@@ -1,0 +1,68 @@
+{
+  "algorithm": "hmac-sha256-commit-reveal/v1",
+  "generated_by": "python",
+  "note": "Seeds here are derived deterministically for testing only.",
+  "vectors": [
+    {
+      "giveaway_id": "gw_vector_1",
+      "user_id": "100000000000000001",
+      "entry_seq": 1,
+      "total_entries": 6,
+      "seed": "7b0680102c6454d1e32525341ba73000d159f17defd15242b6f44263ae56b5c9",
+      "commitment": "3c89c32f5484248e4a1c232b51410e3660f4958a11d4afa6057b8ece18b954af",
+      "score": "3500077653500826539266471362854071966822197919665231437802192216193470259215",
+      "retry_count": 0
+    },
+    {
+      "giveaway_id": "gw_vector_1",
+      "user_id": "100000000000000002",
+      "entry_seq": 1,
+      "total_entries": 6,
+      "seed": "78db9d8a63fdd12460299727aec054e1cae72c6be84a7536870a1adf02fda1fe",
+      "commitment": "d599272a1c06afa88c9467d7799e08f1da2879364fb0c1fde762492e20a898dc",
+      "score": "12590801668318013912274761244988233093290174040027184034857526444071382237756",
+      "retry_count": 0
+    },
+    {
+      "giveaway_id": "gw_vector_1",
+      "user_id": "100000000000000003",
+      "entry_seq": 2,
+      "total_entries": 6,
+      "seed": "1a8475ea90e03cf4761e62721abdbb4c4fc16825951202240ca3d55472e62d86",
+      "commitment": "38bca9b6bfe7bbe860d14ef30fb75afa6641f37f7b3145335dcb377c822375d4",
+      "score": "16405641433898211108519735400987364329252428020841327195402264856174497856743",
+      "retry_count": 0
+    },
+    {
+      "giveaway_id": "gw_vector_2",
+      "user_id": "200000000000000001",
+      "entry_seq": 1,
+      "total_entries": 6,
+      "seed": "0ed3d2cd0faade514b3bf0a721eee1395cadb08017c0847ef4b74ba7047aa0ae",
+      "commitment": "2f26d873bdc51bab644a1c8b4eef582149f728c737ae6ea2e1028c46bca92de2",
+      "score": "12088457366377174388935668214989114868773402233996731953953073885762322855465",
+      "retry_count": 0
+    },
+    {
+      "giveaway_id": "gw_vector_2",
+      "user_id": "200000000000000002",
+      "entry_seq": 3,
+      "total_entries": 6,
+      "seed": "86cef56a13a9c942d1fc6fc55720720bea63cd53b6fc65808704d9be48042742",
+      "commitment": "465310570b84567271a3155314b145050dab21a26d7311fbc002d5b74567ec66",
+      "score": "8938645055732651243242448526966114942579475607022364870956502777031956050252",
+      "retry_count": 0
+    },
+    {
+      "giveaway_id": "gw_f3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "user_id": "42",
+      "entry_seq": 1,
+      "total_entries": 6,
+      "seed": "c042de5f7ac35dc615736f4dbd67afb32186787944b634bf2603888a96547e71",
+      "commitment": "d9a73d1835869ab5232279aba2d711b7e2f7b65dbe002e61660db459af440806",
+      "score": "10781024040770416324019773329623302311727606050528704151070549979210819815654",
+      "retry_count": 0
+    }
+  ],
+  "vectors_participant_digest": "cd187da30f1d3476f79d026a67b32503a427d01017e3ee8362e735b80fd48298"
+}

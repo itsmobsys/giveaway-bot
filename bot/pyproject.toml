@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "giveaway-bot"
+version = "1.0.0"
+description = "Open-source Discord giveaway bot with a provably fair, auditable draw"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Giveaway Bot contributors" }]
+keywords = ["discord", "giveaway", "provably-fair", "bot", "turso"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Communications :: Chat",
+]
+
+dependencies = [
+  "discord.py>=2.4,<3",
+  "pydantic>=2.7,<3",
+  "pydantic-settings>=2.3,<3",
+  "python-dotenv>=1.0,<2",
+  "httpx>=0.27,<1",
+  "tenacity>=8.2,<10",
+]
+
+[project.optional-dependencies]
+# Turso/libSQL driver. Install with: pip install -e ".[turso]"
+turso = ["libsql>=0.2.1"]
+dev = [
+  "pytest>=8.2",
+  "pytest-asyncio>=0.23",
+  "ruff>=0.6",
+  "mypy>=1.11",
+]
+
+[project.scripts]
+giveaway-bot = "giveaway_bot.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/your-org/giveaway-bot"
+Documentation = "https://github.com/your-org/giveaway-bot/blob/main/docs/ARCHITECTURE.md"
+Issues = "https://github.com/your-org/giveaway-bot/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["giveaway_bot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "S", "ASYNC", "C4", "RET", "SIM"]
+ignore = ["S101", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "E501"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+disallow_untyped_defs = false
+ignore_missing_imports = true

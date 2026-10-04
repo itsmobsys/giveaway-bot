@@ -1,0 +1,179 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens.
+ *
+ * One accent (violet) plus semantic status colours. Dark mode is class-based
+ * (`html.dark`) rather than media-based so the user can override it, and the
+ * choice is applied before paint by the inline script in layout.tsx to avoid a
+ * flash of the wrong theme.
+ */
+
+:root {
+  --background: oklch(99% 0.005 285);
+  --surface: oklch(100% 0 0);
+  --surface-muted: oklch(97% 0.006 285);
+  --border: oklch(91% 0.008 285);
+  --foreground: oklch(21% 0.02 285);
+  --muted-foreground: oklch(52% 0.02 285);
+  --accent: oklch(58% 0.21 285);
+  --accent-foreground: oklch(99% 0.005 285);
+  --success: oklch(62% 0.16 155);
+  --warning: oklch(74% 0.16 75);
+  --danger: oklch(60% 0.19 22);
+  --info: oklch(62% 0.15 240);
+  --radius: 0.75rem;
+}
+
+.dark {
+  --background: oklch(17% 0.017 285);
+  --surface: oklch(21% 0.019 285);
+  --surface-muted: oklch(25% 0.021 285);
+  --border: oklch(31% 0.022 285);
+  --foreground: oklch(97% 0.005 285);
+  --muted-foreground: oklch(68% 0.02 285);
+  --accent: oklch(66% 0.19 285);
+  --accent-foreground: oklch(17% 0.017 285);
+  --success: oklch(70% 0.15 155);
+  --warning: oklch(79% 0.15 78);
+  --danger: oklch(68% 0.18 22);
+  --info: oklch(70% 0.14 240);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-muted: var(--surface-muted);
+  --color-border: var(--border);
+  --color-foreground: var(--foreground);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+  --color-info: var(--info);
+  --radius-card: var(--radius);
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", "Cascadia Code", Consolas, monospace;
+}
+
+* {
+  border-color: var(--border);
+}
+
+html {
+  color-scheme: light;
+}
+html.dark {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  min-height: 100dvh;
+}
+
+/* Respect users who ask for less motion. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -200% 0;
+  }
+  100% {
+    background-position: 200% 0;
+  }
+}
+
+@keyframes pulse-ring {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in oklab, var(--accent) 45%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 8px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+.animate-fade-in {
+  animation: fade-in 0.35s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.animate-scale-in {
+  animation: scale-in 0.2s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.animate-pulse-ring {
+  animation: pulse-ring 2s ease-out infinite;
+}
+
+.skeleton {
+  background: linear-gradient(
+    90deg,
+    var(--surface-muted) 25%,
+    color-mix(in oklab, var(--surface-muted) 60%, var(--surface)) 50%,
+    var(--surface-muted) 75%
+  );
+  background-size: 200% 100%;
+  animation: shimmer 1.6s linear infinite;
+}
+
+/* Visible, consistent focus ring for keyboard users. */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Numeric columns line up. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+.scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+.scrollbar-thin::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 999px;
+}

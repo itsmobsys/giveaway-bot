@@ -1,0 +1,29 @@
+# Normalize line endings in the repository, then restore them on checkout.
+#
+# Everything is stored with LF. Windows contributors get LF too, so a clone
+# produces byte-identical files regardless of who committed them. This matters
+# here because Docker builds, SQL migrations and any script with a `#!` line all
+# break or behave differently when CRLF leaks in.
+* text=auto eol=lf
+
+# Windows-native formats genuinely need CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary assets must never be line-ending filtered or diffed as text.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+
+# Lockfiles are generated; keep diffs readable but still normalised.
+package-lock.json text eol=lf
+
+# Keep these out of language statistics and diffs: they are generated or large.
+dashboard/data/** linguist-generated
+*.db binary

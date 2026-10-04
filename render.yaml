@@ -1,0 +1,88 @@
+# Render blueprint: bot (background worker) + dashboard (web service).
+#
+# One-time setup:
+#   1. Create a Turso database and set TURSO_DATABASE_URL / TURSO_AUTH_TOKEN
+#      in both services' environment.
+#   2. Add DISCORD_BOT_TOKEN, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET,
+#      SESSION_SECRET to the services that need them.
+#   3. Set DASHBOARD_URL to the dashboard's public URL after first deploy, then
+#      register that exact URL as a Discord OAuth2 redirect.
+#   4. Run migrations once (`npm run db:migrate` locally or in a shell).
+#
+# `render.yaml` is read from the repository root.
+
+databases:
+  - name: giveaway-db
+    # Turso/libSQL is the supported store; this entry documents intent.
+    # Replace with your own Turso credentials via the dashboard environment.
+
+services:
+  # ---------------------------------------------------------------------
+  # Discord bot: a long-running background worker.
+  # ---------------------------------------------------------------------
+  - type: worker
+    name: giveaway-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: starter
+    region: oregon
+    autoDeploy: true
+    healthCheckPath: /healthz
+    envVars:
+      - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_CLIENT_ID
+        sync: false
+      - key: DISCORD_CLIENT_SECRET
+        sync: false
+      - key: DISCORD_REDIRECT_URI
+        sync: false
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+      - key: DASHBOARD_URL
+        sync: false
+      - key: DISCORD_GUILD_ALLOWLIST
+        sync: false
+      - key: LOG_LEVEL
+        value: INFO
+      - key: LOG_JSON
+        value: "true"
+      - key: LOG_PRETTY
+        value: "false"
+      - key: FAIRNESS_FREEZE_ENTRIES_ON_DRAW
+        value: "true"
+      - key: MIGRATIONS_DIR
+        value: /app/shared/migrations
+
+  # ---------------------------------------------------------------------
+  # Dashboard: a web service.
+  # ---------------------------------------------------------------------
+  - type: web
+    name: giveaway-dashboard
+    runtime: docker
+    dockerfilePath: ./dashboard/Dockerfile
+    dockerContext: ./dashboard
+    plan: starter
+    region: oregon
+    autoDeploy: true
+    healthCheckPath: /api/health
+    envVars:
+      - key: DISCORD_CLIENT_ID
+        sync: false
+      - key: DISCORD_CLIENT_SECRET
+        sync: false
+      - key: DISCORD_REDIRECT_URI
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+      - key: NEXT_PUBLIC_APP_URL
+        sync: false
+      - key: MIGRATIONS_DIR
+        value: /app/migrations
