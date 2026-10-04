@@ -19,6 +19,8 @@ What it proves
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import inspect
 import json
@@ -26,6 +28,7 @@ import os
 import shutil
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator
@@ -2248,6 +2251,379 @@ def test_dashboard_health_check() -> None:
     }, f"status() disagreed with the poll loop: {health.status()}"
 
 # --------------------------------------------------------------------------- #
+# Transaction lifecycle and concurrent claiming
+# --------------------------------------------------------------------------- #
+def _libsql_available() -> bool:
+    try:
+        import libsql  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@contextmanager
+def _backend_databases(label: str) -> Iterator[tuple[Database, str]]:
+    """Yield a migrated scratch database on each available backend.
+
+    SQLite always. libSQL too when the driver is importable, pointed at a local
+    file URL - no network, no token, no shared state - because the production
+    driver is where the reported failure happened and the local driver is not
+    where it can be reproduced. GIVEAWAY_REQUIRE_LIBSQL turns a missing driver
+    into a failure instead of a skip, so CI cannot quietly stop covering it.
+    """
+    require = os.environ.get("GIVEAWAY_REQUIRE_LIBSQL") == "1"
+    if require and not _libsql_available():
+        raise AssertionError(
+            "GIVEAWAY_REQUIRE_LIBSQL=1 but the libsql driver is not importable, so the "
+            "Turso backend this check exists for would go untested"
+        )
+
+    with _temp_database(f"tx-{label}-sqlite") as db:
+        yield db, "sqlite"
+
+    if _libsql_available():
+        tmp = tempfile.mkdtemp(prefix="giveaway-selftest-libsql-")
+        previous = os.environ.get("TURSO_DATABASE_URL")
+        os.environ["TURSO_DATABASE_URL"] = ""
+        try:
+            settings = Settings(
+                turso_database_url=f"file:{Path(tmp) / f'tx-{label}-libsql.db'}",
+                turso_auth_token="",
+                migrations_dir=Path("../shared/migrations"),
+            )
+            db = Database(settings)
+            try:
+                db.migrate(verbose=False)
+                assert db.backend == "turso", f"expected the turso backend, got {db.backend}"
+                yield db, "turso/libsql"
+            finally:
+                db.close_all()
+        finally:
+            if previous is None:
+                os.environ.pop("TURSO_DATABASE_URL", None)
+            else:
+                os.environ["TURSO_DATABASE_URL"] = previous
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_transactions_never_outlive_their_block() -> None:
+    """A transaction is closed out on every exit path, including BaseException.
+
+    Connections are thread-confined but threads are pooled, so a transaction
+    left open on one is inherited by whatever unrelated job the pool schedules
+    onto that thread next. Its first statement is BEGIN, which then fails with
+    "cannot start a transaction within a transaction" - reported against code
+    that has nothing to do with whatever abandoned it. That was the observed
+    failure in repositories/control.py::claim_batch.
+    """
+    import gc
+
+    from .repositories import control
+    from .repositories import guilds as guilds_repo
+
+    with _temp_database("tx-lifecycle") as db:
+        guilds_repo.upsert_guild(db, "1", name="Lifecycle")
+        assert not db.in_transaction(), "a fresh connection must not be in a transaction"
+
+        # CancelledError, KeyboardInterrupt and SystemExit are BaseException, not
+        # Exception. Catching only Exception skipped both COMMIT and ROLLBACK.
+        for base_exc in (KeyboardInterrupt, SystemExit, asyncio.CancelledError):
+            assert not db.in_transaction(), f"depth leaked before {base_exc.__name__}"
+            with contextlib.suppress(base_exc), db.transaction():
+                control.enqueue(
+                    db, guild_id="1", kind="leaky", payload={}, requested_by="1", source="bot"
+                )
+                raise base_exc()
+            assert not db.in_transaction(), (
+                f"{base_exc.__name__} inside a transaction left it open; the next "
+                "operation on this thread would fail on its own BEGIN"
+            )
+            assert db.transaction_depth() == 0, f"depth is {db.transaction_depth()} after {base_exc.__name__}"
+            assert db.scalar("SELECT COUNT(*) FROM command_queue WHERE kind = 'leaky'") == 0, (
+                f"{base_exc.__name__} did not roll back its work"
+            )
+            # The real regression: the next unrelated operation must succeed.
+            assert isinstance(control.claim_batch(db, limit=5), list), (
+                f"claim_batch failed after {base_exc.__name__}"
+            )
+
+        # A transaction block abandoned without ever being exited: CPython throws
+        # GeneratorExit into it when it is collected. That has to roll back too.
+        abandoned = db.transaction()
+        abandoned.__enter__()
+        control.enqueue(db, guild_id="1", kind="abandoned", payload={}, requested_by="1", source="bot")
+        del abandoned
+        gc.collect()
+        assert not db.in_transaction(), "a collected transaction block left a transaction open"
+        assert isinstance(control.claim_batch(db, limit=5), list), (
+            "claim_batch failed after an abandoned transaction block"
+        )
+
+        # An ordinary exception still rolls back, and still propagates.
+        with contextlib.suppress(RuntimeError), db.transaction():
+            control.enqueue(
+                db, guild_id="1", kind="runtime", payload={}, requested_by="1", source="bot"
+            )
+            raise RuntimeError("boom")
+        assert not db.in_transaction(), "an ordinary exception left the transaction open"
+        assert db.scalar("SELECT COUNT(*) FROM command_queue WHERE kind = 'runtime'") == 0
+
+        # Closing a connection mid-transaction must not leave the work applied.
+        closing = db.transaction()
+        closing.__enter__()
+        control.enqueue(db, guild_id="1", kind="closing", payload={}, requested_by="1", source="bot")
+        db.close()
+        assert not db.in_transaction(), "close() left a transaction open"
+        reopened = Database(db.settings)
+        try:
+            assert reopened.query_one(
+                "SELECT * FROM command_queue WHERE kind = 'closing'"
+            ) is None, "close() committed work from an unclosed transaction"
+        finally:
+            reopened.close_all()
+        db.close_all()
+
+
+def test_transactions_nest_without_re_begin() -> None:
+    """A transaction opened inside another joins it as a savepoint.
+
+    SQLite refuses a second BEGIN with "cannot start a transaction within a
+    transaction", so nesting has to be a savepoint. The outermost block owns the
+    real COMMIT; a nested failure discards only its own work.
+    """
+    from .repositories import control
+    from .repositories import guilds as guilds_repo
+
+    with _temp_database("tx-nesting") as db:
+        guilds_repo.upsert_guild(db, "1", name="Nesting")
+
+        def add(tx: Database, kind: str) -> None:
+            control.enqueue(tx, guild_id="1", kind=kind, payload={}, requested_by="1", source="bot")
+
+        # Inner block succeeds: everything commits together.
+        with db.transaction() as outer:
+            assert outer.transaction_depth() == 1, f"outer depth is {outer.transaction_depth()}"
+            add(outer, "kept")
+            with db.transaction() as inner:
+                assert inner.transaction_depth() == 2, f"inner depth is {inner.transaction_depth()}"
+                add(inner, "also-kept")
+            assert outer.transaction_depth() == 1, (
+                f"depth not restored after nesting: {outer.transaction_depth()}"
+            )
+        kinds = {row["kind"] for row in db.query("SELECT kind FROM command_queue")}
+        assert {"kept", "also-kept"} <= kinds, f"committed kinds were {sorted(kinds)}"
+
+        # Inner block fails: only its work is discarded, the outer block commits.
+        with db.transaction() as outer:
+            add(outer, "outer-survives")
+            with contextlib.suppress(ValueError), db.transaction() as inner:
+                add(inner, "inner-discarded")
+                raise ValueError("inner failed on purpose")
+            assert outer.transaction_depth() == 1, "depth not restored after a failed savepoint"
+        kinds = {row["kind"] for row in db.query("SELECT kind FROM command_queue")}
+        assert "outer-survives" in kinds, "the outer block's work was lost"
+        assert "inner-discarded" not in kinds, "the failed savepoint was not rolled back"
+
+        # Three levels deep, and the outermost failure discards all of it.
+        with contextlib.suppress(ValueError), db.transaction():
+            add(db, "l1")
+            with db.transaction():
+                add(db, "l2")
+                with db.transaction():
+                    add(db, "l3")
+                raise ValueError("middle failed")
+        kinds = {row["kind"] for row in db.query("SELECT kind FROM command_queue")}
+        assert not {"l1", "l2", "l3"} & kinds, f"nested work survived a rollback: {sorted(kinds)}"
+        assert not db.in_transaction(), f"depth left at {db.transaction_depth()}"
+
+        # And a rolled-back transaction leaves nothing claimed.
+        assert isinstance(control.claim_batch(db, limit=20), list), "claim_batch failed after nesting"
+
+
+def _concurrent_claim_run(db: Database, *, commands: int, workers: int, batch: int) -> list[int]:
+    """Hammer claim_batch from several threads, as the scheduler's to_thread does.
+
+    Returns every id that any worker managed to claim. A single ``Database`` is
+    shared deliberately: that is the production shape, and it is why connections
+    have to be thread-confined.
+    """
+    claimed: list[int] = []
+    errors: list[BaseException] = []
+    guard = threading.Lock()
+
+    def worker() -> None:
+        try:
+            mine: list[int] = []
+            for _ in range(commands):
+                for record in control.claim_batch(db, limit=batch):
+                    mine.append(record.id)
+            with guard:
+                claimed.extend(mine)
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assertion below
+            with guard:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=worker, name=f"claim-{index}") for index in range(workers)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(120)
+    alive = [thread.name for thread in threads if thread.is_alive()]
+    assert not alive, f"claimer threads did not finish: {alive}"
+    assert not errors, f"claim_batch raised under concurrency: {errors[0]!r}"
+    return claimed
+
+
+def test_concurrent_claims_never_duplicate() -> None:
+    """Concurrent claimers split the queue and never claim the same row twice.
+
+    Runs on every available backend: SQLite and, when the libsql driver is
+    installed, the real production driver against a local file. Each worker
+    thread gets its own connection, exactly as ``asyncio.to_thread`` does in the
+    bot, so this covers the pooled-connection path rather than a single-threaded
+    simulation of it.
+    """
+    from .repositories import guilds as guilds_repo
+
+    commands, workers, batch = 60, 8, 4
+    exercised: list[str] = []
+
+    with _backend_databases("claims") as (db, backend):
+        guilds_repo.upsert_guild(db, "1", name="Concurrent")
+        for index in range(commands):
+            control.enqueue(
+                db,
+                guild_id="1",
+                kind=f"cmd-{index}",
+                payload={},
+                requested_by="1",
+                source="bot",
+                priority=100,
+            )
+        assert db.scalar("SELECT COUNT(*) FROM command_queue WHERE status = 'pending'") == commands
+
+        claimed = _concurrent_claim_run(db, commands=commands, workers=workers, batch=batch)
+        exercised.append(backend)
+
+        # Claiming must not have needed a write transaction. Atomicity comes from
+        # the conditional UPDATE, so claimers never serialise on a writer lock.
+        assert not db.in_transaction(), "claim_batch left a transaction open"
+
+        duplicates = sorted({cid for cid in claimed if claimed.count(cid) > 1})
+        assert not duplicates, f"commands claimed more than once: {duplicates}"
+        assert len(claimed) == commands, (
+            f"{len(claimed)} of {commands} commands were claimed; a claim was lost, "
+            "which stalls the queue"
+        )
+        assert sorted(claimed) == list(range(1, commands + 1)), "the claimed set is not the queued set"
+
+        rows = db.query("SELECT id, status, attempts FROM command_queue ORDER BY id")
+        assert all(row["status"] == "claimed" for row in rows), "some commands are still pending"
+        assert all(int(row["attempts"]) == 1 for row in rows), (
+            "a command was claimed more than once (attempts > 1), so two workers "
+            "believed they owned it"
+        )
+
+    print(f"       concurrent claim_batch exercised on: {', '.join(exercised)}")
+
+
+def test_concurrent_role_task_claims_never_duplicate() -> None:
+    """Role tasks are claimed by the same compare-and-set, so they are race-safe too."""
+    from .db import now_ms
+    from .repositories import giveaways as gw_repo
+    from .repositories import guilds as guilds_repo
+
+    tasks, workers = 40, 6
+    exercised: list[str] = []
+
+    with _backend_databases("role-claims") as (db, backend):
+        guilds_repo.upsert_guild(db, "1", name="Concurrent Roles")
+        gw_repo.create_giveaway(
+            db,
+            giveaway_id="gw_race",
+            guild_id="1",
+            channel_id="10",
+            title="Race",
+            description="d",
+            prize="p",
+            created_by="1",
+            winner_count=1,
+            max_entries_per_user=1,
+            entry_limit=0,
+            ends_at=int(time.time() * 1000) + 60_000,
+        )
+        for index in range(tasks):
+            db.execute(
+                """
+                INSERT INTO giveaway_role_tasks
+                  (giveaway_id, guild_id, user_id, action, status, created_at)
+                VALUES (?, '1', ?, 'add', 'pending', ?)
+                """,
+                ("gw_race", str(1000 + index), now_ms()),
+            )
+
+        claimed: list[int] = []
+        errors: list[BaseException] = []
+        guard = threading.Lock()
+
+        def worker() -> None:
+            try:
+                mine: list[int] = []
+                for _ in range(tasks):
+                    for task in control.claim_role_tasks(db, limit=3):
+                        mine.append(int(task["id"]))
+                with guard:
+                    claimed.extend(mine)
+            except BaseException as exc:  # noqa: BLE001 - surfaced by the assertion below
+                with guard:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=worker, name=f"role-claim-{i}") for i in range(workers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(120)
+        assert not [t.name for t in threads if t.is_alive()], "role claimer threads did not finish"
+        assert not errors, f"claim_role_tasks raised under concurrency: {errors[0]!r}"
+        exercised.append(backend)
+
+        duplicates = sorted({tid for tid in claimed if claimed.count(tid) > 1})
+        assert not duplicates, f"role tasks claimed more than once: {duplicates}"
+        assert len(claimed) == tasks, f"{len(claimed)} of {tasks} role tasks were claimed; some were lost"
+        rows = db.query("SELECT attempts FROM giveaway_role_tasks")
+        assert all(int(row["attempts"]) == 1 for row in rows), "a role task was claimed twice"
+
+    print(f"       concurrent claim_role_tasks exercised on: {', '.join(exercised)}")
+
+
+def test_a_leaked_transaction_cannot_poison_a_later_operation() -> None:
+    """The reported failure, end to end: a stuck transaction, then claim_batch.
+
+    Reproduces the original crash by orphaning a transaction the way a
+    BaseException did, then asserting the scheduler's next call still works.
+    Under the old code this raised "cannot start a transaction within a
+    transaction" inside claim_batch.
+    """
+    from .repositories import guilds as guilds_repo
+
+    with _temp_database("tx-poison") as db:
+        guilds_repo.upsert_guild(db, "1", name="Poison")
+        stuck = db.transaction()
+        stuck.__enter__()  # never exited: the connection is left mid-transaction
+        try:
+            claimed = control.claim_batch(db, limit=4)
+            assert claimed == [], f"a claim inside a foreign transaction should not commit: {claimed}"
+        except Exception as exc:  # noqa: BLE001 - reported as a readable failure
+            raise AssertionError(
+                "claim_batch failed on a connection that already had a transaction open: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        finally:
+            stuck.__exit__(None, None, None)
+        assert not db.in_transaction(), "the abandoned block was not closed out on the way out"
+        assert isinstance(control.claim_batch(db, limit=4), list), "claim_batch failed after cleanup"
+
+# --------------------------------------------------------------------------- #
 # Cross-language vectors
 # --------------------------------------------------------------------------- #
 def deterministic_test_seed(*parts: str) -> str:
@@ -2364,6 +2740,13 @@ def main() -> int:
     check.run("crash recovery finishes an interrupted draw", test_crash_recovery)
     check.run("migrations are immutable and idempotent", test_migration_integrity)
     check.run("the dashboard health check works", test_dashboard_health_check)
+    check.run("a transaction never outlives its block", test_transactions_never_outlive_their_block)
+    check.run("transactions nest without re-BEGIN", test_transactions_nest_without_re_begin)
+    check.run("concurrent claim_batch never duplicates", test_concurrent_claims_never_duplicate)
+    check.run("concurrent role-task claims never duplicate",
+               test_concurrent_role_task_claims_never_duplicate)
+    check.run("a leaked transaction cannot poison a later operation",
+               test_a_leaked_transaction_cannot_poison_a_later_operation)
 
     print("\n" + "=" * 60)
     if check.failures:

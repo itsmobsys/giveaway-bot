@@ -13,6 +13,7 @@ knowing an ORM.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import logging
 import re
@@ -30,6 +31,27 @@ log = logging.getLogger("giveaway_bot.db")
 Migration = tuple[str, str]  # (filename, sql)
 
 
+@dataclasses.dataclass
+class _TxState:
+    """Transaction bookkeeping for exactly one connection.
+
+    Held in the same thread-local as the connection it describes, so the depth
+    can never refer to a different connection than the one statements go to.
+    That identity is the whole point: the previous code tracked nothing, so a
+    transaction left open on a connection was invisible, and the next statement
+    issued on that connection failed with "cannot start a transaction within a
+    transaction".
+    """
+
+    connection: Any
+    depth: int = 0
+    retired: bool = False
+
+    @property
+    def nested(self) -> bool:
+        return self.depth > 0
+
+
 class Database:
     """Thin DB-API wrapper with retries, transactions and instrumentation."""
 
@@ -41,6 +63,8 @@ class Database:
         #: Every connection handed out, so close_all() can release file handles
         #: created by worker threads (matters for SQLite on Windows).
         self._connections: list[Any] = []
+        #: Transaction bookkeeping per live connection, keyed by id(conn).
+        self._states: dict[int, _TxState] = {}
         self._init_pool()
 
     # ------------------------------------------------------------------ setup
@@ -71,7 +95,16 @@ class Database:
         return self._backend
 
     def connection(self) -> Any:
-        """Return this thread's connection, creating it on first use."""
+        """Return this thread's connection, creating it on first use.
+
+        A connection is thread-confined: exactly one thread can reach it at a
+        time. That is what makes the scheduler safe. Every job runs in
+        ``asyncio.to_thread``, so each worker thread gets its own connection and
+        no two threads can ever be inside a transaction on the same one. It also
+        means a thread is reused for unrelated later work, which is why the
+        connection has to be left in a clean state on the way out - see
+        :meth:`transaction`.
+        """
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = self._connect_factory()
@@ -85,9 +118,64 @@ class Database:
             with contextlib.suppress(Exception):
                 conn.execute("PRAGMA busy_timeout=30000")
             self._local.conn = conn
+            state = _TxState(connection=conn)
+            self._local.tx = state
             with self._lock:
                 self._connections.append(conn)
+                # Keyed by connection rather than held only in the owning thread's
+                # local, so close_all() can mark another thread's state retired.
+                # id() is a safe key because _connections holds a strong reference
+                # for as long as the entry exists.
+                self._states[id(conn)] = state
         return conn
+
+    def _tx_state(self, conn: Any) -> _TxState:
+        """The transaction state belonging to this connection."""
+        with self._lock:
+            state = self._states.get(id(conn))
+            if state is None:
+                state = _TxState(connection=conn)
+                self._states[id(conn)] = state
+        self._local.tx = state
+        return state
+
+    def in_transaction(self) -> bool:
+        """True while this thread holds an open transaction on its connection."""
+        state = getattr(self._local, "tx", None)
+        return bool(state is not None and state.nested)
+
+    def transaction_depth(self) -> int:
+        """How many transaction blocks are open on this thread's connection."""
+        state = getattr(self._local, "tx", None)
+        return 0 if state is None else state.depth
+
+    def _retire(self, conn: Any, reason: str, *, broken: bool) -> None:
+        """Stop using this connection: close it and drop every reference to it.
+
+        Called either on purpose (a normal close) or because the connection got
+        into a state nobody can reason about - usually a transaction whose
+        COMMIT/ROLLBACK itself failed. The broken case logs at ERROR and is the
+        one that matters: the alternative is handing the next operation a
+        connection that may still hold a transaction, so its own BEGIN fails with
+        "cannot start a transaction within a transaction". That error surfaces
+        against code which has nothing to do with whatever went wrong earlier,
+        which is what made this so hard to trace.
+        """
+        verb = "discarding" if broken else "closing"
+        (log.error if broken else log.debug)("%s database connection: %s", verb, reason)
+        with self._lock:
+            with contextlib.suppress(ValueError):
+                self._connections.remove(conn)
+            state = self._states.pop(id(conn), None)
+        if state is not None:
+            # Whatever transaction this state described died with the connection.
+            state.retired = True
+            state.depth = 0
+        with contextlib.suppress(Exception):
+            conn.close()
+        if getattr(self._local, "conn", None) is conn:
+            self._local.conn = None
+            self._local.tx = None
 
     def close(self) -> None:
         """Close this thread's connection and forget it.
@@ -97,18 +185,27 @@ class Database:
         """
         conn = getattr(self._local, "conn", None)
         if conn is not None:
-            try:
-                conn.close()
-            except Exception:  # noqa: BLE001 - closing must never raise
-                log.debug("error closing database connection", exc_info=True)
+            state = getattr(self._local, "tx", None)
+            if state is not None and state.nested:
+                # Reaching here means a transaction block was abandoned without
+                # being closed out. Undo it before the connection goes, so the
+                # work cannot be left half-applied.
+                log.error(
+                    "closing a connection that still has an open transaction (depth %d)", state.depth
+                )
+                with contextlib.suppress(Exception):
+                    conn.execute("ROLLBACK")
+            self._retire(conn, "close() called", broken=False)
             self._local.conn = None
 
     def close_all(self) -> None:
         """Close connections opened by every thread in this process."""
         for conn in list(self._connections):
             with contextlib.suppress(Exception):
-                conn.close()
-        self._connections.clear()
+                self._retire(conn, "close_all() called", broken=False)
+        with self._lock:
+            self._connections.clear()
+            self._states.clear()
         self._local = threading.local()
 
     def __enter__(self) -> Database:
@@ -142,14 +239,22 @@ class Database:
         raise last_error  # type: ignore[misc]
 
     def execute_many(self, sql: str, rows: Sequence[Sequence[Any]]) -> None:
+        """Run one statement per row.
+
+        The row-at-a-time fallback is chosen by what the driver offers, not by
+        catching an exception. Catching it and retrying every row re-applies the
+        prefix executemany had already written before it failed, which silently
+        double-writes instead of reporting the error.
+        """
         if not rows:
             return
         conn = self.connection()
-        with contextlib.suppress(Exception):
-            conn.executemany(sql, [tuple(row) for row in rows])
+        params = [tuple(row) for row in rows]
+        if hasattr(conn, "executemany"):
+            conn.executemany(sql, params)
             return
-        for row in rows:  # pragma: no cover - fallback for drivers without executemany
-            conn.execute(sql, tuple(row))
+        for row in params:  # pragma: no cover - drivers without executemany
+            conn.execute(sql, row)
 
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
         cur = self.execute(sql, params)
@@ -205,33 +310,86 @@ class Database:
     # ------------------------------------------------------------ transaction
     @contextlib.contextmanager
     def transaction(self) -> Iterator[Database]:
-        """Explicit transaction.
+        """Run a block inside a transaction, atomically.
 
-        SQLite in WAL mode and libSQL both give us real transactions, so every
+        SQLite in WAL mode and libSQL both give real transactions, so every
         multi-statement mutation (join + stats + audit + event) is atomic.
+
+        Two properties matter more than the SQL:
+
+        **Nesting is legal.** A ``transaction()`` opened inside an already-open
+        one joins the existing transaction as a SAVEPOINT instead of issuing a
+        second BEGIN, which SQLite refuses with "cannot start a transaction
+        within a transaction". The outermost block owns the real BEGIN and
+        COMMIT; a nested block's failure discards only its own savepoint and
+        leaves the enclosing work intact.
+
+        **The transaction is always closed out.** Return, raise, or a
+        BaseException such as ``asyncio.CancelledError``, ``KeyboardInterrupt``
+        or ``SystemExit`` all reach the COMMIT/ROLLBACK path. The old code caught
+        only ``Exception``, so a BaseException skipped both and left the
+        transaction open - and since a connection is thread-confined and threads
+        are pooled, the next unrelated job the pool scheduled onto that thread
+        failed on its own BEGIN.
         """
         conn = self.connection()
-        if self._is_turso:
-            # libSQL has no client-controlled BEGIN; wrap in a write transaction
-            # by issuing BEGIN IMMEDIATE / COMMIT on the same connection.
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                yield self
-            except Exception:
-                with contextlib.suppress(Exception):
-                    conn.execute("ROLLBACK")
-                raise
-            conn.execute("COMMIT")
-            return
+        state = self._tx_state(conn)
+        depth = state.depth
+        savepoint = f"giveaway_bot_sp_{depth}"
 
-        conn.execute("BEGIN IMMEDIATE")
+        if depth == 0:
+            # BEGIN IMMEDIATE takes the write lock up front so two writers cannot
+            # both read-then-write; busy_timeout (set on connect) is what makes
+            # that wait instead of failing.
+            conn.execute("BEGIN IMMEDIATE")
+        else:
+            conn.execute(f'SAVEPOINT "{savepoint}"')
+
+        state.depth = depth + 1
         try:
             yield self
-        except Exception:
-            with contextlib.suppress(Exception):
-                conn.execute("ROLLBACK")
+        except BaseException:
+            self._close_out(conn, state, depth=depth, savepoint=savepoint, commit=False)
             raise
-        conn.execute("COMMIT")
+        self._close_out(conn, state, depth=depth, savepoint=savepoint, commit=True)
+
+    def _close_out(
+        self, conn: Any, state: _TxState, *, depth: int, savepoint: str, commit: bool
+    ) -> None:
+        """COMMIT or ROLLBACK, and restore the nesting depth.
+
+        Deliberately never raises. A COMMIT or ROLLBACK that fails leaves the
+        connection in a state nobody can reason about, so it is retired and the
+        failure logged at ERROR. Raising from here would replace the exception
+        the caller was already propagating, and that one is the one worth
+        reading.
+        """
+        if state.retired:
+            # The connection was already closed - by close(), close_all(), or an
+            # earlier failed close-out. There is nothing left to commit or roll
+            # back, and asking a closed connection only raises "Cannot operate on
+            # a closed database", which would be reported as though the commit
+            # itself had failed.
+            log.debug(
+                "not closing out a transaction: its connection was already retired (depth %d)", depth
+            )
+            state.depth = depth
+            return
+
+        verb = "commit" if commit else "roll back"
+        try:
+            if depth == 0:
+                conn.execute("COMMIT" if commit else "ROLLBACK")
+            elif commit:
+                conn.execute(f'RELEASE SAVEPOINT "{savepoint}"')
+            else:
+                conn.execute(f'ROLLBACK TO SAVEPOINT "{savepoint}"')
+                conn.execute(f'RELEASE SAVEPOINT "{savepoint}"')
+        except Exception:  # noqa: BLE001 - reported and the connection retired
+            log.error("could not %s the database transaction", verb, exc_info=True)
+            self._retire(conn, f"could not {verb} its transaction", broken=True)
+        finally:
+            state.depth = depth
 
     # -------------------------------------------------------------- migrations
     def pending_migrations(self) -> list[Migration]:

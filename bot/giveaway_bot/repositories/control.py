@@ -200,28 +200,36 @@ def role_task(
 
 
 def claim_role_tasks(db: Database, *, limit: int = 25) -> list[dict[str, Any]]:
-    """Atomically claim pending role tasks."""
+    """Atomically claim pending role tasks.
+
+    Atomicity comes from the conditional UPDATE, not from an enclosing write
+    transaction - see :func:`claim_batch` for why.
+    """
+    limit = max(1, min(limit, 100))
     claimed: list[dict[str, Any]] = []
-    with db.transaction() as tx:
-        rows = tx.query(
-            """
-            SELECT id FROM giveaway_role_tasks
-            WHERE status = 'pending'
-            ORDER BY id ASC LIMIT ?
-            """,
-            (max(1, min(limit, 100)),),
+    for row in db.query(
+        """
+        SELECT id FROM giveaway_role_tasks
+        WHERE status = 'pending'
+        ORDER BY id ASC LIMIT ?
+        """,
+        (limit,),
+    ):
+        cursor = db.execute(
+            "UPDATE giveaway_role_tasks SET status = 'claimed', attempts = attempts + 1"
+            " WHERE id = ? AND status = 'pending'",
+            (row["id"],),
         )
-        for row in rows:
-            cursor = tx.execute(
-                "UPDATE giveaway_role_tasks SET status = 'claimed', attempts = attempts + 1"
-                " WHERE id = ? AND status = 'pending'",
-                (row["id"],),
-            )
-            if getattr(cursor, "rowcount", 0):
-                cursor.close()
-                claimed.append(dict(tx.query_one(
-                    "SELECT * FROM giveaway_role_tasks WHERE id = ?", (row["id"],)
-                ) or {}))
+        won = int(getattr(cursor, "rowcount", 0) or 0) > 0
+        cursor.close()
+        if not won:
+            # Lost the race for this row; another claimer owns it now.
+            continue
+        claimed.append(
+            dict(db.query_one("SELECT * FROM giveaway_role_tasks WHERE id = ?", (row["id"],)) or {})
+        )
+        if len(claimed) >= limit:
+            break
     return claimed
 
 
@@ -291,33 +299,51 @@ def enqueue(
 def claim_batch(db: Database, *, limit: int = 4) -> list[CommandRecord]:
     """Atomically move pending commands to ``claimed``.
 
-    The UPDATE selects only rows that are still pending, so two bot instances
-    sharing one database can never process the same command twice.
+    Atomicity comes from the conditional UPDATE, which is a compare-and-set:
+    ``WHERE id = ? AND status = 'pending'`` only matches while the row is still
+    unclaimed, so when two claimers race for the same row exactly one sees
+    ``rowcount == 1`` and the other sees 0. Two bot instances sharing one
+    database therefore cannot process the same command twice.
+
+    Deliberately not wrapped in ``db.transaction()``. A write transaction would
+    make every claimer serialise on the single writer lock, so on a remote
+    database the losers of that race are turned away with SQLITE_BUSY instead of
+    simply claiming different rows - and BEGIN is issued straight on the
+    connection, outside the retry path, so that failure is not retried. Letting
+    each row's UPDATE be its own atomic step means concurrent claimers overlap
+    freely and neither blocks nor fails the other.
     """
+    limit = max(1, min(limit, 20))
     claimed: list[CommandRecord] = []
-    with db.transaction() as tx:
-        rows = tx.query(
+    rows = db.query(
+        """
+        SELECT id FROM command_queue
+        WHERE status = 'pending'
+        ORDER BY priority ASC, id ASC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    for row in rows:
+        cursor = db.execute(
             """
-            SELECT id FROM command_queue
-            WHERE status = 'pending'
-            ORDER BY priority ASC, id ASC
-            LIMIT ?
+            UPDATE command_queue
+            SET status = 'claimed', claimed_at = ?, attempts = attempts + 1
+            WHERE id = ? AND status = 'pending'
             """,
-            (max(1, min(limit, 20)),),
+            (now_ms(), row["id"]),
         )
-        for row in rows:
-            cursor = tx.execute(
-                """
-                UPDATE command_queue
-                SET status = 'claimed', claimed_at = ?, attempts = attempts + 1
-                WHERE id = ? AND status = 'pending'
-                """,
-                (now_ms(), row["id"]),
-            )
-            if getattr(cursor, "rowcount", 0):
-                cursor.close()
-                claimed.append(_command_from_id(tx, int(row["id"])))
-    return [item for item in claimed if item is not None]
+        won = int(getattr(cursor, "rowcount", 0) or 0) > 0
+        cursor.close()
+        if not won:
+            # Lost the race for this row; another claimer owns it now.
+            continue
+        record = _command_from_id(db, int(row["id"]))
+        if record is not None:
+            claimed.append(record)
+        if len(claimed) >= limit:
+            break
+    return claimed
 
 
 def _command_from_id(db: Database, command_id: int) -> CommandRecord | None:
