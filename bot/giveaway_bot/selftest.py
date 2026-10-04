@@ -1563,6 +1563,91 @@ def test_example_env_file_loads() -> None:
     )
 
 
+#: The os.exec* family. Matched by name rather than a "starts with exec" prefix,
+#: because sys.executable - a legitimate, unrelated attribute - also starts with
+#: "exec" and would otherwise be flagged.
+_EXEC_FAMILY = frozenset(
+    {"execv", "execve", "execvp", "execvpe", "execl", "execle", "execlp", "execlpe"}
+)
+
+
+def test_app_shim_entrypoint() -> None:
+    """The root app.py must reach the bot and report the bot's exit code.
+
+    Some hosting panels start a Python app from a file at the repository root, so
+    app.py exists purely to bridge to `python -m giveaway_bot run`. Two things
+    about it are easy to break and hard to notice:
+
+    * the bot has to run *in* the app's own process. If it were spawned as a
+      child, a SIGTERM arriving before or between the handler install and the wait
+      would be lost and leave an orphaned bot holding a gateway connection. If it
+      were exec'd, the behaviour would differ per platform - CPython emulates
+      os.exec* on Windows without propagating the child's status.
+    * the panel decides whether the deploy worked from the exit status, so the
+      bot's code has to reach it unmodified.
+
+    Both are asserted against a real interpreter rather than by reading the file
+    alone. The probe subcommands chosen here are config-independent (argparse
+    rejects them before any settings or database are touched), so this stays
+    offline and needs no token.
+    """
+    import ast
+    import subprocess
+
+    root = Path(__file__).resolve().parents[2]
+    app = root / "app.py"
+    assert app.exists(), "app.py is missing from the repository root"
+
+    # Inspect the parsed code rather than the text: the module docstring explains
+    # at length why os.exec* is avoided, and a substring search would flag its own
+    # explanation.
+    tree = ast.parse(app.read_text(encoding="utf-8"))
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            offenders += [
+                f"import {alias.name}"
+                for alias in node.names
+                if alias.name.split(".")[0] == "subprocess"
+            ]
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] == "subprocess":
+                offenders.append(f"from {node.module} import ...")
+        elif isinstance(node, ast.Attribute) and node.attr in _EXEC_FAMILY:
+            offenders.append(f".{node.attr}()")
+
+    assert not offenders, (
+        "app.py must run the bot in its own process, but it uses "
+        f"{sorted(set(offenders))}: spawning a child would need signal "
+        "forwarding, and os.exec* does not propagate the exit code on Windows"
+    )
+
+    # Run from an unrelated directory to prove paths come from __file__ rather
+    # than the working directory a panel might choose.
+    probe_dir = tempfile.mkdtemp(prefix="giveaway-appshim-")
+    try:
+        def probe(args: list[str]) -> int:
+            return subprocess.run(
+                [sys.executable, str(app), *args],
+                cwd=probe_dir,
+                capture_output=True,
+                timeout=120,
+                check=False,
+            ).returncode
+
+        # --help exercises the import wiring and the forwarding of arguments.
+        assert probe(["--help"]) == 0, "app.py must forward arguments to the bot CLI"
+
+        # An unknown subcommand makes argparse exit 2. If app.py returned anything
+        # else, the panel would read every crash as a successful deploy.
+        assert probe(["not-a-real-command"]) == 2, (
+            "app.py must exit with the bot's own status; argparse exits 2 for an "
+            "invalid subcommand, so anything else means the code was swallowed"
+        )
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+
+
 # --------------------------------------------------------------------------- #
 # Cross-language vectors
 # --------------------------------------------------------------------------- #
@@ -1663,6 +1748,7 @@ def main() -> int:
     check.run("the giveaway channel is fixed by configuration", test_giveaway_channel_is_fixed)
     check.run("requirements.txt covers every runtime dependency", test_requirements_cover_runtime_deps)
     check.run("the shipped .env.example is a loadable config", test_example_env_file_loads)
+    check.run("the root app.py shim reaches the bot", test_app_shim_entrypoint)
 
     check.section("Persistence + lifecycle")
     check.run("create -> join -> manage -> draw -> reroll", test_lifecycle)

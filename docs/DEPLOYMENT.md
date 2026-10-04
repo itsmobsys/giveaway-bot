@@ -201,6 +201,28 @@ Turso works on 3.14 if you install everything except `libsql`.
   the database is the hosted option.
 * Keep `autoDeploy` off if you would rather deploy deliberately.
 
+### Panels that run a file (`PY_FILE`)
+
+Some hosts — Silly Development among them — do not let you choose a start command;
+they run a Python file at the repository root. That file is `app.py`, and it
+expects the same things the command above does:
+
+| Panel setting | Value |
+| --- | --- |
+| Python version | 3.13 (3.11–3.13 all have a `libsql` wheel; 3.14 does not) |
+| Requirements file | `requirements.txt` (repository root) |
+| App file | `app.py` |
+
+Run migrations once before the first start, as above.
+
+`app.py` runs the bot **in its own process** rather than spawning or exec'ing it,
+which is what makes both required properties hold without any forwarding code:
+SIGTERM and SIGINT reach the bot directly, and the exit status the panel reads is
+the bot's own. `os.execve` was rejected for this — it is a true `exec` on Linux
+but CPython emulates it on Windows without propagating the child's status, so the
+shim would have exited 0 on every crash. `selftest` asserts all of this, so the
+behaviour cannot silently regress.
+
 ### Vercel (dashboard only)
 
 ```bash

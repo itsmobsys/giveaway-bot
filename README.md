@@ -12,6 +12,7 @@ files, and `npm run fairness:verify` proves the two implementations agree.
 ├── dashboard/      Next.js dashboard (Render or Vercel) with Turso
 ├── shared/         Cross-language contract: SQL migrations, fairness spec, test vectors
 ├── docs/           Architecture · Fairness · Security · Deployment
+├── app.py          Entry point for panels that start a file (e.g. SillyDev)
 ├── requirements.txt  Python dependencies for the bot (no container image)
 ├── render.yaml     Render blueprint: bot (worker) + dashboard (web)
 └── docker-compose.yml  Dashboard only; the bot is not containerised
@@ -110,6 +111,15 @@ That is the whole story for the bot on any host — no image build, no
 `docker compose`. Only the dashboard uses Docker
 (`dashboard/Dockerfile`); `docker compose up -d --build` starts the dashboard
 alone.
+
+For panels that start a Python file at the repository root rather than a command
+(Silly Development's `PY_FILE`, for instance), `app.py` is the entry point. It
+runs the bot in the same process and forwards its exit code:
+
+```bash
+python app.py             # starts the bot
+python app.py selftest    # other subcommands work too
+```
 
 Full walkthrough, including Discord application setup, bot permissions and the
 intents required for message counting: **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**
