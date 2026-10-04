@@ -75,9 +75,11 @@ class Database:
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = self._connect_factory()
-            # Row access by name, and enforce FKs where the backend supports it.
-            with contextlib.suppress(Exception):
-                conn.row_factory = sqlite3.Row
+            # Row access by name is handled in _to_dict from the cursor
+            # description, not by asking the driver for sqlite3.Row: libSQL has no
+            # row_factory attribute at all, so that assignment was a silent no-op
+            # there and only SQLite ever produced named rows. Doing it in one place
+            # means both backends take the identical path.
             with contextlib.suppress(Exception):
                 conn.execute("PRAGMA foreign_keys=ON")
             with contextlib.suppress(Exception):
@@ -125,9 +127,16 @@ class Database:
             try:
                 cur = conn.execute(sql, tuple(params))
                 return cur
-            except sqlite3.OperationalError as exc:  # pragma: no cover - transient
+            except Exception as exc:  # noqa: BLE001 - re-raised unless transient
+                # Matching on sqlite3.OperationalError was SQLite-only: libSQL
+                # raises its own exception types and exports no OperationalError,
+                # so on Turso this retry could never fire and a transient
+                # lock/conflict surfaced as a hard failure. The message is the only
+                # portable signal, so it is matched directly and anything else is
+                # re-raised untouched.
                 message = str(exc).lower()
-                if "locked" not in message and "busy" not in message and "conflict" not in message:
+                transient = any(word in message for word in ("locked", "busy", "conflict"))
+                if not transient:
                     raise
                 last_error = exc
                 time.sleep(0.15 * (attempt + 1))
@@ -146,8 +155,9 @@ class Database:
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
         cur = self.execute(sql, params)
         rows = cur.fetchall()
+        columns = _cursor_columns(cur)
         cur.close()
-        return [self._to_dict(row) for row in rows]
+        return [self._to_dict(row, columns) for row in rows]
 
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> dict[str, Any] | None:
         rows = self.query(sql, params)
@@ -167,10 +177,28 @@ class Database:
         return int(rowid)
 
     @staticmethod
-    def _to_dict(row: Any) -> dict[str, Any]:
+    def _to_dict(row: Any, columns: Sequence[str] | None = None) -> dict[str, Any]:
+        """Map one result row to a dict, whatever the driver hands back.
+
+        This is the seam that differs between the two backends. SQLite can be
+        asked for sqlite3.Row and then supports row.keys(); libSQL has no
+        row_factory at all and returns plain tuples, so calling row.keys()
+        unconditionally raised AttributeError: 'tuple' object has no attribute
+        'keys' the first time a hosted database was queried. Both drivers do
+        expose cursor.description, so the names are taken from there and zipped
+        against the row. The keys() path is kept for any row that does offer it.
+        """
         if isinstance(row, dict):
             return row
-        return {key: row[key] for key in row.keys()}
+        keys = getattr(row, "keys", None)
+        if callable(keys):
+            return {key: row[key] for key in keys()}
+        if columns:
+            return dict(zip(columns, row))
+        raise TypeError(
+            f"cannot map a {type(row).__name__} row to column names: the cursor "
+            "exposed no description"
+        )
 
     # ------------------------------------------------------------ transaction
     @contextlib.contextmanager
@@ -321,6 +349,24 @@ def _is_comment_only(statement: str) -> bool:
         if line.strip() and not line.strip().startswith("--")
     ]
     return not body
+
+
+def _cursor_columns(cursor: Any) -> list[str] | None:
+    """Column names from a DB-API cursor description, or None if unavailable.
+
+    Description entries are 7-tuples per PEP 249, but this tolerates shorter ones
+    so an unusual driver cannot break every read.
+    """
+    description = getattr(cursor, "description", None)
+    if not description:
+        return None
+    names: list[str] = []
+    for item in description:
+        if isinstance(item, (tuple, list)) and item:
+            names.append(str(item[0]))
+        else:
+            names.append(str(item))
+    return names
 
 
 def load_migrations(directory: Path) -> list[Migration]:

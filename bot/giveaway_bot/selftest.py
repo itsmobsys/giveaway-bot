@@ -1697,6 +1697,114 @@ def test_migrations_are_bom_free() -> None:
         )
 
 
+def test_rows_are_mapped_for_any_driver() -> None:
+    """Result rows must be readable by name on both backends, not just SQLite.
+
+    SQLite can be configured to hand back sqlite3.Row, which supports row.keys().
+    libSQL has no row_factory attribute at all, so it returns plain tuples, and
+    code that called row.keys() unconditionally died with
+
+        AttributeError: 'tuple' object has no attribute 'keys'
+
+    on the first query against a hosted database - after migrations had already
+    been applied, so it looked like a data problem rather than a driver one.
+
+    The point of this check is the seam. It runs the real read path through a
+    connection that behaves like libSQL (tuples, description, no row_factory) so
+    the behaviour is asserted directly instead of inferred from SQLite passing.
+    """
+    from .config import Settings
+    from .db import Database
+
+    class _TupleCursor:
+        """A cursor shaped like libSQL's: tuples plus a description."""
+
+        def __init__(self, cursor: Any) -> None:
+            self._cursor = cursor
+
+        @property
+        def description(self) -> Any:
+            return self._cursor.description
+
+        @property
+        def lastrowid(self) -> Any:
+            return self._cursor.lastrowid
+
+        @property
+        def rowcount(self) -> Any:
+            return self._cursor.rowcount
+
+        def fetchall(self) -> list[tuple[Any, ...]]:
+            return [tuple(row) for row in self._cursor.fetchall()]
+
+        def close(self) -> None:
+            self._cursor.close()
+
+    class _TupleConnection:
+        """A connection that offers no row_factory, exactly like libSQL."""
+
+        def __init__(self, conn: Any) -> None:
+            self._conn = conn
+            assert not hasattr(self, "row_factory"), "stub must not accept row_factory"
+
+        def execute(self, sql: str, params: Any = ()) -> _TupleCursor:
+            return _TupleCursor(self._conn.execute(sql, params))
+
+        def close(self) -> None:
+            self._conn.close()
+
+    with _temp_database("driver-rows") as db:
+        # The migrations themselves populated schema_migrations, so this needs no
+        # extra fixture and no coupling to another table's columns.
+        assert db.scalar("SELECT COUNT(*) AS n FROM schema_migrations") == 6, (
+            "expected all six migrations applied in the scratch database"
+        )
+
+        # Read back through a libSQL-shaped connection.
+        inner = Database(_isolated_settings())
+        try:
+            real = inner._connect_factory()  # noqa: SLF001 - exercising the seam
+            inner._connect_factory = lambda: _TupleConnection(real)  # noqa: SLF001
+            assert inner.backend == "sqlite"
+
+            # The reported crash came through this exact query.
+            applied = inner.query_one("SELECT filename, checksum FROM schema_migrations")
+            assert applied is not None, "libSQL-shaped query returned nothing"
+            assert set(applied) == {"filename", "checksum"}, (
+                f"expected filename/checksum keys, got {applied!r}"
+            )
+            assert applied["filename"] == "0001_core.sql", (
+                f"values must line up with their columns, got {applied!r}"
+            )
+
+            listed = inner.query("SELECT filename, checksum FROM schema_migrations")
+            assert len(listed) == 6 and all(
+                isinstance(r["checksum"], str) and r["checksum"] for r in listed
+            ), "repeated reads must stay name-addressable over tuple rows"
+
+            count = inner.scalar("SELECT COUNT(*) AS n FROM schema_migrations")
+            assert count == 6, f"scalar() over tuple rows returned {count!r}"
+
+            # A join proves aliases and multiple columns map in order.
+            joined = inner.query(
+                "SELECT a.filename AS name, b.filename AS other"
+                " FROM schema_migrations a, schema_migrations b"
+                " WHERE a.filename = b.filename LIMIT 1"
+            )
+            assert len(joined) == 1 and set(joined[0]) == {"name", "other"}, (
+                f"aliased columns must map by name, got {joined!r}"
+            )
+        finally:
+            inner.close_all()
+
+        # And the real connection must not be relying on a row_factory either.
+        raw = db.connection()
+        assert getattr(raw, "row_factory", None) is None, (
+            "Database.connection() must not set row_factory: it is a silent no-op on "
+            "libSQL, so relying on it makes named rows work on SQLite only"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Cross-language vectors
 # --------------------------------------------------------------------------- #
@@ -1799,6 +1907,7 @@ def main() -> int:
     check.run("the shipped .env.example is a loadable config", test_example_env_file_loads)
     check.run("the root app.py shim reaches the bot", test_app_shim_entrypoint)
     check.run("migrations are BOM-free and loaders strip one", test_migrations_are_bom_free)
+    check.run("rows map by name on any driver, not just SQLite", test_rows_are_mapped_for_any_driver)
 
     check.section("Persistence + lifecycle")
     check.run("create -> join -> manage -> draw -> reroll", test_lifecycle)
