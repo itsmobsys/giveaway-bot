@@ -1,4 +1,4 @@
-"""Message-activity requirement — implementation notes and rationale.
+Message-activity requirement — implementation notes and rationale.
 
 Public specification for users: [`docs/MESSAGE_REQUIREMENTS.md`](../docs/MESSAGE_REQUIREMENTS.md).
 Normative draw rules (unaffected by this feature): `shared/FAIRNESS_SPEC.md`.

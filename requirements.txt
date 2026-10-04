@@ -31,7 +31,9 @@ tenacity==9.1.4
 # 0.1.11 is the newest published release - there is no 0.2.x. The previous
 # `>=0.2.1` specifier resolved to nothing, so a Turso deploy could not install.
 #
-# This is a Rust extension with prebuilt wheels, and there is no cp314 wheel:
-# Python 3.14 has to compile it from source. 3.11, 3.12 and 3.13 all have Linux
-# wheels, which is why render.yaml pins the bot to 3.13.
+# A Rust extension. libsql 0.1.11 publishes wheels for cp38-cp314, cp314 included
+# on manylinux, so the earlier claim here that "there is no cp314 wheel" was wrong.
+# The image stays on 3.13 (Dockerfile FROM python:3.13-slim) because that is the
+# interpreter the suite is tested against, not because a wheel is missing. Note
+# there is no cp314 wheel for Windows, so 3.14 is a Linux-only option.
 libsql>=0.1.11,<2

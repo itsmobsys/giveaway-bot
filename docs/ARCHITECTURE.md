@@ -138,7 +138,9 @@ others.
 
 ## Request flows
 
-**Public giveaway page** — server-rendered, `force-dynamic`, 15s CDN cache.
+**Public giveaway page** — server-rendered with `force-dynamic`, so no CDN cache. (A 15s `revalidate`
+  window is not configured; adding it would need `export const revalidate = 15`
+  in place of `force-dynamic`.)
 Reads `giveaways` + `giveaway_stats` + `guilds`. Exposes counts, never identity.
 
 **Public JSON** — `GET /api/giveaways/{id}`, plus `/verify` returning the seed,

@@ -177,10 +177,10 @@ The bot is containerised from the root `Dockerfile`. `render.yaml` sets:
 | `dockerfilePath` | `./Dockerfile` (build context: repository root) |
 | health check | none - a worker has no HTTP port to probe |
 
-The image is `python:3.13-slim` because the Turso driver (`libsql`) is a Rust
-extension with wheels for CPython 3.11, 3.12 and 3.13 only; on 3.14 pip tries to
-compile it from source and usually fails. Everything except Turso works on 3.14 if
-you install everything except `libsql`.
+The image is `python:3.13-slim` because that is the interpreter the suite is
+tested against. It is not forced by the Turso driver: `libsql` 0.1.11 publishes
+wheels for cp38-cp314, including cp314 on manylinux. The wheel set does have no
+cp314 for Windows, so 3.14 is a Linux-only option.
 
 `PYTHONPATH=/app/bot` runs the package from source rather than installing it,
 because the default migrations directory is derived from the source tree

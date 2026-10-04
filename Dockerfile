@@ -16,9 +16,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Dependencies first, so editing the source does not bust the layer cache.
-# 3.13 rather than 3.14 because the Turso driver (libsql) is a Rust extension with
-# wheels for cp311-cp313 only, and has to be compiled from source on 3.14.
+# libsql 0.1.11 publishes wheels for cp38-cp314, including cp314 on manylinux.
+# The image stays on 3.13 (Dockerfile FROM python:3.13-slim) because that is the
+# interpreter the suite is tested against, not because a wheel is missing - an
+# earlier version of this comment claimed there is no cp314 wheel, which was
+# wrong. Note the wheel set has no cp314 for Windows, so 3.14 is a Linux-only
+# option.
 COPY requirements.txt ./
 RUN pip install --upgrade pip && pip install -r requirements.txt
 

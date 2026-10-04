@@ -2698,6 +2698,76 @@ def test_stranded_queue_claims_are_requeued() -> None:
         assert "requeued_commands" in report, report
 
 
+def test_embeds_never_exceed_discord_limits() -> None:
+    """Every embed must fit, at the maximum length the validators allow.
+
+    The validators cap title at 256 and description at 4000 - Discord's title
+    limit and just under its 4096 description limit - and the renderer then
+    prepends an emoji to the title and appends the prize and status line to the
+    description. So a giveaway that validated perfectly produced a title of
+    258+ and a description of ~4600. channel.send() then raised HTTPException 400,
+    which render_giveaway caught and logged as a warning: the giveaway existed, was
+    running, had no message and message_id IS NULL, and nobody could ever enter it
+    - while /giveaway create reported success.
+    """
+    from .embeds import (
+        DISCORD_DESCRIPTION_LIMIT,
+        DISCORD_FIELD_VALUE_LIMIT,
+        DISCORD_TITLE_LIMIT,
+        _clip,
+        build_cancelled_embed,
+        build_giveaway_embed,
+        build_verify_embed,
+        build_winner_embed,
+    )
+
+    long = "x" * 4000
+    giveaway = _giveaway(
+        id="gw_limits",
+        title=long,
+        description=long,
+        prize=long,
+        participant_role_id="4242",
+        min_messages=100,
+    )
+
+    def check(embed: object, label: str) -> None:
+        title = getattr(embed, "title", None) or ""
+        description = getattr(embed, "description", None) or ""
+        assert len(title) <= DISCORD_TITLE_LIMIT, (
+            f"{label}: title is {len(title)} chars, Discord allows {DISCORD_TITLE_LIMIT}"
+        )
+        assert len(description) <= DISCORD_DESCRIPTION_LIMIT, (
+            f"{label}: description is {len(description)} chars, "
+            f"Discord allows {DISCORD_DESCRIPTION_LIMIT}"
+        )
+        for field in getattr(embed, "fields", []) or []:
+            assert len(field.name or "") <= 256, f"{label}: field name too long"
+            assert len(field.value or "") <= DISCORD_FIELD_VALUE_LIMIT, (
+                f"{label}: field {field.name!r} value is {len(field.value or '')} chars, "
+                f"Discord allows {DISCORD_FIELD_VALUE_LIMIT}"
+            )
+
+    check(build_giveaway_embed(giveaway, role_names={}, dashboard_url="", now=0), "giveaway")
+    check(build_cancelled_embed(giveaway), "cancelled")
+    check(
+        build_verify_embed(giveaway, {"ok": False, "errors": [long] * 5, "manifest": {}}),
+        "verify",
+    )
+    check(build_cancelled_embed(giveaway, reason=long), "cancelled with a long reason")
+    check(
+        build_winner_embed(giveaway, [], round_number=2, reroll=True,
+                           mention_winners=True, previous_winner_ids=[],
+                           activity_report=None),
+        "winner",
+    )
+
+    # _clip marks the cut rather than silently truncating.
+    assert _clip("abc", 10) == "abc"
+    clipped = _clip("y" * 50, 10)
+    assert len(clipped) == 10 and clipped.endswith("\u2026"), clipped
+
+
 # --------------------------------------------------------------------------- #
 # Transaction lifecycle and concurrent claiming
 # --------------------------------------------------------------------------- #
@@ -3181,6 +3251,7 @@ def main() -> int:
     )
     check.run("setup_hook and on_ready run without a gateway", test_startup_lifecycle_runs_offline)
     check.run("every embed and view renders", test_every_embed_and_view_renders)
+    check.run("embeds never exceed Discord limits", test_embeds_never_exceed_discord_limits)
     check.run("privileged intents and startup errors are actionable",
                test_intents_and_startup_error_explanations)
 

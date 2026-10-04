@@ -157,12 +157,26 @@ async function main(): Promise<void> {
       "guild_admins",
       "guilds",
       "bot_state",
+      // Dropped LAST, and this was the bug: schema_migrations survived, so
+      // appliedMap() still reported every migration as applied, `pending` came
+      // back empty, and the runner printed "Database is already up to date" with
+      // zero application tables. A --reset that leaves an empty schema is worse
+      // than one that fails.
+      "schema_migrations",
     ];
     // order matters for FKs; PRAGMA off so ordering issues cannot abort the drop
     await executeScript(["PRAGMA foreign_keys = OFF"]);
     await executeScript(tables.map((t) => `DROP TABLE IF EXISTS ${t}`));
     await executeScript(["PRAGMA foreign_keys = ON"]);
     await ensureBookkeeping();
+    // Nothing may be left claiming to be applied.
+    const afterReset = await appliedMap();
+    if (afterReset.size > 0) {
+      throw new Error(
+        `--reset did not clear schema_migrations (${afterReset.size} row(s) remain); ` +
+          "the schema is empty but the ledger still claims migrations ran",
+      );
+    }
   }
 
   const known = await appliedMap();

@@ -148,7 +148,11 @@ Stated plainly rather than glossed over:
 - [ ] `DISCORD_REDIRECT_URI` matches the registered redirect exactly (no trailing slash drift)
 - [ ] `NEXT_PUBLIC_APP_URL` and `CSRF_TRUSTED_ORIGINS` match the real hostname
 - [ ] `DISCORD_BOT_TOKEN` has least privilege, and the bot's role is above the entrants role
-- [ ] Server Members Intent and Message Content Intent are enabled
+- [ ] Server Members Intent is enabled
+
+  Message Content Intent is deliberately NOT required and should stay off: the bot
+  counts messages from gateway events and never reads message text. See
+  docs/DEPLOYMENT.md section 2.
 - [ ] Turso auth token is scoped to the one database, and rotated if leaked
 - [ ] `discord.com/developers/applications` → the app is private/internal if you do not want it listed
 - [ ] `npm audit --omit=dev` is clean
