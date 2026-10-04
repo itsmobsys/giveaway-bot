@@ -74,6 +74,11 @@ services:
     autoDeploy: true
     healthCheckPath: /api/health
     envVars:
+      # The dashboard verifies Manage Server against Discord's API on every
+      # admin page and action. Without it it refuses everyone and the panel
+      # reads "Not authorised" even for genuine server owners.
+      - key: DISCORD_BOT_TOKEN
+        sync: false
       - key: DISCORD_CLIENT_ID
         sync: false
       - key: DISCORD_CLIENT_SECRET
@@ -88,5 +93,3 @@ services:
         sync: false
       - key: NEXT_PUBLIC_APP_URL
         sync: false
-      - key: MIGRATIONS_DIR
-        value: /app/migrations

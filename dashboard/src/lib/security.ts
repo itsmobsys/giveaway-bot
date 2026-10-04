@@ -24,23 +24,74 @@ import { readSession } from "./session";
 const CSRF_COOKIE = "gw_csrf";
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
+/**
+ * Reduce a configured value to a bare origin.
+ *
+ * They were compared raw against `URL.origin`, which never carries a trailing
+ * slash or a path, so `NEXT_PUBLIC_APP_URL=https://dash.example.com/` matched
+ * nothing and *every* Server Action failed with "Request rejected. Reload the
+ * page and try again." with no diagnostic. Unparseable values are dropped and
+ * logged rather than silently allowed or silently fatal.
+ */
+function normaliseOrigin(value: string): string | null {
+  try {
+    const url = new URL(value.trim());
+    if (url.protocol !== "https:" && url.protocol !== "http:") return null;
+    return url.origin;
+  } catch {
+    return null;
+  }
+}
+
 function expectedOrigins(): Set<string> {
   const origins = new Set<string>();
   const configured = process.env.CSRF_TRUSTED_ORIGINS;
   if (configured) {
     for (const value of configured.split(",")) {
-      const trimmed = value.trim();
-      if (trimmed) origins.add(trimmed);
+      const origin = normaliseOrigin(value);
+      if (origin) origins.add(origin);
+      else console.warn(`[csrf] ignoring unparseable CSRF_TRUSTED_ORIGINS entry: ${value.trim()}`);
     }
   }
-  const appUrl = process.env.NEXT_PUBLIC_APP_URL?.trim();
-  if (appUrl) origins.add(appUrl);
+  const appUrl = process.env.NEXT_PUBLIC_APP_URL;
+  if (appUrl) {
+    const origin = normaliseOrigin(appUrl);
+    if (origin) origins.add(origin);
+    else console.warn(`[csrf] ignoring unparseable NEXT_PUBLIC_APP_URL: ${appUrl.trim()}`);
+  }
   // Vercel and Render both set this automatically.
   const vercel = process.env.VERCEL_URL?.trim();
   if (vercel) origins.add(`https://${vercel}`);
   const render = process.env.RENDER_EXTERNAL_URL?.trim();
   if (render) origins.add(render);
   return origins;
+}
+
+/**
+ * A same-origin path, or "/admin" if `candidate` is anything else.
+ *
+ * Rejects anything that is not a single-slash-rooted path. `"//evil.com"` is
+ * protocol-relative and `"\/evil.com"` is not: WHATWG URL parsing normalises a
+ * backslash to a slash for special schemes, so both resolve to a different host
+ * while a naive `startsWith("//")` check passes them. Verified:
+ *   new URL("/\\evil.com", "https://dash.example.com").href
+ *     === "https://evil.com/"
+ * The callback route's check was weaker still - `startsWith("/")` alone - so a
+ * plain "//evil.com" survived there. Both used to hand an attacker a redirect
+ * straight off a legitimate Discord login.
+ */
+export function safeInternalPath(candidate: string | null | undefined): string {
+  if (typeof candidate !== "string" || candidate.length === 0) return "/admin";
+  if (!candidate.startsWith("/")) return "/admin";
+  // A second slash makes the value protocol-relative ("//evil.com"), and a
+  // backslash anywhere is normalised to a slash by WHATWG URL parsing for special
+  // schemes, so "/\evil.com" reaches a different host too. Both name a host
+  // rather than a path, so both are rejected.
+  const second = candidate[1] ?? "";
+  if (second === "/" || second === "\\") return "/admin";
+  if (candidate.includes("\\")) return "/admin";
+  if (candidate.includes("\n") || candidate.includes("\r")) return "/admin";
+  return candidate;
 }
 
 /** Verify a mutating request came from our own origin. */
@@ -58,10 +109,6 @@ export function checkOrigin(headers: Headers): { ok: boolean; reason?: string } 
     originUrl = new URL(candidate);
   } catch {
     return { ok: false, reason: "malformed_origin" };
-  }
-
-  if (SAFE_METHODS.has(originUrl.protocol.toUpperCase())) {
-    return { ok: false, reason: "unexpected_method" };
   }
 
   const allowed = expectedOrigins();

@@ -13,6 +13,7 @@
 
 import { NextResponse } from "next/server";
 
+import { safeInternalPath } from "@/lib/security";
 import { discordConfigured, exchangeCode, fetchIdentity } from "@/lib/auth";
 import { all, run } from "@/lib/db";
 import { createSession, sessionsAvailable } from "@/lib/session";
@@ -67,7 +68,7 @@ export async function GET(request: Request): Promise<NextResponse> {
     // 4. Consume the state so it cannot be replayed.
     await run("UPDATE oauth_states SET consumed_at = ? WHERE state = ?", [Date.now(), state]);
 
-    const target = record.redirect_to.startsWith("/") ? record.redirect_to : "/admin";
+    const target = safeInternalPath(record.redirect_to);
     return NextResponse.redirect(new URL(target, url.origin));
   } catch (err) {
     console.error("OAuth callback failed:", err);

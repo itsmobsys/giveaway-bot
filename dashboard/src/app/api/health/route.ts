@@ -30,7 +30,14 @@ export async function GET(): Promise<Response> {
       {
         ok: false,
         database: "unreachable",
-        error: error instanceof Error ? error.message : "unknown error",
+        // Never echo the driver error to an unauthenticated caller: a Turso failure
+    // embeds the database hostname and a local SQLite failure embeds a filesystem
+    // path, which tells a scanner exactly which backend is in use and how it is
+    // misconfigured. The detail goes to the log instead.
+    error: "unreachable",
+    ...(process.env.NODE_ENV !== "production" && {
+      detail: error instanceof Error ? error.message : "unknown error",
+    }),
       },
       { status: 503, headers: { "Cache-Control": "no-store" } },
     );

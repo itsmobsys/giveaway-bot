@@ -232,7 +232,13 @@ export async function listAdminGuilds(userId: string): Promise<AdminGuild[]> {
        FROM guild_admins a
        JOIN guilds g ON g.id = a.guild_id
       WHERE a.user_id = ?
-        AND a.permissions != 0
+        -- Filter on the admin bits, not "has any permission at all".
+        -- requireGuildAdmin records a row for every member it can resolve, admin
+        -- or not, storing their true permission bitfield, so a != 0 test matched
+        -- member whose only permission was VIEW_CHANNEL. Their guild then appeared
+        -- on /admin with its name, icon, member count and giveaway analytics, and
+        -- they could read every giveaway, entry and winner in it.
+        AND (CAST(a.permissions AS INTEGER) & 41) != 0
         AND g.bot_present = 1
       ORDER BY g.name COLLATE NOCASE`,
     [userId],

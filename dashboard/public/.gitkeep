@@ -1,0 +1,3 @@
+# Next.js serves this directory as-is at the site root.
+# It must exist: the Dockerfile copies /app/public out of the builder stage,
+# and git cannot track an empty directory.

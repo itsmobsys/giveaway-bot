@@ -27,9 +27,10 @@ services:
       context: ./dashboard
       dockerfile: Dockerfile
     restart: unless-stopped
-    ports:
-      - "3000:3000"
     environment:
+      # Required: the dashboard checks Manage Server against Discord before every
+      # admin action. Without it every admin page is refused.
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN}
       NODE_ENV: production
       PORT: "3000"
       TURSO_DATABASE_URL: ${TURSO_DATABASE_URL}

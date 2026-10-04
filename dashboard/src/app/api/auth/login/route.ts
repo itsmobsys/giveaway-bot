@@ -1,3 +1,4 @@
+import { safeInternalPath } from "@/lib/security";
 import { all, first, nowMs, run } from "@/lib/db.ts";
 import { readSession } from "@/lib/session.ts";
 
@@ -21,9 +22,7 @@ export async function GET(request: Request): Promise<NextResponse> {
   const url = new URL(request.url);
   const redirectTo = url.searchParams.get("redirect_to") ?? "/admin";
   // Only allow same-site relative paths, so this cannot be used as an open redirect.
-  const safeRedirect = redirectTo.startsWith("/") && !redirectTo.startsWith("//")
-    ? redirectTo
-    : "/admin";
+  const safeRedirect = safeInternalPath(redirectTo);
 
   if (!discordConfigured()) {
     return NextResponse.json(
