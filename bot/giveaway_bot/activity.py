@@ -172,9 +172,15 @@ class MessageActivityTracker:
             with self._lock:
                 self.stats["skipped_invalid"] += 1
             return
-        # Ignore bots/webhooks and empty messages: counting them would let a
-        # giveaway be farmed by an automated account.
-        if is_bot or content_length == 0:
+        # Ignore bots/webhooks: counting them would let a giveaway be farmed
+        # by an automated account. Empty messages are COUNTED, not skipped:
+        # without the privileged Message Content Intent (deliberately off -
+        # the bot never reads message text) Discord delivers "" as the content
+        # of every ordinary message, so an emptiness check would discard all
+        # live traffic and no message-gated giveaway could ever be entered.
+        # `content_length` is kept as a parameter so callers and tests do not
+        # churn, but it no longer gates anything.
+        if is_bot:
             with self._lock:
                 self.stats["skipped_bot"] += 1
             return

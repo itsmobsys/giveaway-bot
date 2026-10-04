@@ -56,11 +56,13 @@ def build_intents() -> discord.Intents:
       payloads unless this intent is on, so those two rules cannot be evaluated
       without it. A connection that requests it while the portal has it off is
       refused outright with PrivilegedIntentsRequired.
-    * ``message_content`` is deliberately left off. Message counting uses gateway
-      events and never reads message text, so there is no reason to ask Discord for
-      the content of every message in the server. discord.py logs "privileged
-      message content intent is missing" regardless; that warning is expected and
-      harmless for a slash-command-only bot.
+    * ``message_content`` is deliberately left off. Message counting counts
+      gateway events and never reads message text, so there is no reason to ask
+      Discord for the content of every message in the server. Consequence, by
+      design: every message arrives with empty content, so emptiness can never
+      gate counting (and ``!`` prefix commands cannot trigger - use slash
+      commands). discord.py logs "privileged message content intent is missing"
+      regardless; that warning is expected and harmless.
     """
     intents = discord.Intents.default()
     intents.members = True

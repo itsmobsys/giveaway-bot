@@ -780,7 +780,9 @@ def test_message_tracker_buffering() -> None:
         )
         assert activity_repo.get_count(db, "500", "2100") == 0
 
-        # Bots and empty messages are ignored even with counting enabled.
+        # Bots are ignored even with counting enabled. Empty messages are
+        # counted: without Message Content Intent every message arrives with
+        # empty content, so skipping empties would skip everything.
         service.create(
             actor, guild_id="500", channel_id="501",
             payload={"title": "t", "prize": "p", "duration": "1h", "min_messages": 3},
@@ -790,25 +792,26 @@ def test_message_tracker_buffering() -> None:
             guild_id="500", user_id="2100", channel_id="501",
             message_id="1100", message_at=now, is_bot=True, content_length=10,
         )
+        assert tracker.stats["skipped_bot"] == 1, "bot messages must be skipped"
         tracker.record_raw(
             guild_id="500", user_id="2100", channel_id="501",
             message_id="1101", message_at=now, content_length=0,
         )
-        assert tracker.stats["skipped_bot"] == 2, "bot and empty messages must be skipped"
+        assert tracker.pending() == 1, "an empty-content message is still an event"
 
-        # Real messages buffer, then flush.
+        # Real messages buffer, then flush (one event is already buffered above).
         for index in range(4):
             tracker.record_raw(
                 guild_id="500", user_id="2100", channel_id="501",
                 message_id=str(1200 + index), message_at=now, content_length=5,
             )
-        assert tracker.pending() == 4, "events must buffer rather than write per message"
+        assert tracker.pending() == 5, "events must buffer rather than write per message"
         assert activity_repo.get_count(db, "500", "2100") == 0, "no write before flush"
 
         tracker.flush_all()
         assert tracker.pending() == 0, "flush must drain the buffer"
-        assert activity_repo.get_count(db, "500", "2100") == 4, (
-            f"all 4 messages must be counted, got {activity_repo.get_count(db, '500', '2100')}"
+        assert activity_repo.get_count(db, "500", "2100") == 5, (
+            f"all 5 messages must be counted, got {activity_repo.get_count(db, '500', '2100')}"
         )
 
         # A queued participant is now eligible without any further action.
@@ -2332,13 +2335,17 @@ def test_tracker_record_reads_a_real_timestamp() -> None:
             "the message was not persisted, so the requirement could never be met"
         )
 
-        # Bots, webhooks and empty messages are still refused through record().
+        # Bots and webhooks are still refused through record(). Empty content
+        # is counted: without Message Content Intent that is every message.
         before = dict(tracker.stats)
         tracker.record(_message(id="1750000000000000002", author=_Obj(id="2101", bot=True)))
-        tracker.record(_message(id="1750000000000000003", content=""))
         tracker.record(_message(id="1750000000000000004", webhook_id="99"))
-        assert tracker.stats["skipped_bot"] == before["skipped_bot"] + 3, (
-            f"bot/webhook/empty messages were not all skipped: {dict(tracker.stats)}"
+        assert tracker.stats["skipped_bot"] == before["skipped_bot"] + 2, (
+            f"bot/webhook messages were not skipped: {dict(tracker.stats)}"
+        )
+        tracker.record(_message(id="1750000000000000003", content=""))
+        assert activity_repo.get_count(db, "800", "2100") == 1, (
+            "count must not have moved before a flush"
         )
 
         # A message with no usable timestamp falls back to now rather than raising.
@@ -2348,8 +2355,9 @@ def test_tracker_record_reads_a_real_timestamp() -> None:
         tracker.record(_message(id="1750000000000000006", created_at="not-a-datetime"))
         with tracker._lock:
             state = tracker._states.get("800")
-            assert state is not None and len(state.buffer) == 2, (
-                "a missing or unusable created_at must still be recorded"
+            assert state is not None and len(state.buffer) == 3, (
+                "a missing or unusable created_at must still be recorded "
+                "(buffer holds the empty-content event plus these two)"
             )
 
 
