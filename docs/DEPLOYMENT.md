@@ -1,4 +1,4 @@
-﻿# Deployment
+# Deployment
 
 Two processes share one Turso database:
 
@@ -270,6 +270,17 @@ transaction, leaving the previous schema intact.
 ---
 
 ## Troubleshooting
+
+These two lines on every start are **expected and harmless**:
+
+`
+WARNING discord.client  PyNaCl is not installed, voice will NOT be supported
+WARNING discord.client  davey is not installed, voice will NOT be supported
+`
+
+They come from discord.py and mean only that voice channels are unavailable. This
+bot never joins one, so neither package is a dependency. They are left unfixed on
+purpose rather than silenced by installing an unused crypto library.
 
 | Symptom | Cause |
 | --- | --- |

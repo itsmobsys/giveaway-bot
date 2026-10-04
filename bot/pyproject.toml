@@ -73,6 +73,11 @@ ignore = ["S101", "B008"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S", "E501"]
+# S608 flags any SQL built with an f-string. Every occurrence in repositories/ was
+# checked by hand: they interpolate only generated "?" placeholders and clause
+# literals assembled from constant keywords, never a caller's value. Kept enabled
+# elsewhere so a real injection would still be reported.
+"giveaway_bot/repositories/*" = ["S608"]
 
 [tool.mypy]
 python_version = "3.11"

@@ -1,4 +1,4 @@
-﻿"""Command line interface.
+"""Command line interface.
 
     python -m giveaway_bot migrate        # apply pending SQL migrations
     python -m giveaway_bot selftest       # run the fairness + eligibility suite

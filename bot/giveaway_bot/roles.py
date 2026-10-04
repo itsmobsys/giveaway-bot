@@ -280,9 +280,12 @@ class RoleManager:
                     granted += 1
                 except discord.HTTPException:
                     pass
-            elif has_role and not should_have:
+            elif (
+                has_role
+                and not should_have
                 # Only strip from members we granted it to.
-                if entries_repo.has_bot_grant(self.db, giveaway.id, str(member.id)):
+                and entries_repo.has_bot_grant(self.db, giveaway.id, str(member.id))
+            ):
                     try:
                         await member.remove_roles(role, reason="Giveaway Bot: reconcile entrants")
                         revoked += 1

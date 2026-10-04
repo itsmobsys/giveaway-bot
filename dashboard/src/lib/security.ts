@@ -1,4 +1,4 @@
-﻿/**
+/**
  * CSRF protection and shared rate limiting.
  *
  * CSRF

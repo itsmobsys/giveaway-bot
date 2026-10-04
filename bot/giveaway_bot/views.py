@@ -75,6 +75,11 @@ class GiveawayView(discord.ui.View):
         can_manage: bool = False,
         timeout: float | None = None,
     ) -> None:
+        # View.__init__ creates self._children, which add_item() appends to, so it
+        # has to run before the first add_item() below. Calling it last raised
+        # AttributeError: 'GiveawayView' object has no attribute '_children' -
+        # meaning the live giveaway message could never be built.
+        super().__init__(timeout=timeout)
         self.giveaway_id = giveaway_id
         self.dashboard_url = dashboard_url
         self._entered: set[str] = set()
@@ -117,8 +122,6 @@ class GiveawayView(discord.ui.View):
                 )
             )
 
-        super().__init__(timeout=timeout)
-
     def mark_entered(self, user_id: str, entered: bool) -> None:
         if entered:
             self._entered.add(str(user_id))
@@ -140,6 +143,7 @@ class WinnerView(discord.ui.View):
         dashboard_url: str = "",
         can_manage: bool = False,
     ) -> None:
+        super().__init__(timeout=None)  # before add_item(); see GiveawayView
         self.giveaway_id = giveaway_id
         if can_manage and on_reroll is not None:
             reroll = discord.ui.Button(
@@ -159,13 +163,13 @@ class WinnerView(discord.ui.View):
                     url=f"{dashboard_url}/g/{giveaway_id}#verification",
                 )
             )
-        super().__init__(timeout=None)
 
 
 class VerifyView(discord.ui.View):
     """`/giveaway reveal` output."""
 
     def __init__(self, giveaway_id: str, *, dashboard_url: str = "") -> None:
+        super().__init__(timeout=None)  # before add_item(); see GiveawayView
         if dashboard_url:
             self.add_item(
                 discord.ui.Button(
@@ -175,7 +179,6 @@ class VerifyView(discord.ui.View):
                     url=f"{dashboard_url}/g/{giveaway_id}#verification",
                 )
             )
-        super().__init__(timeout=None)
 
 
 REASON_EMOJI = {
@@ -228,6 +231,12 @@ def eligibility_embed(result: Any) -> discord.Embed | None:
 
     embed.set_footer(text="Eligibility is re-checked every time you press the button.")
     return embed
+
+
+def entry_count_footer(giveaway: Giveaway) -> str:
+    """One-line entry summary for a giveaway with no message requirement."""
+    count = giveaway.entry_count
+    return f"{count} {'entry' if count == 1 else 'entries'}"
 
 
 def progress_footer(giveaway: Giveaway) -> str:

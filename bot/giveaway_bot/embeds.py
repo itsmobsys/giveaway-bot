@@ -7,7 +7,7 @@ fairness claim is visible in Discord itself (not only on the dashboard).
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import discord
@@ -55,7 +55,7 @@ def format_duration(ms: int) -> str:
 def format_timestamp(ms: int | None, *, style: str = "f") -> str:
     if not ms:
         return "not set"
-    moment = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    moment = datetime.fromtimestamp(ms / 1000, tz=UTC)
     if style == "R":
         return discord.utils.format_dt(moment, "R")
     return discord.utils.format_dt(moment, "f")
@@ -83,11 +83,14 @@ def progress_bar(remaining_ms: int, total_ms: int, *, width: int = 24) -> str:
 
 
 def status_line(giveaway: Giveaway, *, now: int | None = None) -> str:
-    current = now if now is not None else int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    current = now if now is not None else int(datetime.now(tz=UTC).timestamp() * 1000)
     emoji = STATUS_EMOJI[giveaway.status]
     if giveaway.status is GiveawayStatus.RUNNING and giveaway.ends_at:
         remaining = max(0, giveaway.ends_at - current)
-        return f"{emoji} **Ends** {format_timestamp(giveaway.ends_at, style='R')} · `{format_duration(remaining)}` left"
+        return (
+            f"{emoji} **Ends** {format_timestamp(giveaway.ends_at, style='R')} · "
+            f"`{format_duration(remaining)}` left"
+        )
     if giveaway.status is GiveawayStatus.PAUSED:
         return (
             f"{emoji} **Paused** with `{format_duration(giveaway.paused_remaining_ms or 0)}` remaining"
@@ -105,7 +108,7 @@ def build_giveaway_embed(
     now: int | None = None,
 ) -> discord.Embed:
     """The live giveaway embed (running / paused / scheduled)."""
-    current = now if now is not None else int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+    current = now if now is not None else int(datetime.now(tz=UTC).timestamp() * 1000)
     color = STATUS_COLORS[giveaway.status]
     rules = summarise_rules(giveaway, role_names=role_names)
 
@@ -182,7 +185,7 @@ def build_giveaway_embed(
     embed.set_footer(
         text=f"Giveaway {giveaway.id} · host {host} · provably fair draw"
     )
-    embed.timestamp = datetime.fromtimestamp((giveaway.updated_at or current) / 1000, tz=timezone.utc)
+    embed.timestamp = datetime.fromtimestamp((giveaway.updated_at or current) / 1000, tz=UTC)
 
     if giveaway.seed_commitment:
         embed.add_field(
@@ -339,5 +342,5 @@ def member_mention(user_id: str) -> str:
 def relative_time(ms: int | None) -> str:
     if not ms:
         return "unknown"
-    delta = timedelta(milliseconds=ms - int(datetime.now(tz=timezone.utc).timestamp() * 1000))
-    return discord.utils.format_dt(datetime.now(tz=timezone.utc) + delta, "R")
+    delta = timedelta(milliseconds=ms - int(datetime.now(tz=UTC).timestamp() * 1000))
+    return discord.utils.format_dt(datetime.now(tz=UTC) + delta, "R")

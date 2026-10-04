@@ -77,7 +77,8 @@ live updates, dark mode.
 python -m pip install -r requirements.txt
 cd bot
 python -m giveaway_bot migrate
-python -m giveaway_bot selftest      # 29 checks, no token or network needed
+python -m giveaway_bot selftest      # 35 checks, no token or network needed
+python -m ruff check giveaway_bot  # or: ruff check .  (from bot/)
 cd ..
 
 # 2. Dashboard

@@ -79,7 +79,7 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def normalise_status(value: "GiveawayStatus | str | None") -> GiveawayStatus:
+def normalise_status(value: GiveawayStatus | str | None) -> GiveawayStatus:
     """Coerce any status representation into the enum.
 
     Uses the lookup table rather than ``GiveawayStatus(value)`` so that an

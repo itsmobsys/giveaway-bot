@@ -166,9 +166,7 @@ class Settings(BaseSettings):
     def guild_allowed(self, guild_id: str) -> bool:
         if guild_id in self.guild_blocklist:
             return False
-        if self.guild_allowlist and guild_id not in self.guild_allowlist:
-            return False
-        return True
+        return not self.guild_allowlist or guild_id in self.guild_allowlist
 
 
 @lru_cache(maxsize=1)

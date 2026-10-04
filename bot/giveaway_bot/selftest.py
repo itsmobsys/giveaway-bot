@@ -28,15 +28,14 @@ import sys
 import tempfile
 import time
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .config import Settings
 from .db import Database
 from .eligibility import Reason, evaluate_join
-from .repositories import control
 from .fairness import (
     METHOD,
     DrawEntry,
@@ -48,6 +47,7 @@ from .fairness import (
     score_entry,
     verify_draw,
 )
+from .repositories import control
 from .validation import parse_duration, validate_giveaway_payload
 
 VECTOR_PATH = Path(__file__).resolve().parents[2] / "shared" / "test_vectors.json"
@@ -571,8 +571,8 @@ def test_message_requirement_validation() -> None:
 def test_message_counting_and_gating() -> None:
     """End-to-end: counters, duplicate protection and the join gate."""
     from .repositories import activity as activity_repo
-    from .repositories import activity as activity_repo, control
-    from .repositories import entries as entries_repo, guilds as guilds_repo
+    from .repositories import control
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("activity") as db:
@@ -752,7 +752,8 @@ def test_message_count_idempotency() -> None:
 def test_message_tracker_buffering() -> None:
     """The tracker must skip work when no requirement exists, and flush in bulk."""
     from .activity import MessageActivityTracker
-    from .repositories import activity as activity_repo, entries as entries_repo, guilds as guilds_repo
+    from .repositories import activity as activity_repo
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("tracker") as db:
@@ -822,7 +823,9 @@ def test_message_tracker_buffering() -> None:
 
 def test_message_revalidation() -> None:
     """Revalidation flags only who fails today, and is audited."""
-    from .repositories import activity as activity_repo, entries as entries_repo, guilds as guilds_repo
+    from .repositories import activity as activity_repo
+    from .repositories import entries as entries_repo
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("revalidate") as db:
@@ -935,7 +938,9 @@ def test_no_admin_override_exists() -> None:
 
 def test_role_grant_on_entry() -> None:
     """Joining must queue exactly one role grant for the entrants role."""
-    from .repositories import entries as entries_repo, giveaways as gw_repo, guilds as guilds_repo
+    from .repositories import entries as entries_repo
+    from .repositories import giveaways as gw_repo
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("role-grant") as db:
@@ -980,7 +985,9 @@ def test_role_grant_on_entry() -> None:
 
 def test_role_release_provenance() -> None:
     """Only bot grants are released; a human-assigned role is left alone."""
-    from .repositories import entries as entries_repo, giveaways as gw_repo, guilds as guilds_repo
+    from .repositories import entries as entries_repo
+    from .repositories import giveaways as gw_repo
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("role-release") as db:
@@ -1021,7 +1028,8 @@ def test_role_release_provenance() -> None:
 
 def test_role_task_retry() -> None:
     """A failing role task is retried, then marked failed - never lost."""
-    from .repositories import giveaways as gw_repo, guilds as guilds_repo
+    from .repositories import giveaways as gw_repo
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("role-retry") as db:
@@ -1075,7 +1083,8 @@ def test_role_task_retry() -> None:
 
 def test_single_active_giveaway() -> None:
     """One open giveaway per guild keeps the entrants role unambiguous."""
-    from .repositories import giveaways as gw_repo, guilds as guilds_repo
+    from .repositories import giveaways as gw_repo
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("single-active") as db:
@@ -1119,9 +1128,17 @@ def test_single_active_giveaway() -> None:
 def test_lifecycle() -> None:
     from .repositories import (
         control,
+    )
+    from .repositories import (
         draws as draws_repo,
+    )
+    from .repositories import (
         entries as entries_repo,
+    )
+    from .repositories import (
         giveaways as gw_repo,
+    )
+    from .repositories import (
         guilds as guilds_repo,
     )
     from .service import Actor, GiveawayService
@@ -1334,7 +1351,8 @@ def test_lifecycle() -> None:
 
 def test_crash_recovery() -> None:
     """A draw interrupted between phases must finish on restart."""
-    from .repositories import giveaways as gw_repo, guilds as guilds_repo
+    from .repositories import giveaways as gw_repo
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("crash") as db:
@@ -1627,7 +1645,9 @@ def test_app_shim_entrypoint() -> None:
     probe_dir = tempfile.mkdtemp(prefix="giveaway-appshim-")
     try:
         def probe(args: list[str]) -> int:
-            return subprocess.run(
+            # S603: fixed argv, no shell, and args come from this file's own
+            # literals - the point is to assert the exit code app.py returns.
+            return subprocess.run(  # noqa: S603
                 [sys.executable, str(app), *args],
                 cwd=probe_dir,
                 capture_output=True,
@@ -1713,7 +1733,6 @@ def test_rows_are_mapped_for_any_driver() -> None:
     connection that behaves like libSQL (tuples, description, no row_factory) so
     the behaviour is asserted directly instead of inferred from SQLite passing.
     """
-    from .config import Settings
     from .db import Database
 
     class _TupleCursor:
@@ -1804,6 +1823,302 @@ def test_rows_are_mapped_for_any_driver() -> None:
             "libSQL, so relying on it makes named rows work on SQLite only"
         )
 
+
+def _build_offline_bot(name: str) -> tuple[Any, Database, Settings, str]:
+    """A GiveawayBot wired to a throwaway database, without any gateway.
+
+    Constructing one is enough to catch attribute and construction errors, and it
+    needs neither a token nor a network, so the startup path can be exercised in
+    CI rather than discovered on a deploy.
+    """
+    from .bot import GiveawayBot
+    from .db import Database
+    from .service import GiveawayService
+
+    tmp = tempfile.mkdtemp(prefix=f"giveaway-{name}-")
+    settings = _isolated_settings(
+        sqlite_path=str(Path(tmp) / "bot.db"),
+        discord_bot_token="x" * 59,  # shape only; never used to connect
+        migrations_dir=Path(__file__).resolve().parents[2] / "shared" / "migrations",
+    )
+    db = Database(settings)
+    db.migrate(verbose=False)
+    bot = GiveawayBot(GiveawayService(db, settings), db, settings)
+    return bot, db, settings, tmp
+
+
+def test_startup_lifecycle_runs_offline() -> None:
+    """setup_hook and on_ready must run without a gateway connection.
+
+    Everything from construction to a live client had only ever executed on a
+    deployed host, and it failed three times in a row there, each failure hiding
+    the next: the activity collision, then a missing cog entry point, and each one
+    sat in front of the next crash. Both hooks are driven here with the single
+    gateway-dependent call stubbed out - tree.sync() needs a real connection, and
+    is the only thing in setup_hook that does.
+    """
+    import asyncio
+
+
+    bot, db, _settings, tmp = _build_offline_bot("lifecycle")
+    synced: list[str] = []
+
+    async def fake_sync(*_args: object, **_kwargs: object) -> list[Any]:
+        synced.append("tree.sync")
+        return []
+
+    async def drive() -> None:
+        # The one call that genuinely requires a live gateway.
+        bot.tree.sync = fake_sync  # type: ignore[method-assign]
+        await bot.setup_hook()
+
+        job_names = {job.name for job in bot.scheduler.jobs}
+        expected = {
+            "end_due",
+            "queue",
+            "refresh",
+            "maintenance",
+            "activity_flush",
+            "activity_backfill",
+            "role_tasks",
+        }
+        missing = expected - job_names
+        assert not missing, f"setup_hook did not register job(s): {sorted(missing)}"
+
+        assert len(bot.tree.get_commands()) > 0, "no slash commands were registered"
+        # Two groups: `giveaway` (public commands) and `give` (staff commands).
+        for group_name in ("giveaway", "give"):
+            group = bot.tree.get_command(group_name)
+            assert group is not None, f"command group {group_name!r} was not registered"
+            assert len(group.commands) > 0, f"group {group_name!r} has no subcommands"
+
+        # on_ready normally fires after a connection; the recovery and
+        # reconciliation it performs are all database work, so they run offline.
+        await bot.on_ready()
+
+        await bot.close()
+
+    try:
+        asyncio.run(drive())
+        assert synced == ["tree.sync"], "setup_hook must sync application commands"
+        assert db.backend in {"sqlite", "turso"}
+    finally:
+        db.close_all()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_bot_constructs_without_shadowing_discord() -> None:
+    """GiveawayBot must be constructible, and must not shadow discord.py.
+
+    The bot had never been constructed outside a real gateway session, so nothing
+    checked that assigning our attributes onto a commands.Bot was legal. It was
+    not: `self.activity = MessageActivityTracker(...)` hit discord.Client's
+    `activity` property, whose setter demands a BaseActivity, and every deploy
+    died with
+
+        TypeError: activity must derive from BaseActivity.
+
+    Two things are asserted. First that construction and extension loading
+    actually work, offline. Second - and this is the part that generalises - that
+    no attribute assigned in __init__ collides with a name discord.py already
+    defines, so the next person to add one is caught before a deploy rather than
+    after.
+    """
+    import asyncio
+    import inspect
+    import re
+
+    import discord
+    from discord.ext import commands as dpy_commands
+
+    from .bot import GiveawayBot
+    from .db import Database
+    from .service import GiveawayService
+
+    # --- the generic guard, checked before anything is instantiated ---------
+    assigned = sorted(set(re.findall(r"self\.(\w+)\s*=", inspect.getsource(GiveawayBot.__init__))))
+    assert assigned, "could not read GiveawayBot.__init__ to check for collisions"
+    reserved: dict[str, str] = {}
+    for klass in dpy_commands.Bot.__mro__:
+        for name in vars(klass):
+            reserved.setdefault(name, klass.__name__)
+    collisions = [
+        f"{name} (defined on {reserved[name]})"
+        for name in assigned
+        if name in reserved
+    ]
+    assert not collisions, (
+        "GiveawayBot.__init__ assigns attribute(s) that discord.py already "
+        f"defines: {collisions}. Assigning over them either silently breaks the "
+        "client or hits a property setter that validates the type."
+    )
+
+    # --- construction, offline ------------------------------------------------
+    tmp = tempfile.mkdtemp(prefix="giveaway-construct-")
+    try:
+        settings = _isolated_settings(
+            sqlite_path=str(Path(tmp) / "bot.db"),
+            discord_bot_token="x" * 59,  # shape only; never used to connect
+            migrations_dir=Path(__file__).resolve().parents[2] / "shared" / "migrations",
+        )
+        db = Database(settings)
+        db.migrate(verbose=False)
+        bot = GiveawayBot(GiveawayService(db, settings), db, settings)
+
+        async def exercise() -> None:
+            # Cog loading is the other thing that only ever ran on a live
+            # connection. tree.sync() needs the gateway, so it is not called.
+            await bot.load_extension("giveaway_bot.cogs.giveaways")
+            await bot.load_extension("giveaway_bot.cogs.admin")
+            assert len(bot.tree.get_commands()) > 0, "no slash commands registered"
+            await bot.close()
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            db.close_all()
+
+        assert isinstance(bot, discord.Client), "GiveawayBot must still be a Client"
+        # The client's own activity attribute must be untouched and unused: this
+        # bot never joins a voice channel.
+        assert bot.activity is None, (
+            "GiveawayBot must leave discord.Client.activity alone (None); "
+            f"found {bot.activity!r}"
+        )
+        assert type(bot.activity_tracker).__name__ == "MessageActivityTracker", (
+            "the message-activity tracker must be reachable as .activity_tracker"
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_every_embed_and_view_renders() -> None:
+    """Every embed builder and view must render without a NameError.
+
+    The whole presentation layer was untested, and it shipped a function calling a
+    name that does not exist:
+
+        def progress_footer(giveaway):
+            ...
+            return entry_count_footer(giveaway)   # never defined
+
+    Nothing caught it because no test ever called a builder - the failure only
+    appeared on a live deploy. Every public builder and every view constructor is
+    now called here with a synthetic giveaway, in both the requirement and no
+    requirement configurations, so an undefined or misspelled name in any of them
+    fails here instead of in front of a user.
+    """
+    import discord
+
+    from . import embeds, views
+
+    outcomes: list[str] = []
+
+    def attempt(label: str, fn: Any) -> None:
+        try:
+            value = fn()
+        except Exception as exc:  # noqa: BLE001 - reported below
+            raise AssertionError(
+                f"{label} raised {type(exc).__name__}: {exc}"
+            ) from exc
+        assert value is not None, f"{label} returned None"
+        if isinstance(value, discord.Embed):
+            assert value.title is not None or len(value.fields) > 0, (
+                f"{label} produced an empty embed"
+            )
+        outcomes.append(label)
+
+    # Both configurations: with a message requirement and without, because the
+    # requirement branch is exactly where the missing helper was referenced.
+    plain = _giveaway()
+    with_requirement = _giveaway(
+        id="gw_req",
+        min_messages=25,
+        message_count_scope="channel",
+        message_count_channel_ids=["11", "12"],
+    )
+
+    for giveaway in (plain, with_requirement):
+        tag = "req" if giveaway.min_messages else "plain"
+        attempt(f"embeds.status_line[{tag}]", lambda g=giveaway: embeds.status_line(g))
+        attempt(f"embeds.build_giveaway_embed[{tag}]",
+                lambda g=giveaway: embeds.build_giveaway_embed(g))
+        attempt(f"embeds.build_paused_embed[{tag}]",
+                lambda g=giveaway: embeds.build_paused_embed(g, reason="testing"))
+        attempt(f"embeds.build_cancelled_embed[{tag}]",
+                lambda g=giveaway: embeds.build_cancelled_embed(g, reason="testing"))
+        attempt(f"views.joined_embed[{tag}]",
+                lambda g=giveaway: views.joined_embed(g, entry_seq=1, max_entries=1))
+        attempt(f"views.left_embed[{tag}]", lambda g=giveaway: views.left_embed(g))
+        # progress_footer is the function that referenced the undefined name.
+        attempt(f"views.progress_footer[{tag}]", lambda g=giveaway: views.progress_footer(g))
+
+    attempt("embeds.build_winner_embed",
+            lambda: embeds.build_winner_embed(plain, [("200000000000000001", "Winner")]))
+    attempt("embeds.build_winner_embed[reroll]",
+            lambda: embeds.build_winner_embed(
+                plain, [("200000000000000001", "Winner")], round_number=2, reroll=True))
+    attempt("embeds.build_verify_embed[ok]",
+            lambda: embeds.build_verify_embed(plain, {"ok": True, "checks": []}))
+    attempt("embeds.build_verify_embed[missing]",
+            lambda: embeds.build_verify_embed(plain, None))
+
+    attempt("embeds.format_duration", lambda: embeds.format_duration(90_000))
+    attempt("embeds.format_timestamp", lambda: embeds.format_timestamp(1_700_000_000_000))
+    attempt("embeds.relative_time", lambda: embeds.relative_time(1_700_000_000_000))
+    attempt("embeds.progress_bar", lambda: embeds.progress_bar(1000, 10000))
+    attempt("embeds.member_mention", lambda: embeds.member_mention("200000000000000001"))
+    # Round-trip the custom id: the button callbacks depend on this format, and a
+    # separator change here would silently break every button.
+    cid = views.custom_id("gw_x", "join")
+    parsed = views.parse_custom_id(cid)
+    assert parsed == ("gw_x", "join"), f"custom id round-trip failed: {cid!r} -> {parsed!r}"
+    assert views.parse_custom_id("nonsense") is None, "malformed custom ids must be rejected"
+
+    async def noop(*_a: Any, **_k: Any) -> None:
+        return None
+
+    attempt("views.GiveawayView",
+            lambda: views.GiveawayView("gw_x", on_join=noop, on_leave=noop))
+    attempt("views.GiveawayView[manage]",
+            lambda: views.GiveawayView(
+                "gw_x", on_join=noop, on_leave=noop, can_manage=True, dashboard_url="https://x"))
+    attempt("views.WinnerView", lambda: views.WinnerView("gw_x", dashboard_url="https://x"))
+    attempt("views.VerifyView", lambda: views.VerifyView("gw_x", dashboard_url="https://x"))
+
+    # The views must actually carry their buttons. Constructing without raising is
+    # not enough: a view that silently lost a button would still "work" here.
+    async def _noop(*_a: Any, **_k: Any) -> None:
+        return None
+
+    public_view = views.GiveawayView("gw_x", on_join=_noop, on_leave=_noop)
+    assert len(public_view.children) == 2, (
+        f"a public giveaway needs join + leave, got {len(public_view.children)}"
+    )
+
+    managed_view = views.GiveawayView(
+        "gw_x", on_join=_noop, on_leave=_noop, on_reroll=_noop, can_manage=True
+    )
+    assert len(managed_view.children) == 3, (
+        "a manageable giveaway needs join + leave + reroll, got "
+        f"{len(managed_view.children)}"
+    )
+    assert managed_view.is_entered("42") is False
+    managed_view.mark_entered("42", True)
+    assert managed_view.is_entered("42") is True
+    managed_view.mark_entered("42", False)
+    assert managed_view.is_entered("42") is False
+
+    winner = views.WinnerView("gw_x", on_reroll=_noop, can_manage=True)
+    assert len(winner.children) == 1, "winner view lost its reroll button"
+    assert len(views.WinnerView("gw_x").children) == 0, (
+        "a public winner view must have no privileged buttons"
+    )
+
+    assert len(views.VerifyView("gw_x", dashboard_url="https://x").children) == 1
+    assert len(views.VerifyView("gw_x").children) == 0
+
+    assert len(outcomes) >= 20, f"expected the whole surface to be covered, ran {len(outcomes)}"
 
 # --------------------------------------------------------------------------- #
 # Cross-language vectors
@@ -1908,6 +2223,12 @@ def main() -> int:
     check.run("the root app.py shim reaches the bot", test_app_shim_entrypoint)
     check.run("migrations are BOM-free and loaders strip one", test_migrations_are_bom_free)
     check.run("rows map by name on any driver, not just SQLite", test_rows_are_mapped_for_any_driver)
+    check.run(
+        "the bot constructs without shadowing discord.py",
+        test_bot_constructs_without_shadowing_discord,
+    )
+    check.run("setup_hook and on_ready run without a gateway", test_startup_lifecycle_runs_offline)
+    check.run("every embed and view renders", test_every_embed_and_view_renders)
 
     check.section("Persistence + lifecycle")
     check.run("create -> join -> manage -> draw -> reroll", test_lifecycle)

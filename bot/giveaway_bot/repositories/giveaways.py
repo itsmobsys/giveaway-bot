@@ -66,7 +66,10 @@ def create_giveaway(
             min_messages, message_count_channel_ids, message_count_ignore_bots,
             message_count_since, message_count_scope,
             created_by, version, created_at, updated_at
-        ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 0, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+        ) VALUES (
+            ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            NULL, ?, 0, ?, ?, ?, ?, ?, ?, 1, ?, ?
+        )
         """,
         (
             giveaway_id,
@@ -223,7 +226,7 @@ def find_active(db: Database, guild_id: str) -> dict[str, Any] | None:
     giveaway?" always has exactly one answer.
     """
     return db.query_one(
-        f"""
+        """
         SELECT g.id, g.title, g.status, g.ends_at, g.message_id, g.participant_role_id,
                COALESCE(s.participant_count, 0) AS participant_count,
                COALESCE(s.entry_count, 0)      AS entry_count

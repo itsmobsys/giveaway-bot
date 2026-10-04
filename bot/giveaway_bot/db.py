@@ -125,8 +125,7 @@ class Database:
         last_error: Exception | None = None
         for attempt in range(attempts):
             try:
-                cur = conn.execute(sql, tuple(params))
-                return cur
+                return conn.execute(sql, tuple(params))
             except Exception as exc:  # noqa: BLE001 - re-raised unless transient
                 # Matching on sqlite3.OperationalError was SQLite-only: libSQL
                 # raises its own exception types and exports no OperationalError,
@@ -194,7 +193,10 @@ class Database:
         if callable(keys):
             return {key: row[key] for key in keys()}
         if columns:
-            return dict(zip(columns, row))
+            # strict=True so a driver that returns the wrong number of values
+            # fails here, loudly, instead of silently dropping trailing columns
+            # and producing a dict that is missing keys.
+            return dict(zip(columns, row, strict=True))
         raise TypeError(
             f"cannot map a {type(row).__name__} row to column names: the cursor "
             "exposed no description"
@@ -202,7 +204,7 @@ class Database:
 
     # ------------------------------------------------------------ transaction
     @contextlib.contextmanager
-    def transaction(self) -> Iterator["Database"]:
+    def transaction(self) -> Iterator[Database]:
         """Explicit transaction.
 
         SQLite in WAL mode and libSQL both give us real transactions, so every

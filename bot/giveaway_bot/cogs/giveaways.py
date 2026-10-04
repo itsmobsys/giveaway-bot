@@ -24,7 +24,9 @@ from discord import app_commands
 from discord.ext import commands
 
 from .. import embeds
-from ..repositories import draws as draws_repo, entries as entries_repo, giveaways as gw_repo
+from ..repositories import draws as draws_repo
+from ..repositories import entries as entries_repo
+from ..repositories import giveaways as gw_repo
 from ..service import ServiceError
 
 log = logging.getLogger("giveaway_bot.cogs.giveaways")
@@ -154,7 +156,7 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
         fresh = self.bot.service.get(giveaway.id)
         # A new requirement means this guild now needs counting; recompute the
         # watched set so no message is missed from here on.
-        self.bot.activity.refresh_requirements()
+        self.bot.activity_tracker.refresh_requirements()
         role_line = ""
         if fresh.participant_role_id:
             role_line = (
@@ -174,7 +176,8 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
                 title="✅ Giveaway created",
                 description=(
                     f"**{fresh.title}**\n"
-                    f"Entries close {embeds.format_timestamp(fresh.ends_at, style='R')}.{activity_line}{role_line}\n"
+                    f"Entries close {embeds.format_timestamp(fresh.ends_at, style='R')}."
+                    f"{activity_line}{role_line}\n"
                     f"Seed commitment published before entries open:\n`{fresh.seed_commitment}`\n"
                     f"<#{target.id}>"
                 ),
@@ -373,4 +376,13 @@ def _parse_ids(value: str) -> list[str]:
     return [item for item in re.split(r"[,\s]+", cleaned) if item.isdigit()]
 
 
-__all__ = ["GiveawayCommands"]
+__all__ = ["GiveawayCommands", "setup"]
+
+
+async def setup(bot: Any) -> None:
+    """Entry point required by ``Bot.load_extension``.
+
+    Without this, ``setup_hook`` raised NoEntryPointError the moment the gateway
+    connected - the class existed and was never registered.
+    """
+    await bot.add_cog(GiveawayCommands(bot))

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Migration runner.
  *
  * Reads the *same* SQL files the Python bot uses (`shared/migrations`), so both

@@ -111,7 +111,9 @@ def emit(
     )
 
 
-def events_since(db: Database, giveaway_id: str, *, since_id: int = 0, limit: int = 50) -> list[dict[str, Any]]:
+def events_since(
+    db: Database, giveaway_id: str, *, since_id: int = 0, limit: int = 50
+) -> list[dict[str, Any]]:
     rows = db.query(
         """
         SELECT id, giveaway_id, guild_id, type, payload_json, created_at

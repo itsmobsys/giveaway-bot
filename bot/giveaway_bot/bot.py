@@ -22,13 +22,15 @@ import discord
 from discord.ext import commands
 
 from . import embeds, views
+from .activity import MessageActivityTracker
 from .config import Settings, is_admin_permissions
 from .db import Database
 from .models import Giveaway, GiveawayStatus
 from .repositories import activity as activity_repo
-from .repositories import control, entries as entries_repo, giveaways as gw_repo, guilds as guilds_repo
-from .activity import MessageActivityTracker
+from .repositories import control
+from .repositories import entries as entries_repo
 from .repositories import giveaways as gw_repo
+from .repositories import guilds as guilds_repo
 from .roles import RoleManager
 from .scheduler import Scheduler
 from .service import Actor, DrawOutcome, GiveawayService, ServiceError
@@ -56,7 +58,7 @@ class GiveawayBot(commands.Bot):
         self._views: dict[str, GiveawayView | WinnerView] = {}
         self._ready = asyncio.Event()
         #: Message-activity counter (buffered + batch flushed).
-        self.activity = MessageActivityTracker(db, service)
+        self.activity_tracker = MessageActivityTracker(db, service)
         #: Temporary "entrants" role manager.
         self.roles = RoleManager(self, db)
 
@@ -123,7 +125,7 @@ class GiveawayBot(commands.Bot):
         * Counters live in memory and are flushed in batches, so a busy channel
           does not produce one write per message.
         """
-        self.activity.record(message)
+        self.activity_tracker.record(message)
 
     async def on_disconnect(self) -> None:
         log.warning("gateway disconnected - message counting will backfill on resume")
@@ -501,11 +503,11 @@ class GiveawayBot(commands.Bot):
 
     async def _job_maintenance(self) -> None:
         await asyncio.to_thread(self.service.housekeeping)
-        self.activity.refresh_requirements()
+        self.activity_tracker.refresh_requirements()
 
     async def _job_flush_activity(self) -> None:
-        if self.activity.pending():
-            await asyncio.to_thread(self.activity.flush_all)
+        if self.activity_tracker.pending():
+            await asyncio.to_thread(self.activity_tracker.flush_all)
 
     # ------------------------------------------------------- entrants role
     async def attach_entrants_role(self, giveaway: Giveaway) -> Giveaway:
@@ -591,7 +593,7 @@ class GiveawayBot(commands.Bot):
         for guild_id in guild_ids:
             for channel_id in activity_repo.watched_channels(self.db, guild_id)[:10]:
                 try:
-                    await self.activity.backfill_channel(self, guild_id, channel_id)
+                    await self.activity_tracker.backfill_channel(self, guild_id, channel_id)
                 except Exception:  # noqa: BLE001 - backfill must never crash the bot
                     log.exception("activity backfill failed for %s/%s", guild_id, channel_id)
 
@@ -613,10 +615,12 @@ class GiveawayBot(commands.Bot):
             view=VerifyView(giveaway.id, dashboard_url=self.settings.dashboard_url),
         )
 
-    async def wait_ready(self, timeout: float = 60.0) -> None:
+    # ASYNC109: this is an internal await helper whose whole job is to bound
+    # the wait, not a public request API.
+    async def wait_ready(self, timeout: float = 60.0) -> None:  # noqa: ASYNC109
         try:
             await asyncio.wait_for(self._ready.wait(), timeout=timeout)
-        except asyncio.TimeoutError:  # pragma: no cover - slow network
+        except TimeoutError:  # pragma: no cover - slow network
             log.warning("bot did not report ready within %.0fs", timeout)
 
     def participant_counts(self, giveaway_id: str, user_ids: list[str]) -> dict[str, int]:
