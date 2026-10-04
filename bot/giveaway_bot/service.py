@@ -959,7 +959,10 @@ class GiveawayService:
         )
 
     def reroll(self, actor: Actor, giveaway: Giveaway, *, reason: str = "manual_reroll") -> DrawOutcome:
-        if not giveaway.is_locked:
+        # A completed draw is unlocked (the reveal releases the lock so a later
+        # reroll can lock again), so "is there a draw?" means total_draws >= 1,
+        # not is_locked. Checking is_locked here refused every reroll.
+        if giveaway.total_draws < 1:
             raise ServiceError("no_draw", "There is no draw to reroll.")
         if giveaway.status is not GiveawayStatus.ENDED:
             raise ServiceError("not_ended", "Only ended giveaways can be rerolled.")
@@ -985,18 +988,24 @@ class GiveawayService:
         trigger_reason: str,
         reroll: bool,
         mark_ended: bool,
+        expect_locked: bool = False,
     ) -> DrawOutcome:
         """Three-phase draw: lock -> score -> reveal.
 
         * **lock** - transaction 1 makes the giveaway unmodifiable and freezes
           the entry set. For a reroll this also mints and publishes a *new* seed
           and commitment, so the previous randomness cannot be replayed.
+          The lock is conditional: a concurrent draw loses and is told a draw
+          is already running, instead of drawing a duplicate round.
         * **score** - pure computation from the seed read back out of storage.
         * **reveal** - transaction 2 writes the draw, the winners and the
-          revealed seed. A crash anywhere leaves ``locked_at`` set, and
+          revealed seed, and releases the lock so a later reroll can lock
+          again. A crash anywhere leaves ``locked_at`` set, and
           :meth:`recover_locked_draws` finishes the job on restart.
         """
-        round_number = giveaway.draw_round + 1
+        # Crash recovery: the interrupted lock already holds this round, so there
+        # is nothing to acquire and the round is current, not next.
+        round_number = giveaway.draw_round if expect_locked else giveaway.draw_round + 1
         reseed = reroll or giveaway.server_seed is None
         seed = generate_seed() if reseed else giveaway.server_seed or generate_seed()
         started = time.perf_counter()
@@ -1010,7 +1019,11 @@ class GiveawayService:
             else:
                 seed, _ = gw_repo.read_sealed_seed(tx, giveaway.id)
 
-            gw_repo.mark_locked(tx, giveaway.id, round_number)
+            if not expect_locked and not gw_repo.mark_locked(tx, giveaway.id, round_number):
+                raise ServiceError(
+                    "draw_in_progress",
+                    "A draw for this giveaway is already running.",
+                )
             if mark_ended:
                 gw_repo.set_status(
                     tx, giveaway.id, GiveawayStatus.ENDED, actor_id=actor.user_id,
@@ -1065,6 +1078,7 @@ class GiveawayService:
                 duration_ms=elapsed_ms,
             )
             gw_repo.refresh_stats(tx, giveaway.id)
+            gw_repo.mark_unlocked(tx, giveaway.id)
             control.audit(
                 tx,
                 guild_id=giveaway.guild_id,
@@ -1145,7 +1159,8 @@ class GiveawayService:
             try:
                 log.warning("recovering interrupted draw for giveaway %s", giveaway.id)
                 self._run_draw(
-                    system, giveaway, trigger_reason="crash_recovery", reroll=False, mark_ended=False
+                    system, giveaway, trigger_reason="crash_recovery", reroll=False, mark_ended=False,
+                    expect_locked=True,
                 )
                 recovered += 1
             except Exception:  # noqa: BLE001 - never block startup on one giveaway

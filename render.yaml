@@ -65,7 +65,7 @@ services:
     name: giveaway-dashboard
     runtime: docker
     dockerfilePath: ./dashboard/Dockerfile
-    dockerContext: ./dashboard
+    dockerContext: .
     plan: starter
     region: oregon
     autoDeploy: true

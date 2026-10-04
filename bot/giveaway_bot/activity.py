@@ -165,15 +165,18 @@ class MessageActivityTracker:
         content_length: int = 0,
     ) -> None:
         """Transport-agnostic entry point (also used by tests)."""
-        self.stats["seen"] += 1
+        with self._lock:
+            self.stats["seen"] += 1
 
         if not user_id.isdigit() or not message_id.isdigit():
-            self.stats["skipped_invalid"] += 1
+            with self._lock:
+                self.stats["skipped_invalid"] += 1
             return
         # Ignore bots/webhooks and empty messages: counting them would let a
         # giveaway be farmed by an automated account.
         if is_bot or content_length == 0:
-            self.stats["skipped_bot"] += 1
+            with self._lock:
+                self.stats["skipped_bot"] += 1
             return
 
         with self._lock:
@@ -192,13 +195,27 @@ class MessageActivityTracker:
             # message event and risk Discord dropping the connection.
             executor = getattr(self, "_executor", None)
             if executor is not None:
-                executor.submit(self.flush_guild, guild_id)
+                try:
+                    executor.submit(self.flush_guild, guild_id)
+                except RuntimeError:
+                    # Shutting down (close() ran): flush inline so the
+                    # message is not silently dropped.
+                    try:
+                        self.flush_guild(guild_id)
+                    except Exception:  # noqa: BLE001 - shutdown path
+                        log.exception("inline flush failed during shutdown")
             else:  # pragma: no cover - executor attached in __post_init__
                 self.flush_guild(guild_id)
 
     def flush_guild_async(self, guild_id: str) -> None:
         """Schedule a flush on the tracker executor."""
-        self._executor.submit(self.flush_guild, guild_id)  # type: ignore[union-attr]
+        try:
+            self._executor.submit(self.flush_guild, guild_id)  # type: ignore[union-attr]
+        except RuntimeError:
+            try:
+                self.flush_guild(guild_id)
+            except Exception:  # noqa: BLE001 - shutdown path
+                log.exception("inline flush failed during shutdown")
 
     # ----------------------------------------------------------------- flush
     def flush_guild(self, guild_id: str) -> int:

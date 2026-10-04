@@ -31,8 +31,10 @@ function migrationsDir(): string {
   const candidates = [
     resolve(here, "../../shared/migrations"),
     resolve(here, "../shared/migrations"),
+    resolve(here, "../../migrations"),
     resolve(process.cwd(), "shared/migrations"),
     resolve(process.cwd(), "../shared/migrations"),
+    "/app/migrations",
   ];
   for (const candidate of candidates) {
     if (existsSync(candidate)) return candidate;

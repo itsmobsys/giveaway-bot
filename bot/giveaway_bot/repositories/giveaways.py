@@ -356,14 +356,33 @@ def renew_seed_commitment(db: Database, giveaway_id: str, commitment_hex: str) -
     )
 
 
-def mark_locked(db: Database, giveaway_id: str, round_number: int) -> None:
-    db.execute(
+def mark_locked(db: Database, giveaway_id: str, round_number: int) -> bool:
+    """Lock a giveaway for a draw round. Returns True if this call won the lock.
+
+    Conditional on locked_at IS NULL so two concurrent end() calls (scheduler +
+    slash command + queue worker) can't both lock and draw duplicate rounds.
+    A crash after locking leaves locked_at set and recover_locked_draws finishes it.
+    """
+    cursor = db.execute(
         """
         UPDATE giveaways
-        SET locked_at = COALESCE(locked_at, ?), draw_round = ?, updated_at = ?
-        WHERE id = ?
+        SET locked_at = ?, draw_round = ?, updated_at = ?
+        WHERE id = ? AND locked_at IS NULL
         """,
         (now_ms(), round_number, now_ms(), giveaway_id),
+    )
+    try:
+        won = int(getattr(cursor, "rowcount", 0) or 0) > 0
+    finally:
+        cursor.close()
+    return won
+
+
+def mark_unlocked(db: Database, giveaway_id: str) -> None:
+    """Clear the draw lock after a successful reveal, so a reroll can lock again."""
+    db.execute(
+        "UPDATE giveaways SET locked_at = NULL, updated_at = ? WHERE id = ?",
+        (now_ms(), giveaway_id),
     )
 
 
