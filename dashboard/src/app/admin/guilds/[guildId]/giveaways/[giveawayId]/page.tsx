@@ -38,7 +38,7 @@ export default async function GiveawayAdminPage({ params, searchParams }: Props)
   const { q } = await searchParams;
 
   const user = await readSession();
-  if (!user) redirect(`/login?redirect_to=/admin/guilds/${guildId}`);
+  if (!user) redirect(`/login?redirect_to=${encodeURIComponent(`/admin/guilds/${guildId}/giveaways/${giveawayId}`)}`);
 
   // Authorize against Discord before touching any giveaway data.
   const auth = await requireGuildAdmin(guildId);

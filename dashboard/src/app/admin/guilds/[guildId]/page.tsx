@@ -23,7 +23,7 @@ interface Props {
 export default async function GuildAdminPage({ params }: Props) {
   const { guildId } = await params;
   const user = await readSession();
-  if (!user) redirect(`/login?redirect_to=/admin/guilds/${guildId}`);
+  if (!user) redirect(`/login?redirect_to=${encodeURIComponent(`/admin/guilds/${guildId}`)}`);
 
   const auth = await requireGuildAdmin(guildId);
   if (!auth.allowed) {
