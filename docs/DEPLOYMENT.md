@@ -61,9 +61,23 @@ diverge.
    `DISCORD_GIVEAWAY_CHANNEL_ID`. Every giveaway is posted there - admins never
    choose a channel, and the bot refuses to create one if this is unset or
    points somewhere it cannot post.
-4. **Bot** -> enable both **Server Members Intent** and **Message Content Intent**
-   (message-activity counting needs Members; the Members intent is required to
-   resolve roles and join dates)
+4. **Bot** -> enable **Server Members Intent** (under *Privileged Gateway
+   Intents*), then press Save.
+
+   This one is **mandatory**. Discord refuses the whole connection if the bot
+   requests a privileged intent the portal has not enabled, and the bot has to
+   request it: giveaway eligibility reads a member's roles and their server join
+   date, and Discord omits the member object from interaction payloads without
+   it. If you skip this the bot exits immediately with
+   `PrivilegedIntentsRequired`.
+
+   Do **not** enable Message Content Intent. The bot never reads message text -
+   message counting uses gateway events - so it does not request it. discord.py
+   logs "privileged message content intent is missing" at startup regardless; that
+   warning is expected and harmless for a slash-command-only bot.
+
+   `python -m giveaway_bot doctor` prints exactly which intents this build
+   requests, read from the same code the client uses.
 5. **OAuth2 -> URLs** -> add your dashboard's redirect:
    - Render: `https://<app>.onrender.com/api/auth/callback`
    - Vercel: `https://<app>.vercel.app/api/auth/callback`
@@ -282,12 +296,22 @@ They come from discord.py and mean only that voice channels are unavailable. Thi
 bot never joins one, so neither package is a dependency. They are left unfixed on
 purpose rather than silenced by installing an unused crypto library.
 
+A third startup line is also expected, for the same kind of reason:
+
+`
+WARNING discord.ext.commands.bot  Privileged message content intent is missing
+`
+
+The bot uses slash commands only and never reads message text, so it does not
+request that intent. This warning is harmless.
+
 | Symptom | Cause |
 | --- | --- |
 | Dashboard shows "Not authorised" | Missing **Manage Server** in that server, or the bot is not in the server |
 | Admin action says "request rejected" | `CSRF_TRUSTED_ORIGINS` / `NEXT_PUBLIC_APP_URL` mismatch |
 | Giveaway creates in the dashboard but not in Discord | The bot is not polling, or it cannot post in the channel (check `/admin give sync`) |
 | Entrants never receive the role | Bot lacks **Manage Roles**, or its role is below the entrants role |
+| `PrivilegedIntentsRequired` on startup | **Server Members Intent** not enabled in the Developer Portal (Bot -> Privileged Gateway Intents). The bot exits immediately rather than running with broken eligibility |
 | Message counts stay at zero | **Server Members Intent** not enabled, or the bot lacks **Read Message History** |
 | `migration ... is malformed` | A `; statement-breakpoint` line is missing between two statements |
 | Live updates stall on Vercel | Expected — SSE hits `maxDuration` and the client reconnects |

@@ -42,14 +42,39 @@ log = logging.getLogger("giveaway_bot.bot")
 QUEUE_POLL_SECONDS = 2.0
 
 
+def build_intents() -> discord.Intents:
+    """The gateway intents this bot requests.
+
+    A single definition, used by the client and reported by ``doctor``, so what an
+    operator is told cannot drift from what is actually requested.
+
+    * ``members`` is privileged and must be enabled in the Developer Portal under
+      Bot -> Privileged Gateway Intents. Eligibility reads a member's roles and
+      their server join date, and Discord omits the member object from interaction
+      payloads unless this intent is on, so those two rules cannot be evaluated
+      without it. A connection that requests it while the portal has it off is
+      refused outright with PrivilegedIntentsRequired.
+    * ``message_content`` is deliberately left off. Message counting uses gateway
+      events and never reads message text, so there is no reason to ask Discord for
+      the content of every message in the server. discord.py logs "privileged
+      message content intent is missing" regardless; that warning is expected and
+      harmless for a slash-command-only bot.
+    """
+    intents = discord.Intents.default()
+    intents.members = True
+    intents.message_content = False
+    return intents
+
+
 class GiveawayBot(commands.Bot):
     """discord.py client with giveaway services attached."""
 
     def __init__(self, service: GiveawayService, db: Database, settings: Settings) -> None:
-        intents = discord.Intents.default()
-        intents.members = True   # required for role/account-age eligibility checks
-        intents.message_content = False
-        super().__init__(command_prefix=settings.command_prefix, intents=intents, help_command=None)
+        super().__init__(
+            command_prefix=settings.command_prefix,
+            intents=build_intents(),
+            help_command=None,
+        )
 
         self.service = service
         self.db = db

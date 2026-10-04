@@ -2120,6 +2120,67 @@ def test_every_embed_and_view_renders() -> None:
 
     assert len(outcomes) >= 20, f"expected the whole surface to be covered, ran {len(outcomes)}"
 
+def test_intents_and_startup_error_explanations() -> None:
+    """The privileged-intent contract, and actionable startup failures.
+
+    Discord refuses the connection outright when a privileged intent is requested
+    but not enabled in the Developer Portal:
+
+        discord.errors.PrivilegedIntentsRequired: Shard ID None is requesting
+        privileged intents that have not been explicitly enabled
+
+    That is a configuration step only an operator can perform, so two things are
+    asserted. That the bot requests exactly one privileged intent - the minimum -
+    and never asks for message content, since it never reads message text. And
+    that the two most common first-run failures come back as an explanation with
+    the portal path in it, rather than as a bare traceback.
+    """
+    import discord
+
+    from .bot import build_intents
+    from .cli import _explain_startup_failure
+
+    intents = build_intents()
+    assert intents.members is True, (
+        "Server Members Intent is required: eligibility reads member roles and the "
+        "server join date, which Discord omits without it"
+    )
+    assert intents.message_content is False, (
+        "message content must stay off - the bot counts message events and never "
+        "reads text, so requesting it would widen access for no benefit"
+    )
+
+    privileged = [n for n in ("members", "message_content", "presences") if getattr(intents, n)]
+    assert privileged == ["members"], (
+        f"only Server Members Intent should be requested, got {privileged}"
+    )
+
+    # The client must use that same definition, not a second copy of it.
+    bot, db, _settings, tmp = _build_offline_bot("intents")
+    try:
+        assert bot.intents.members is True, "the client did not request members intent"
+        assert bot.intents.message_content is False, "the client requested message content"
+    finally:
+        db.close_all()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # A configuration failure must explain itself.
+    hint = _explain_startup_failure(discord.errors.PrivilegedIntentsRequired(0))
+    assert hint is not None, "PrivilegedIntentsRequired produced no explanation"
+    assert "Server Members Intent" in hint, f"the hint does not name the intent: {hint}"
+    assert "developers/applications" in hint, (
+        f"the hint does not link the Developer Portal: {hint}"
+    )
+
+    login = _explain_startup_failure(discord.errors.LoginFailure())
+    assert login is not None and "DISCORD_BOT_TOKEN" in login, (
+        f"a bad token produced no useful hint: {login!r}"
+    )
+
+    assert _explain_startup_failure(ValueError("something else")) is None, (
+        "unrelated errors must be re-raised, not swallowed into a config message"
+    )
+
 # --------------------------------------------------------------------------- #
 # Cross-language vectors
 # --------------------------------------------------------------------------- #
@@ -2229,6 +2290,8 @@ def main() -> int:
     )
     check.run("setup_hook and on_ready run without a gateway", test_startup_lifecycle_runs_offline)
     check.run("every embed and view renders", test_every_embed_and_view_renders)
+    check.run("privileged intents and startup errors are actionable",
+               test_intents_and_startup_error_explanations)
 
     check.section("Persistence + lifecycle")
     check.run("create -> join -> manage -> draw -> reroll", test_lifecycle)
