@@ -452,9 +452,18 @@ class GiveawayBot(commands.Bot):
         if not await self._assert_manage(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
+        # service.reroll() takes a Giveaway and reads giveaway.is_locked. It used
+        # to be handed the id string instead, so every click raised AttributeError
+        # - which `except ServiceError` does not catch - leaving the interaction
+        # deferred forever. The button never worked. The suite missed it because
+        # test_lifecycle calls service.reroll directly, never through the button.
+        record = await asyncio.to_thread(gw_repo.get_giveaway, self.db, giveaway_id)
+        if record is None:
+            await interaction.followup.send("⚠️ Giveaway not found.", ephemeral=True)
+            return
         try:
             outcome = await asyncio.to_thread(
-                self.service.reroll, self.actor_for(interaction.user), giveaway_id
+                self.service.reroll, self.actor_for(interaction.user), record
             )
         except ServiceError as exc:
             await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)

@@ -33,9 +33,17 @@ class AdminCommands(commands.Cog, name="admin"):
     give = app_commands.Group(name="give", description="Manage a giveaway")
 
     async def _lookup(self, interaction: discord.Interaction, identifier: str) -> Any | None:
+        # Guild-scoped on purpose. The permission check validates the invoker in
+        # `interaction.guild`, but a gw_ id is global, so without this a moderator
+        # of guild A could end, reroll or disqualify entries in guild B using an id
+        # picked up from a link or a screenshot. Both lookup paths are now pinned to
+        # the guild the command was typed in.
         identifier = identifier.strip()
         if identifier.startswith("gw_"):
-            return gw_repo.get_giveaway(self.bot.db, identifier)
+            record = gw_repo.get_giveaway(self.bot.db, identifier)
+            if record is not None and record.guild_id != str(interaction.guild_id):
+                return None
+            return record
         if identifier.isdigit():
             return gw_repo.get_by_message(self.bot.db, str(interaction.guild_id), identifier)
         return None

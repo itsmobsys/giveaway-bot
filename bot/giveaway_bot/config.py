@@ -87,7 +87,13 @@ class Settings(BaseSettings):
 
     # --- Fairness ----------------------------------------------------------
     fairness_freeze_entries_on_draw: bool = True
-    max_rerolls_per_giveaway: int = Field(default=0, ge=0)
+    #: Rerolls allowed per giveaway. The count is of *rerolls*, so 1 permits one
+    #: redraw. This used to be 0 with the check written as
+    #: `if max_rerolls and total_draws >= max_rerolls`, which made 0 falsy and so
+    #: unlimited - the shipped default and the documented value both meant "no
+    #: limit", letting an owner reroll until a chosen entrant won, because every
+    #: reroll mints a fresh seed. 0 now genuinely means no rerolls.
+    max_rerolls_per_giveaway: int = Field(default=1, ge=0)
     audit_log_redact_contact_details: bool = True
 
     # --- Control API -------------------------------------------------------

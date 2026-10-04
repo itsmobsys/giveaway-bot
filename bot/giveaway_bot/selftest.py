@@ -1148,7 +1148,10 @@ def test_lifecycle() -> None:
 
     with _temp_database("lifecycle") as db:
         guilds_repo.upsert_guild(db, "900", name="Test Guild", owner_id="1")
-        service = GiveawayService(db, _isolated_settings())
+        # Pinned explicitly: this test rerolls, and MAX_REROLLS_PER_GIVEAWAY=0 now
+        # correctly means "no rerolls". Inheriting it from a developer's .env made
+        # the suite's outcome depend on local configuration.
+        service = GiveawayService(db, _isolated_settings(max_rerolls_per_giveaway=5))
         actor = Actor("1", "owner", "discord")
         now = int(time.time() * 1000)
 
@@ -2455,6 +2458,246 @@ def test_a_dead_database_stream_is_replaced() -> None:
             db._local.conn = None
 
 
+def test_rerolls_cannot_be_used_to_pick_a_winner() -> None:
+    """The reroll limit must be a real limit.
+
+    `max_rerolls_per_giveaway` defaulted to 0 and the check read
+    `if max_rerolls and total_draws >= max_rerolls`, so 0 was falsy and the limit
+    never applied. That is the shipped default and the documented value, which
+    meant unlimited rerolls - and since every reroll mints a fresh seed, an owner
+    could reroll until a chosen entrant won, which is exactly the outcome bias the
+    whole draw is supposed to prevent.
+    """
+    from .repositories import guilds as guilds_repo
+    from .service import Actor, GiveawayService, ServiceError
+
+    with _temp_database("reroll-limit") as db:
+        guilds_repo.upsert_guild(db, "950", name="Reroll Guild")
+        actor = Actor("1", "owner", "discord")
+
+        def build(limit: int) -> GiveawayService:
+            return GiveawayService(
+                db, _isolated_settings(max_rerolls_per_giveaway=limit)
+            )
+
+        # 0 means no rerolls at all, checked against a real draw.
+        strict = build(0)
+        giveaway = strict.create(
+            actor, guild_id="950", channel_id="9501",
+            payload={"title": "t", "prize": "p", "duration": "1h"},
+        )
+        ended = strict.end(actor, giveaway, reason="test")
+        assert ended is not None and ended.giveaway.total_draws == 1, (
+            f"expected one draw, got {ended.giveaway.total_draws}"
+        )
+        try:
+            strict.reroll(actor, ended.giveaway)
+        except ServiceError as exc:
+            assert exc.code == "reroll_limit", f"wrong refusal: {exc.code}"
+        else:
+            raise AssertionError(
+                "MAX_REROLLS_PER_GIVEAWAY=0 must refuse every reroll, not allow them all"
+            )
+
+        # The default must not be "unlimited" either.
+        assert _isolated_settings().max_rerolls_per_giveaway == 1, (
+            "the shipped default must allow a bounded number of rerolls"
+        )
+
+        # One allowed: exactly one reroll, then refused.
+        once = build(1)
+        giveaway2 = once.create(
+            actor, guild_id="950", channel_id="9501",
+            payload={"title": "t2", "prize": "p", "duration": "1h"},
+        )
+        first = once.end(actor, giveaway2, reason="test")
+        assert first is not None
+        second = once.reroll(actor, first.giveaway)
+        assert second.giveaway.total_draws == 2, (
+            f"one reroll should have been allowed, total_draws="
+            f"{second.giveaway.total_draws}"
+        )
+        try:
+            once.reroll(actor, second.giveaway)
+        except ServiceError as exc:
+            assert exc.code == "reroll_limit"
+        else:
+            raise AssertionError("a second reroll must be refused")
+
+
+def test_partial_update_keeps_omitted_fields() -> None:
+    """An update that omits a field must not reset it.
+
+    `as_columns()` emitted every field, and a partial payload fills absent keys
+    with their *defaults*, so `{"prize": "new"}` blanked the title, reset
+    `winner_count` to 1 and cleared every required role, channel and message
+    requirement. The audit row reported the change as intended.
+    """
+    from .repositories import guilds as guilds_repo
+    from .service import Actor, GiveawayService
+
+    with _temp_database("partial-update") as db:
+        guilds_repo.upsert_guild(db, "960", name="Partial Guild")
+        service = GiveawayService(db, _isolated_settings())
+        actor = Actor("1", "owner", "discord")
+        giveaway = service.create(
+            actor, guild_id="960", channel_id="9601",
+            payload={
+                "title": "Original title", "prize": "old prize", "duration": "2h",
+                "winner_count": 5, "max_entries_per_user": 3, "min_messages": 20,
+                # The payload key is required_role_ids; `required_roles` is the
+                # slash-command option name and the validator ignores it.
+                "required_role_ids": "111222333444555666",
+                "blacklist_role_ids": "222333444555666777",
+            },
+        )
+        assert giveaway.winner_count == 5, giveaway.winner_count
+
+        updated = service.update(actor, giveaway, {"prize": "new prize"})
+        assert updated.prize == "new prize", updated.prize
+        assert updated.title == "Original title", (
+            f"title was reset to {updated.title!r} by an update that never mentioned it"
+        )
+        assert updated.winner_count == 5, (
+            f"winner_count was reset to {updated.winner_count} - this is the draw's winner count"
+        )
+        assert updated.max_entries_per_user == 3, updated.max_entries_per_user
+        assert updated.min_messages == 20, updated.min_messages
+        assert updated.required_role_ids == ["111222333444555666"], (
+            f"required roles were cleared: {updated.required_role_ids}"
+        )
+        assert updated.blacklist_role_ids == ["222333444555666777"], updated.blacklist_role_ids
+        assert updated.ends_at == giveaway.ends_at, "the end time was moved by a prize edit"
+
+        # And a full create still writes everything.
+        fresh = service.create(
+            actor, guild_id="960", channel_id="9601",
+            payload={"title": "Full", "prize": "p", "duration": "1h", "winner_count": 2},
+        )
+        assert fresh.title == "Full" and fresh.winner_count == 2
+
+
+def test_disqualifying_a_member_does_not_lock_them_out() -> None:
+    """A flagged member must be able to re-enter.
+
+    `next_seq` came from `count_user_entries`, which counts only valid/winner/lost
+    rows. Disqualifying a member flags all of theirs, so the count fell to zero,
+    `next_seq` became 1, and UNIQUE (giveaway_id, user_id, entry_seq) rejected the
+    insert - leaving one free slot permanently unusable and the member told
+    "already entered". Restore was a silent no-op for the same reason: the
+    `only_valid` predicate excluded 'disqualified'.
+    """
+    from .models import EntryStatus
+    from .repositories import entries as entries_repo
+    from .repositories import giveaways as gw_repo
+    from .repositories import guilds as guilds_repo
+    from .service import Actor, GiveawayService
+
+    with _temp_database("relock") as db:
+        guilds_repo.upsert_guild(db, "970", name="Relock Guild")
+        service = GiveawayService(db, _isolated_settings())
+        actor = Actor("1", "owner", "discord")
+        giveaway = service.create(
+            actor, guild_id="970", channel_id="9701",
+            payload={"title": "t", "prize": "p", "duration": "1h",
+                     "max_entries_per_user": 3},
+        )
+        def member(user_id: str) -> dict[str, object]:
+            """The dict shape service.join() takes."""
+            return {
+                "user_id": user_id,
+                "role_ids": [],
+                "is_member": True,
+                "account_created_at": int(time.time() * 1000) - 86_400_000,
+            }
+
+        for _ in range(3):
+            assert service.join(giveaway, member("u1")).joined, "setup join failed"
+
+        assert service.set_entry_eligibility(
+            actor, giveaway, "u1", eligible=False, reason="alt"
+        ) == 3, "expected all three entries to be flagged"
+
+        # A flagged member must be able to enter again.
+        again = service.join(giveaway, member("u1"))
+        assert again.joined, (
+            f"a disqualified member was locked out: {again.eligibility.reason if again.eligibility else ''}"
+        )
+        assert again.entry_seq == 4, f"expected entry_seq 4, got {again.entry_seq}"
+
+        # And a restore must actually restore.
+        changed = service.set_entry_eligibility(
+            actor, giveaway, "u1", eligible=True, reason="appeal upheld"
+        )
+        assert changed > 0, "restoring a disqualified entry changed nothing (silent no-op)"
+        rows = db.query(
+            "SELECT entry_seq, status FROM giveaway_entries"
+            " WHERE giveaway_id = ? AND user_id = ? ORDER BY entry_seq",
+            (giveaway.id, "u1"),
+        )
+        assert any(r["status"] == EntryStatus.VALID.value for r in rows), (
+            "no entry came back: "
+            f"{[(r['entry_seq'], r['status']) for r in rows]}"
+        )
+        # The flagged entries are back in the frozen set the draw scores.
+        frozen = entries_repo.frozen_entries(db, giveaway.id)
+        assert len(frozen) == 4, f"expected 4 scored entries after restore, got {len(frozen)}"
+        assert gw_repo.get_giveaway(db, giveaway.id) is not None
+
+
+def test_stranded_queue_claims_are_requeued() -> None:
+    """A claim abandoned by a cancelled worker must return to the queue.
+
+    claim_batch sets `claimed` with no lease, and only complete/fail moved a row
+    on. A SIGTERM mid-command cancels the scheduler task; CancelledError is a
+    BaseException so it escaped the `except Exception` and the row stayed claimed
+    forever. Nothing re-armed it, and the dashboard counts `claimed` as in
+    flight - so the admin buttons for that giveaway were disabled permanently.
+    """
+    from .repositories import control
+    from .repositories import guilds as guilds_repo
+
+    with _temp_database("lease") as db:
+        guilds_repo.upsert_guild(db, "980", name="Lease Guild")
+        for index in range(3):
+            control.enqueue(db, guild_id="980", kind=f"k{index}", payload={},
+                            requested_by="1", source="bot")
+
+        claimed = control.claim_batch(db, limit=3)
+        assert len(claimed) == 3, f"claimed {len(claimed)} of 3"
+        assert db.scalar(
+            "SELECT COUNT(*) FROM command_queue WHERE status = 'claimed'"
+        ) == 3
+
+        # Not yet expired: the reaper must leave a fresh claim alone.
+        assert control.requeue_expired_claims(db, lease_ms=300_000) == 0, (
+            "a fresh claim was requeued - a slow-but-alive worker would lose its work"
+        )
+        assert db.scalar(
+            "SELECT COUNT(*) FROM command_queue WHERE status = 'claimed'"
+        ) == 3
+
+        # Aged past the lease: reclaimed.
+        assert control.requeue_expired_claims(db, lease_ms=1) == 3, "stale claims were not requeued"
+        assert db.scalar(
+            "SELECT COUNT(*) FROM command_queue WHERE status = 'claimed'"
+        ) == 0, "claims still stuck"
+        row = db.query_one("SELECT last_error FROM command_queue WHERE id = ?", (claimed[0].id,))
+        assert row and "lease" in (row["last_error"] or ""), row
+
+        # And they are claimable again, exactly once each.
+        again = control.claim_batch(db, limit=10)
+        assert sorted(r.id for r in again) == sorted(r.id for r in claimed), (
+            "the requeued commands were not re-claimable"
+        )
+        assert control.claim_batch(db, limit=10) == [], "a command was claimed twice"
+
+        # housekeeping performs the reaping, so a crashed worker self-heals.
+        from .service import GiveawayService
+        report = GiveawayService(db, _isolated_settings()).housekeeping()
+        assert "requeued_commands" in report, report
+
+
 # --------------------------------------------------------------------------- #
 # Transaction lifecycle and concurrent claiming
 # --------------------------------------------------------------------------- #
@@ -2947,6 +3190,10 @@ def main() -> int:
     check.run("migrations are immutable and idempotent", test_migration_integrity)
     check.run("the dashboard health check works", test_dashboard_health_check)
     check.run("a dead database stream is replaced", test_a_dead_database_stream_is_replaced)
+    check.run("rerolls cannot be used to pick a winner", test_rerolls_cannot_be_used_to_pick_a_winner)
+    check.run("a partial update keeps omitted fields", test_partial_update_keeps_omitted_fields)
+    check.run("disqualifying does not lock a member out", test_disqualifying_a_member_does_not_lock_them_out)
+    check.run("abandoned queue claims are requeued", test_stranded_queue_claims_are_requeued)
     check.run("a transaction never outlives its block", test_transactions_never_outlive_their_block)
     check.run("transactions nest without re-BEGIN", test_transactions_nest_without_re_begin)
     check.run("concurrent claim_batch never duplicates", test_concurrent_claims_never_duplicate)

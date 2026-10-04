@@ -66,9 +66,21 @@ class GiveawayInput:
     message_count_since: int | None = None
     message_count_scope: str = "guild"
     channel_id: str = ""
+    #: Keys the caller actually supplied. Empty means "a full configuration", which
+    #: is how create uses this. On a partial update only these are written, so an
+    #: omitted field keeps whatever the giveaway already had.
+    provided: frozenset[str] = frozenset()
 
     def as_columns(self) -> dict[str, Any]:
-        """Columns for ``repositories.giveaways.update_fields``."""
+        """Columns for ``repositories.giveaways.update_fields``.
+
+        On a partial update this returns only the fields the caller supplied.
+        Emitting every field was a data-loss bug: a payload of just
+        ``{"prize": "new"}`` blanked the title, reset ``winner_count`` to 1 and
+        cleared every required role, channel and message requirement, because the
+        absent keys had silently taken their *defaults* rather than their
+        previous values.
+        """
         data: dict[str, Any] = {
             "title": self.title,
             "description": self.description,
@@ -96,6 +108,12 @@ class GiveawayInput:
             data["ends_at"] = self.ends_at
         if self.duration_ms is not None:
             data["ends_at"] = self.ends_at
+
+        if self.provided:
+            # Partial update: keep only what the caller actually sent. `ends_at`
+            # is handled above and is allowed through when a duration was given.
+            allowed = set(self.provided) | {"ends_at"}
+            data = {key: value for key, value in data.items() if key in allowed}
         return data
 
 
@@ -352,6 +370,8 @@ def validate_giveaway_payload(payload: dict[str, Any], *, partial: bool = False)
         message_count_since=_int(payload.get("message_count_since"), 0) or None,
         message_count_scope=message_scope,
         channel_id=channel_id,
+        # Only meaningful for a partial update; empty means a full configuration.
+        provided=frozenset(payload) if partial else frozenset(),
     )
 
 

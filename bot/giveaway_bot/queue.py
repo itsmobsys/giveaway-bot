@@ -155,8 +155,13 @@ async def _handle_create(bot: Any, command: Any, actor: Actor) -> dict[str, Any]
 
     # Single-giveaway-per-guild policy: this keeps the entrants role meaningful
     # and means "who is in the giveaway?" has exactly one answer.
+    # No payload-supplied bypass. `force` was read straight off the dashboard
+    # payload, so a compromised or buggy dashboard could start a second
+    # concurrent giveaway in a guild - exactly what this invariant exists to
+    # prevent, and what the temporary entrants role depends on. It was also never
+    # audited.
     existing = gw_repo.find_active(bot.db, str(guild.id))
-    if existing is not None and not payload.get("force"):
+    if existing is not None:
         raise ServiceError(
             "giveaway_already_running",
             f"This server already has an active giveaway: **{existing['title']}** "

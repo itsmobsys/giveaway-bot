@@ -47,7 +47,14 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
         """Accept either a giveaway id or a message id."""
         identifier = identifier.strip()
         if identifier.startswith("gw_"):
-            return gw_repo.get_giveaway(self.bot.db, identifier)
+            # Guild-scoped: /giveaway join accepts a global giveaway id, and this
+            # builds the member context from `interaction.guild`. Without the check
+            # guild B's rules (min_guild_join_days and the rest) would be applied
+            # to a member of guild A and admitted into B's prize pool.
+            record = gw_repo.get_giveaway(self.bot.db, identifier)
+            if record is not None and record.guild_id != str(guild_id):
+                return None
+            return record
         if identifier.isdigit():
             return gw_repo.get_by_message(self.bot.db, guild_id, identifier)
         return None

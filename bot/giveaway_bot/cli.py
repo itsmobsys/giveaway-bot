@@ -178,6 +178,17 @@ def cmd_run(_: argparse.Namespace) -> int:
         bot = GiveawayBot(service, db, settings)
         settings_ = settings
         if settings_.enable_control_api:
+            # There is no giveaway_bot.api module in this build, and the settings
+            # validate happily, so following the documentation produced a
+            # ModuleNotFoundError traceback and a crash loop on every restart.
+            # Fail with something actionable instead.
+            raise RuntimeError(
+                "ENABLE_CONTROL_API is set, but the signed HTTP control API is not "
+                "included in this build. Unset ENABLE_CONTROL_API, or add "
+                "bot/giveaway_bot/api.py. (CONTROL_API_* and the bot-side rate "
+                "limit settings depend on it.)"
+            )
+        if False:  # pragma: no cover - retained only to keep the branch obvious
             from .api import start_control_api
 
             await start_control_api(settings_, bot)

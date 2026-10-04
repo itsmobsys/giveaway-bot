@@ -34,6 +34,22 @@ def count_user_entries(
     return int(value or 0)
 
 
+def max_entry_seq(db: Database, giveaway_id: str, user_id: str) -> int | None:
+    """Highest ``entry_seq`` this user already holds, disqualified rows included.
+
+    ``count_user_entries`` deliberately counts only valid/winner/lost rows, so it
+    cannot be used to allocate the next sequence number: disqualifying a member
+    flags all of their rows, the count drops to zero, and ``count + 1`` hands back
+    a sequence that still exists - UNIQUE (giveaway_id, user_id, entry_seq) then
+    rejects the insert and the member is locked out of the giveaway for good.
+    """
+    row = db.query_one(
+        "SELECT MAX(entry_seq) AS top FROM giveaway_entries WHERE giveaway_id = ? AND user_id = ?",
+        (giveaway_id, user_id),
+    )
+    return int(row["top"]) if row and row.get("top") is not None else None
+
+
 def add_entry(
     db: Database,
     giveaway_id: str,
@@ -197,7 +213,12 @@ def set_status(
         params = [status.value, reason, timestamp, giveaway_id, user_id]
 
     if only_valid:
-        sql += " AND status IN ('valid', 'invalid', 'lost')"
+        # 'disqualified' must be in this set or a restore is a silent no-op: a
+        # flagged entry does not match, rowcount is 0, and the admin is still told
+        # "Entry restored." while the row stays disqualified and excluded from the
+        # draw. The original intent was only to protect 'winner'/'lost', so those
+        # are the statuses left out.
+        sql += " AND status IN ('valid', 'invalid', 'lost', 'disqualified')"
     cursor = db.execute(sql, params)
     changed = getattr(cursor, "rowcount", 0) or 0
     cursor.close()

@@ -529,6 +529,39 @@ def set_state(db: Database, key: str, value: str) -> None:
     )
 
 
+def requeue_expired_claims(db: Database, *, lease_ms: int = 300_000) -> int:
+    """Return commands stuck in ``claimed`` back to ``pending``.
+
+    ``claim_batch`` marks rows claimed with no lease, and the only writers that
+    ever moved them on were ``complete_command``/``fail_command``. A SIGTERM
+    during a deploy cancels the scheduler task mid-command; ``CancelledError`` is
+    a BaseException, so it escapes the ``except Exception`` around the execute and
+    the row stayed ``claimed`` forever. Nothing re-armed it, and since the
+    dashboard's ``hasPendingCommand`` counts ``claimed`` as in flight, the admin
+    buttons for that giveaway were disabled permanently with no way out.
+
+    A claim older than the lease is therefore assumed abandoned - the worker that
+    took it is gone - and returned to the queue. The conditional UPDATE keeps this
+    safe against a slow-but-alive worker: it only reclaims rows nobody has
+    touched, and a worker that finishes afterwards will find its row no longer
+    claimed.
+    """
+    cursor = db.execute(
+        """
+        UPDATE command_queue
+        SET status = 'pending', claimed_at = NULL,
+            last_error = 'claim lease expired, requeued'
+        WHERE status = 'claimed'
+          AND claimed_at IS NOT NULL
+          AND claimed_at < ?
+        """,
+        (now_ms() - lease_ms,),
+    )
+    changed = int(getattr(cursor, "rowcount", 0) or 0)
+    cursor.close()
+    return changed
+
+
 def get_state(db: Database, key: str) -> str | None:
     row = db.query_one("SELECT value FROM bot_state WHERE key = ?", (key,))
     return row["value"] if row else None

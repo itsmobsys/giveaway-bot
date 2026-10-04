@@ -491,7 +491,8 @@ class GiveawayService:
         if not verdict.ok:
             return JoinOutcome(joined=False, eligibility=verdict)
 
-        next_seq = current_entries + 1
+        # MAX(entry_seq) + 1 rather than count + 1: see entries.max_entry_seq.
+        next_seq = (entries_repo.max_entry_seq(self.db, giveaway.id, user_id) or 0) + 1
         # The temporary entrants role is *intent*, not a side effect: the row
         # records that the role should be applied, and the Discord layer performs
         # (and retries) the actual grant. A failed grant therefore never loses
@@ -962,12 +963,15 @@ class GiveawayService:
             raise ServiceError("no_draw", "There is no draw to reroll.")
         if giveaway.status is not GiveawayStatus.ENDED:
             raise ServiceError("not_ended", "Only ended giveaways can be rerolled.")
-        if (
-            self.settings.max_rerolls_per_giveaway
-            and giveaway.total_draws >= self.settings.max_rerolls_per_giveaway
-        ):
+        # total_draws counts draws, and the first one is not a reroll, so a limit
+        # of N permits N rerolls: after the initial draw total_draws == 1, and
+        # `1 > N` is false for any N >= 1. With N == 0 it is true immediately, so
+        # rerolling is refused outright.
+        if giveaway.total_draws > self.settings.max_rerolls_per_giveaway:
             raise ServiceError(
-                "reroll_limit", "The reroll limit for this giveaway has been reached."
+                "reroll_limit",
+                "The reroll limit for this giveaway has been reached "
+                f"({self.settings.max_rerolls_per_giveaway} allowed).",
             )
         return self._run_draw(
             actor, giveaway, trigger_reason=reason, reroll=True, mark_ended=True
@@ -1276,6 +1280,8 @@ class GiveawayService:
         control.prune_oauth_states(self.db)
         control.prune_rate_limits(self.db)
         removed["events"] = control.prune_events(self.db, older_than_ms=now_ms() - 7 * 86_400_000)
+        # Reclaim queue rows abandoned by a cancelled or crashed worker.
+        removed["requeued_commands"] = control.requeue_expired_claims(self.db)
         return removed
 
     def analytics(self, guild_id: str) -> dict[str, Any]:

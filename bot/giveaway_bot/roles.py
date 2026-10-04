@@ -25,12 +25,14 @@ Role creation is lazy (on first use) and reused across giveaways.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
 import discord
 
 from .repositories import control
+from .repositories import entries as entries_repo
 
 log = logging.getLogger("giveaway_bot.roles")
 
@@ -136,8 +138,23 @@ class RoleManager:
         entries_repo.mark_grants_revoked(self.db, giveaway_id, user_id)
 
     async def release_member(self, giveaway: Any, user_id: str, *, reason: str) -> bool:
-        """Queue removal for a single member (leave, disqualification)."""
+        """Queue removal for a single member (leave, disqualification).
+
+        Guarded on provenance, like release_for_giveaway. This used to queue
+        unconditionally, so a member whose role a human had assigned by hand lost
+        it the moment they pressed Leave - while the module's own first rule says
+        only what the bot added is ever removed. It then reported success, and
+        forget_grant updated nothing because grant_source was not 'bot'.
+        """
         if not giveaway.participant_role_id:
+            return False
+        if not await asyncio.to_thread(
+            entries_repo.has_bot_grant, self.db, giveaway.id, user_id
+        ):
+            log.info(
+                "not removing the entrants role for %s in %s: the bot never granted it",
+                user_id, giveaway.id,
+            )
             return False
         control.role_task(
             self.db,
