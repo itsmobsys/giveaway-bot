@@ -1,0 +1,52 @@
+# Keep the build context small and the image reproducible.
+#
+# Without this, `docker build .` on the repository root uploads node_modules,
+# .venv and .next with it - hundreds of megabytes that are then discarded.
+
+# VCS
+.git
+.gitignore
+.gitattributes
+
+# Secrets - never bake these into an image
+.env
+.env.local
+.env*.local
+*.pem
+*.key
+
+# Dependencies and build output
+node_modules
+dashboard/node_modules
+dashboard/.next
+dashboard/out
+.venv
+venv
+__pycache__
+**/__pycache__
+*.py[cod]
+*.egg-info
+.ruff_cache
+.mypy_cache
+.pytest_cache
+next-env.d.ts
+*.tsbuildinfo
+
+# Local data
+data
+bot/data
+dashboard/data
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Not needed to run the bot
+dashboard/
+docs/
+README.md
+LICENSE
+docker-compose.yml
+sillydev.conf
+render.yaml
+bot/README.md

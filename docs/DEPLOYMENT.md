@@ -169,43 +169,35 @@ The repo root has `render.yaml` describing both services:
 
 **Bot notes on Render**
 
-The bot runs directly on Render's native Python runtime - there is no container
-image. `render.yaml` sets:
+The bot is containerised from the root `Dockerfile`. `render.yaml` sets:
 
 | | |
 | --- | --- |
-| `runtime` | `python` (3.13, the interpreter the old image used) |
-| `buildCommand` | `pip install -r requirements.txt` |
-| `startCommand` | `cd bot && exec python -m giveaway_bot run` |
+| `runtime` | `docker` |
+| `dockerfilePath` | `./Dockerfile` (build context: repository root) |
+| health check | none - a worker has no HTTP port to probe |
 
-Those two commands are all a deploy needs, on Render or any other host:
+The image is `python:3.13-slim` because the Turso driver (`libsql`) is a Rust
+extension with wheels for CPython 3.11, 3.12 and 3.13 only; on 3.14 pip tries to
+compile it from source and usually fails. Everything except Turso works on 3.14 if
+you install everything except `libsql`.
+
+`PYTHONPATH=/app/bot` runs the package from source rather than installing it,
+because the default migrations directory is derived from the source tree
+(`bot/giveaway_bot/../..` -> `shared/migrations`). An installed copy inside
+`site-packages` would look for migrations that are not there, so `MIGRATIONS_DIR`
+is deliberately not set for the bot.
+
+Run migrations once before the first start - either run the image once, or use the
+CLI from the repo:
 
 ```bash
-pip install -r requirements.txt
-cd bot && exec python -m giveaway_bot run
+docker compose run --rm bot python -m giveaway_bot migrate
+# or
+cd bot && python -m giveaway_bot migrate
 ```
 
-Two details that are deliberate:
-
-* `cd bot` runs the package **from source** instead of installing it. Installing
-  would put `giveaway_bot` in `site-packages`, and the default migrations path is
-  derived from the source tree (`bot/giveaway_bot/../.. -> shared/migrations`),
-  so an installed copy would look for migrations that are not there. This is also
-  why `MIGRATIONS_DIR` is deliberately left unset in `render.yaml` - the default
-  is correct for this layout and does not depend on the working directory.
-* `exec` keeps Python as the process Render signals, so `SIGTERM` reaches
-  discord.py and the gateway closes cleanly on every redeploy instead of being
-  swallowed by a shell.
-
-Run migrations once before the first bot start (`npm run db:migrate` in
-`dashboard/`, or `python -m giveaway_bot migrate`).
-
-**Python version matters.** The Turso driver (`libsql`) is a Rust extension with
-prebuilt wheels for CPython 3.11, 3.12 and 3.13 only. On 3.14 pip tries to
-compile it from source, which needs a Rust toolchain and usually fails - so
-`pip install -r requirements.txt` breaks on 3.14 even though nothing else in the
-project does. That is why the worker is pinned to 3.13 above. Everything except
-Turso works on 3.14 if you install everything except `libsql`.
+**Bot notes on Render**
 
 * It must be a **background worker**, not a web service - a worker keeps the
   gateway connection alive, which is what a Discord bot needs. A worker has no
@@ -214,28 +206,6 @@ Turso works on 3.14 if you install everything except `libsql`.
   bot that must stay online. With Turso, no disk is needed at all, which is why
   the database is the hosted option.
 * Keep `autoDeploy` off if you would rather deploy deliberately.
-
-### Panels that run a file (`PY_FILE`)
-
-Some hosts — Silly Development among them — do not let you choose a start command;
-they run a Python file at the repository root. That file is `app.py`, and it
-expects the same things the command above does:
-
-| Panel setting | Value |
-| --- | --- |
-| Python version | 3.13 (3.11–3.13 all have a `libsql` wheel; 3.14 does not) |
-| Requirements file | `requirements.txt` (repository root) |
-| App file | `app.py` |
-
-Run migrations once before the first start, as above.
-
-`app.py` runs the bot **in its own process** rather than spawning or exec'ing it,
-which is what makes both required properties hold without any forwarding code:
-SIGTERM and SIGINT reach the bot directly, and the exit status the panel reads is
-the bot's own. `os.execve` was rejected for this — it is a true `exec` on Linux
-but CPython emulates it on Windows without propagating the child's status, so the
-shim would have exited 0 on every crash. `selftest` asserts all of this, so the
-behaviour cannot silently regress.
 
 ### Vercel (dashboard only)
 

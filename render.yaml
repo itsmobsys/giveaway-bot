@@ -1,8 +1,7 @@
 # Render blueprint: bot (background worker) + dashboard (web service).
 #
-# The bot runs directly on Render's native Python runtime - no container image.
-# It installs `requirements.txt` and starts with `python -m giveaway_bot run`.
-# The dashboard is still containerised, from dashboard/Dockerfile.
+# Both are containerised: the bot from the root Dockerfile, the dashboard from
+# dashboard/Dockerfile.
 #
 # One-time setup:
 #   1. Create a Turso database and set TURSO_DATABASE_URL / TURSO_AUTH_TOKEN
@@ -28,18 +27,12 @@ services:
   # ---------------------------------------------------------------------
   - type: worker
     name: giveaway-bot
-    runtime: python
-    # Same interpreter the container image used (python:3.13-slim), so removing
-    # Docker does not change the runtime.
-    pythonVersion: 3.13
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     plan: starter
     region: oregon
     autoDeploy: true
-    buildCommand: pip install -r requirements.txt
-    # Run from `bot/` so `python -m giveaway_bot` resolves without installing the
-    # package; `exec` keeps Python as the process Render signals, so SIGTERM
-    # reaches discord.py and the gateway closes cleanly on every redeploy.
-    startCommand: cd bot && exec python -m giveaway_bot run
     envVars:
       - key: DISCORD_BOT_TOKEN
         sync: false
@@ -67,10 +60,6 @@ services:
         value: "false"
       - key: FAIRNESS_FREEZE_ENTRIES_ON_DRAW
         value: "true"
-      # MIGRATIONS_DIR is deliberately unset. It defaults to a path derived from
-      # the source tree (bot/giveaway_bot/../.. -> shared/migrations), which is
-      # correct for this layout and independent of the working directory the
-      # start command leaves us in.
 
   # ---------------------------------------------------------------------
   # Dashboard: a web service (still containerised).

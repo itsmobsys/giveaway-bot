@@ -13,9 +13,9 @@ files, and `npm run fairness:verify` proves the two implementations agree.
 ├── shared/         Cross-language contract: SQL migrations, fairness spec, test vectors
 ├── docs/           Architecture · Fairness · Security · Deployment
 ├── app.py          Entry point for panels that start a file (e.g. SillyDev)
-├── requirements.txt  Python dependencies for the bot (no container image)
+├── requirements.txt  Python dependencies, also used by the bot image
 ├── render.yaml     Render blueprint: bot (worker) + dashboard (web)
-└── docker-compose.yml  Dashboard only; the bot is not containerised
+└── docker-compose.yml  Bot + dashboard, locally
 ```
 
 ## How the two halves work together
@@ -71,13 +71,13 @@ live updates, dark mode.
 
 ```bash
 # 1. Bot: install, migrate, verify
-#    No Docker: the bot runs directly on Python, from the bot/ directory.
+#    The bot also runs straight from Python, from the bot/ directory.
 #    Use Python 3.11-3.13. The Turso driver (libsql) is a Rust extension with
 #    no 3.14 wheel, so 3.14 has to compile it from source.
 python -m pip install -r requirements.txt
 cd bot
 python -m giveaway_bot migrate
-python -m giveaway_bot selftest      # 35 checks, no token or network needed
+python -m giveaway_bot selftest      # 37 checks, no token or network needed
 python -m ruff check giveaway_bot  # or: ruff check .  (from bot/)
 cd ..
 
@@ -101,17 +101,18 @@ credentials; everything else works offline against a local SQLite file.
 Bot on **Render** (background worker), dashboard on **Render** or **Vercel** —
 both supported, `render.yaml` wires up the bot and dashboard together.
 
-**The bot is not containerised.** It runs directly on Python:
+The bot is containerised, from the root `Dockerfile`:
+
+```bash
+docker compose up -d --build    # bot + dashboard locally
+```
+
+It also runs straight from Python on any host, which is handy while developing:
 
 ```bash
 pip install -r requirements.txt
 cd bot && python -m giveaway_bot run
 ```
-
-That is the whole story for the bot on any host — no image build, no
-`docker compose`. Only the dashboard uses Docker
-(`dashboard/Dockerfile`); `docker compose up -d --build` starts the dashboard
-alone.
 
 For panels that start a Python file at the repository root rather than a command
 (Silly Development's `PY_FILE`, for instance), `app.py` is the entry point. It

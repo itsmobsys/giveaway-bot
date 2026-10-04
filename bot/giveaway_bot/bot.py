@@ -25,6 +25,7 @@ from . import embeds, views
 from .activity import MessageActivityTracker
 from .config import Settings, is_admin_permissions
 from .db import Database
+from .healthcheck import POLL_SECONDS, DashboardHealth
 from .models import Giveaway, GiveawayStatus
 from .repositories import activity as activity_repo
 from .repositories import control
@@ -80,6 +81,9 @@ class GiveawayBot(commands.Bot):
         self.db = db
         self.settings = settings
         self.scheduler = Scheduler()
+        #: Pinged every 30s so a free-tier dashboard is not idled out, and so
+        #: we notice when it goes away.
+        self.dashboard_health = DashboardHealth(settings.dashboard_url)
         self._views: dict[str, GiveawayView | WinnerView] = {}
         self._ready = asyncio.Event()
         #: Message-activity counter (buffered + batch flushed).
@@ -107,6 +111,12 @@ class GiveawayBot(commands.Bot):
         )
         # Entrants-role grants/revokes are journalled; this retries them.
         self.scheduler.add("role_tasks", self._job_role_tasks, interval=15.0, run_immediately=False)
+        self.scheduler.add(
+            "dashboard_health",
+            self._job_dashboard_health,
+            interval=POLL_SECONDS,
+            run_immediately=False,
+        )
         await self.scheduler.start()
 
     async def on_ready(self) -> None:
@@ -525,6 +535,9 @@ class GiveawayBot(commands.Bot):
                 await asyncio.to_thread(
                     control.fail_command, self.db, command.id, str(exc), retryable=True
                 )
+
+    async def _job_dashboard_health(self) -> None:
+        await self.dashboard_health.poll()
 
     async def _job_maintenance(self) -> None:
         await asyncio.to_thread(self.service.housekeeping)

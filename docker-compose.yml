@@ -1,10 +1,27 @@
-# Docker is used for the dashboard only.
-#
-# The Python bot is NOT containerised: it runs directly from `requirements.txt`
-# and `python -m giveaway_bot run` (see render.yaml and docs/DEPLOYMENT.md).
-# Only the dashboard service below is built into an image, from
-# dashboard/Dockerfile.
+# Both services are containerised: the bot from the root Dockerfile, the dashboard
+# from dashboard/Dockerfile.
 services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      LOG_JSON: "true"
+      LOG_PRETTY: "false"
+      # Shared SQLite file mounted as a volume. With TURSO_DATABASE_URL set in .env
+      # the hosted database is used instead and this is ignored.
+      SQLITE_PATH: /app/data/giveaways.db
+    volumes:
+      - giveaway-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-m", "giveaway_bot", "doctor"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 30s
+
   dashboard:
     build:
       context: ./dashboard
@@ -32,3 +49,6 @@ services:
       timeout: 10s
       retries: 3
       start_period: 20s
+
+volumes:
+  giveaway-data:

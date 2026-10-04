@@ -2181,6 +2181,72 @@ def test_intents_and_startup_error_explanations() -> None:
         "unrelated errors must be re-raised, not swallowed into a config message"
     )
 
+def test_dashboard_health_check() -> None:
+    """The 30s dashboard ping builds the right URL and does not spam the log.
+
+    Pointed at a closed local port, so this is offline and instant. What matters
+    is that a failure is remembered, that only the first one is logged (otherwise
+    an outage becomes two log lines a minute, forever), and that status() reports
+    the same thing the poll loop does.
+    """
+    import asyncio
+    import logging
+
+    from .healthcheck import POLL_SECONDS, DashboardHealth
+
+    assert 0 < POLL_SECONDS <= 60, (
+        f"the poll interval is {POLL_SECONDS}s; it has to stay well inside the idle "
+        "window of a free-tier web service"
+    )
+
+    health = DashboardHealth("http://127.0.0.1:1/")
+    expected_url = "http://127.0.0.1:1/api/health"
+    assert health.url == expected_url, f"unexpected health URL: {health.url}"
+    assert health.healthy is True, "a fresh checker must start out healthy"
+
+    class _Capture(logging.Handler):
+        def __init__(self) -> None:
+            super().__init__()
+            self.records: list[logging.LogRecord] = []
+
+        def emit(self, record: logging.LogRecord) -> None:
+            self.records.append(record)
+
+    logger = logging.getLogger("giveaway_bot.healthcheck")
+    capture = _Capture()
+    previous_level = logger.level
+    logger.addHandler(capture)
+    logger.setLevel(logging.DEBUG)
+    try:
+        async def scenario() -> None:
+            assert await health.poll() is False, "a closed port must report unhealthy"
+            assert health.healthy is False, "a failed ping must clear `healthy`"
+            assert health.consecutive_failures == 1, (
+                f"expected 1 counted failure, got {health.consecutive_failures}"
+            )
+
+            # Two more failures must not produce two more warnings.
+            assert await health.poll() is False, "still unreachable"
+            assert await health.poll() is False, "still unreachable"
+            assert health.consecutive_failures == 3, (
+                f"expected 3 counted failures, got {health.consecutive_failures}"
+            )
+            warnings = [r for r in capture.records if r.levelno == logging.WARNING]
+            assert len(warnings) == 1, (
+                f"3 failures should log 1 warning, but logged {len(warnings)}"
+            )
+
+        asyncio.run(scenario())
+    finally:
+        logger.removeHandler(capture)
+        logger.setLevel(previous_level)
+
+    assert health.status() == {
+        "url": expected_url,
+        "healthy": False,
+        "consecutive_failures": 3,
+    }, f"status() disagreed with the poll loop: {health.status()}"
+
 # --------------------------------------------------------------------------- #
 # Cross-language vectors
 # --------------------------------------------------------------------------- #
@@ -2297,6 +2363,7 @@ def main() -> int:
     check.run("create -> join -> manage -> draw -> reroll", test_lifecycle)
     check.run("crash recovery finishes an interrupted draw", test_crash_recovery)
     check.run("migrations are immutable and idempotent", test_migration_integrity)
+    check.run("the dashboard health check works", test_dashboard_health_check)
 
     print("\n" + "=" * 60)
     if check.failures:
