@@ -937,7 +937,9 @@ class GiveawayService:
                 guild_id=giveaway.guild_id,
                 giveaway_id=giveaway.id,
                 event_type=action,
-                payload={"target_id": user_id, "entries_changed": changed, "reason": reason},
+                # Public SSE carries this payload unauthenticated: no user IDs
+                # or reasons. The audit row above keeps the full detail for admins.
+                payload={"entries_changed": changed},
             )
         return changed
 
