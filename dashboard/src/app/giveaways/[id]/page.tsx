@@ -237,7 +237,7 @@ export default async function GiveawayPage({ params }: Props) {
                   </div>
                 </div>
 
-                {latestDraw ? (
+                {latestDraw && giveaway.status === "ended" ? (
                   <div>
                     <p className="text-xs uppercase tracking-wide text-[var(--muted-foreground)]">
                       Revealed seed (round {latestDraw.round})

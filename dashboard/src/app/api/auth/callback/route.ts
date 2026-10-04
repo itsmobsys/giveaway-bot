@@ -47,15 +47,20 @@ export async function GET(request: Request): Promise<NextResponse> {
     return loginUrl("oauth_not_configured");
   }
 
-  // 1. Verify the state: must exist, be unexpired, and be unused.
+  // 1. Atomically claim the state so concurrent replays can't both win.
+  // Fetch redirect_to first (display only), then claim atomically as the gate.
   const rows = await all<StateRow>(
     "SELECT state, redirect_to, expires_at, consumed_at FROM oauth_states WHERE state = ?",
     [state],
   );
-  const record = rows[0];
-  if (!record || record.consumed_at !== null || Number(record.expires_at) < Date.now()) {
+  const claimed = await run(
+    "UPDATE oauth_states SET consumed_at = ? WHERE state = ? AND consumed_at IS NULL AND expires_at >= ?",
+    [Date.now(), state, Date.now()],
+  );
+  if (claimed.rowsAffected !== 1) {
     return loginUrl("invalid_state");
   }
+  const record = rows[0];
 
   try {
     // 2. Exchange the one-time code.
@@ -65,10 +70,7 @@ export async function GET(request: Request): Promise<NextResponse> {
     const identity = await fetchIdentity(accessToken);
     await createSession(identity);
 
-    // 4. Consume the state so it cannot be replayed.
-    await run("UPDATE oauth_states SET consumed_at = ? WHERE state = ?", [Date.now(), state]);
-
-    const target = safeInternalPath(record.redirect_to);
+    const target = safeInternalPath(record?.redirect_to);
     return NextResponse.redirect(new URL(target, url.origin));
   } catch (err) {
     console.error("OAuth callback failed:", err);

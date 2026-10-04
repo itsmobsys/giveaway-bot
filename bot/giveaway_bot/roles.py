@@ -200,7 +200,7 @@ class RoleManager:
         if guild is None:
             return 0
         applied = 0
-        for task in control.claim_role_tasks(self.db, limit=limit):
+        for task in control.claim_role_tasks(self.db, limit=limit, guild_id=str(guild_id)):
             ok, error = await self._apply(guild, task)
             if ok:
                 control.complete_role_task(self.db, int(task["id"]), ok=True)

@@ -174,18 +174,22 @@ export async function rateLimit(
   const max = limit > 0 ? Math.floor(limit) : 30;
   const windowStart = Math.floor(nowMs() / 1000 / windowSecondsSafe) * windowSecondsSafe;
 
-  await run(
-    `INSERT INTO rate_limits (bucket, window_start, hits) VALUES (?, ?, 1)
-     ON CONFLICT(bucket, window_start) DO UPDATE SET hits = hits + 1`,
-    [bucket, windowStart],
+  // Single statement: increment and read back atomically so concurrent
+  // bursts can't both read the pre-increment value and bypass the limit.
+  const returned = await import("./db").then((m) =>
+    m.all<{ hits: number }>(
+      `INSERT INTO rate_limits (bucket, window_start, hits) VALUES (?, ?, 1)
+       ON CONFLICT(bucket, window_start) DO UPDATE SET hits = hits + 1
+       RETURNING hits`,
+      [bucket, windowStart],
+    ),
   );
-
-  const row = await import("./db").then((m) =>
+  const row = returned[0] ?? (await import("./db").then((m) =>
     m.first<{ hits: number }>(
       "SELECT hits FROM rate_limits WHERE bucket = ? AND window_start = ?",
       [bucket, windowStart],
     ),
-  );
+  ));
   const hits = Number(row?.hits ?? 1);
   const resetSeconds = Math.max(
     0,

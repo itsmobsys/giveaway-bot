@@ -209,13 +209,18 @@ def evaluate_join(
 
 
 def revalidate_snapshot(
-    giveaway: Giveaway, entry: dict[str, Any], *, is_member: bool, role_ids: Iterable[str], now: int
+    giveaway: Giveaway, entry: dict[str, Any], *, is_member: bool, role_ids: Iterable[str], now: int,
+    current_entries: int = 0, total_entries: int = 0, message_count: int = 0,
 ) -> Eligibility:
     """Re-check a stored entry against current guild state.
 
     Used by the "eligibility validation" pass that administrators can trigger
     from the dashboard: participants who lost a required role (or gained a
     blacklisted one) can be flagged so the next draw is honest.
+
+    Entry-cap and message-count inputs are explicit parameters (defaulting to 0
+    for callers that only re-check roles): previously they were hardcoded to 0,
+    so a revalidation pass silently skipped the entry-cap and message rules.
     """
     return evaluate_join(
         giveaway,
@@ -225,8 +230,10 @@ def revalidate_snapshot(
         guild_joined_at=entry.get("guild_joined_at"),
         is_member=is_member,
         channel_id=giveaway.channel_id,
-        current_entries=0,
+        current_entries=current_entries,
         now=now,
+        total_entries=total_entries,
+        message_count=message_count,
     )
 
 

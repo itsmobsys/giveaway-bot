@@ -72,12 +72,12 @@ live updates, dark mode.
 ```bash
 # 1. Bot: install, migrate, verify
 #    The bot also runs straight from Python, from the bot/ directory.
-#    Use Python 3.11-3.13. The Turso driver (libsql) is a Rust extension with
-#    no 3.14 wheel, so 3.14 has to compile it from source.
+#    Use Python 3.11-3.13. libsql 0.1.11 ships cp314 wheels on manylinux but
+#    none for Windows, so the image stays on 3.13 as the tested baseline.
 python -m pip install -r requirements.txt
 cd bot
 python -m giveaway_bot migrate
-python -m giveaway_bot selftest      # 48 checks, no token or network needed
+python -m giveaway_bot selftest      # 49 checks, no token or network needed
 python -m ruff check giveaway_bot  # or: ruff check .  (from bot/)
 cd ..
 

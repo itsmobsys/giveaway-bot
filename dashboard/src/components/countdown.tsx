@@ -17,8 +17,10 @@ export function Countdown({
   status: string;
 }) {
   const [now, setNow] = useState<number | null>(null);
+  const [mounted, setMounted] = useState(false);
 
   useEffect(() => {
+    setMounted(true);
     setNow(Date.now());
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
@@ -32,8 +34,17 @@ export function Countdown({
     return <span>Ended</span>;
   }
 
-  const reference = now ?? Date.now();
-  const remaining = endsAt - reference;
+  // Deterministic pre-hydration output: Date.now() differs between server and
+  // client, so render the absolute end time until mounted to avoid mismatch.
+  if (!mounted || now === null) {
+    return (
+      <span className="tabular text-[var(--muted-foreground)]" title={new Date(endsAt).toISOString()}>
+        Ends {new Date(endsAt).toLocaleString()}
+      </span>
+    );
+  }
+
+  const remaining = endsAt - now;
 
   if (remaining <= 0) {
     return (

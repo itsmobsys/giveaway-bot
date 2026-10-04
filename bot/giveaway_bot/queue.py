@@ -142,8 +142,9 @@ def _validate_channel(bot: Any, guild: Any, channel_id: str) -> Any:
 async def _refresh(bot: Any, giveaway_id: str) -> None:
     """Re-render a giveaway message after a mutation."""
     giveaway = bot.service.get(giveaway_id)
-    if giveaway.message_id or giveaway.status is not GiveawayStatus.ENDED:
-        await bot.render_giveaway(giveaway, announce=giveaway.status is GiveawayStatus.ENDED)
+    if not giveaway.message_id:
+        return
+    await bot.render_giveaway(giveaway, announce=giveaway.status is GiveawayStatus.ENDED)
 
 
 # --------------------------------------------------------------------------- #

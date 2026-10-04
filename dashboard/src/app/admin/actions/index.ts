@@ -272,14 +272,12 @@ export async function moderateEntryAction(
   try {
     const ctx = await guard("moderate", guildId);
     const data = entrySchema.parse({ user_id: userId, reason });
-    const kind = eligible ? "giveaway.entry.restore" : "giveaway.entry.disqualify";
     const commandId = await enqueue(
       guildId, giveawayId,
       eligible ? "entry.restore" : "entry.disqualify",
       data as never,
       ctx.userId, ctx.username,
     );
-    void kind;
     revalidatePath(`/admin/guilds/${guildId}/giveaways/${giveawayId}`);
     return {
       ok: true,

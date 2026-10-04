@@ -205,6 +205,9 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
     @app_commands.describe(giveaway="Giveaway ID from the message footer")
     async def join(self, interaction: discord.Interaction, giveaway: str) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
+        if interaction.guild is None:
+            await interaction.followup.send("⚠️ Use this command in a server, not in DMs.", ephemeral=True)
+            return
         record = await self._find_giveaway(str(interaction.guild_id), giveaway)
         if record is None:
             await interaction.followup.send("⚠️ Giveaway not found.", ephemeral=True)

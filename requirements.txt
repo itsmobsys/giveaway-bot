@@ -1,12 +1,8 @@
 # Python runtime dependencies for the Discord bot.
 #
-# The bot is deployed directly to a Python runtime (Render's native worker, or
-# any host that can run `pip install -r requirements.txt`):
-#
-#   build:  pip install -r requirements.txt
-#   start:  cd bot && exec python -m giveaway_bot run
-#
-# There is no container image. `bot/pyproject.toml` remains the package
+# The bot runs from the root Dockerfile (Render docker worker) or directly on a
+# Python runtime (`pip install -r requirements.txt`, `cd bot && python -m
+# giveaway_bot run`). `bot/pyproject.toml` remains the package
 # definition and holds the dev extras; `selftest` asserts the two agree, so a
 # dependency added there cannot silently go missing from a deploy.
 #

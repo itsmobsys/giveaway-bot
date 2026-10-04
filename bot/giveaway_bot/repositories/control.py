@@ -199,22 +199,33 @@ def role_task(
         return False
 
 
-def claim_role_tasks(db: Database, *, limit: int = 25) -> list[dict[str, Any]]:
-    """Atomically claim pending role tasks.
+def claim_role_tasks(db: Database, *, limit: int = 25, guild_id: str | None = None) -> list[dict[str, Any]]:
+    """Atomically claim pending role tasks, optionally for one guild only.
 
     Atomicity comes from the conditional UPDATE, not from an enclosing write
     transaction - see :func:`claim_batch` for why.
     """
     limit = max(1, min(limit, 100))
     claimed: list[dict[str, Any]] = []
-    for row in db.query(
-        """
+    if guild_id is not None:
+        candidates = db.query(
+            """
+        SELECT id FROM giveaway_role_tasks
+        WHERE status = 'pending' AND guild_id = ?
+        ORDER BY id ASC LIMIT ?
+        """,
+            (guild_id, limit),
+        )
+    else:
+        candidates = db.query(
+            """
         SELECT id FROM giveaway_role_tasks
         WHERE status = 'pending'
         ORDER BY id ASC LIMIT ?
         """,
-        (limit,),
-    ):
+            (limit,),
+        )
+    for row in candidates:
         cursor = db.execute(
             "UPDATE giveaway_role_tasks SET status = 'claimed', attempts = attempts + 1"
             " WHERE id = ? AND status = 'pending'",

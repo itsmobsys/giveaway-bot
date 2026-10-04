@@ -36,11 +36,14 @@ export async function GET(
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
+      let closed = false;
       const send = (chunk: string) => {
+        if (closed) return;
         try {
           controller.enqueue(encoder.encode(chunk));
         } catch {
           // Stream already closed by the client; nothing to do.
+          closed = true;
         }
       };
 
@@ -90,20 +93,28 @@ export async function GET(
         return true;
       };
 
-      void (async () => {
-        while (await tick()) {
-          if (request.signal.aborted) break;
-          await new Promise((resolve) => setTimeout(resolve, POLL_MS));
-        }
+      const loop = (async () => {
         try {
-          controller.close();
+          while (!closed && !request.signal.aborted && (await tick())) {
+            if (Date.now() - startedAt > MAX_DURATION_MS) break;
+            await new Promise((resolve) => setTimeout(resolve, POLL_MS));
+          }
         } catch {
-          // Already closed.
+          // Tick errors after the first are observed here, not unhandled.
+        } finally {
+          closed = true;
+          try {
+            controller.close();
+          } catch {
+            // Already closed.
+          }
         }
       })();
+      void loop;
     },
     cancel() {
-      // The consumer disconnected; the loop observes request.signal.aborted.
+      // The consumer disconnected; the loop observes request.signal.aborted
+      // on its next tick and exits. No-op body retained for the interface.
     },
   });
 

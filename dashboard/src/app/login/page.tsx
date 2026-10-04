@@ -17,9 +17,9 @@ const ERROR_MESSAGES: Record<string, string> = {
 export default async function LoginPage({
   searchParams,
 }: {
-  searchParams: Promise<{ error?: string }>;
+  searchParams: Promise<{ error?: string; redirect_to?: string }>;
 }) {
-  const { error } = await searchParams;
+  const { error, redirect_to } = await searchParams;
   const message = error ? (ERROR_MESSAGES[error] ?? "Sign-in failed.") : null;
   const ready = sessionsAvailable() && discordConfigured();
 
@@ -54,7 +54,7 @@ export default async function LoginPage({
           </div>
         ) : (
           <a
-            href="/api/auth/login"
+            href={redirect_to ? `/api/auth/login?redirect_to=${encodeURIComponent(redirect_to)}` : "/api/auth/login"}
             className="mt-6 flex items-center justify-center gap-2 rounded-lg bg-[#5865F2] px-5 py-2.5 font-medium text-white transition-transform hover:scale-[1.02]"
           >
             <span aria-hidden="true">💬</span>

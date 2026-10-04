@@ -35,6 +35,19 @@ export function CreateGiveawayForm({ guildId }: { guildId: string }) {
     event.preventDefault();
     setResult(null);
 
+    // Never silently drop a typo'd role ID: the operator would think roles
+    // were required when none were sent.
+    const required = parseIds(form.required_role_ids);
+    const blacklisted = parseIds(form.blacklist_role_ids);
+    const dropped = [...required.dropped, ...blacklisted.dropped];
+    if (dropped.length > 0) {
+      setResult({
+        ok: false,
+        message: `Those don't look like role IDs and were not sent: ${dropped.slice(0, 5).join(", ")}${dropped.length > 5 ? ` (+${dropped.length - 5} more)` : ""}. Use plain IDs or <@&id> mentions.`,
+      });
+      return;
+    }
+
     const payload = {
       ...form,
       winner_count: Number(form.winner_count),
@@ -43,8 +56,8 @@ export function CreateGiveawayForm({ guildId }: { guildId: string }) {
       min_messages: Number(form.min_messages),
       min_account_age_days: Number(form.min_account_age_days),
       // Accept "123, 456" or "<@&123>" and send plain snowflakes.
-      required_role_ids: parseIds(form.required_role_ids),
-      blacklist_role_ids: parseIds(form.blacklist_role_ids),
+      required_role_ids: required.ids,
+      blacklist_role_ids: blacklisted.ids,
     };
 
     startTransition(async () => {
@@ -285,14 +298,18 @@ function Field({
 }
 
 /** Accept raw IDs, comma/space separated lists, and Discord mention syntax. */
-function parseIds(value: string): string[] {
+function parseIds(value: string): { ids: string[]; dropped: string[] } {
   const cleaned = value.replace(/<@&(\d+)>/g, "$1");
-  return [
-    ...new Set(
-      cleaned
-        .split(/[,\s]+/)
-        .map((item) => item.trim())
-        .filter((item) => /^[0-9]{15,25}$/.test(item)),
-    ),
-  ];
+  const ids: string[] = [];
+  const dropped: string[] = [];
+  for (const item of new Set(
+    cleaned
+      .split(/[,\s]+/)
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0),
+  )) {
+    if (/^[0-9]{15,25}$/.test(item)) ids.push(item);
+    else dropped.push(item);
+  }
+  return { ids, dropped };
 }
