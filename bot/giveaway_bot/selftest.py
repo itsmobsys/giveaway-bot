@@ -2250,6 +2250,106 @@ def test_dashboard_health_check() -> None:
         "consecutive_failures": 3,
     }, f"status() disagreed with the poll loop: {health.status()}"
 
+def test_tracker_record_reads_a_real_timestamp() -> None:
+    """``record()`` must handle a real ``discord.Message`` timestamp.
+
+    ``created_at`` is a ``datetime`` and ``datetime.timestamp`` is a *method*. The
+    old code read the attribute and multiplied the bound method by 1000, which
+    raises ``TypeError``. Because ``on_message`` has no exception handling, that
+    fired for every single message: discord.py logged a traceback per message and
+    nothing was ever counted, so a message-gated giveaway could never be entered.
+
+    ``record_raw`` was always fine, which is why the buffering test missed it -
+    this goes through the gateway-shaped entry point with a genuine timestamp.
+    """
+    import datetime
+
+    from .activity import MessageActivityTracker
+    from .repositories import activity as activity_repo
+    from .repositories import guilds as guilds_repo
+    from .service import Actor, GiveawayService
+
+    class _Obj:
+        """Minimal stand-in for the parts of a discord.Message that are read."""
+
+        def __init__(self, **fields: object) -> None:
+            self.__dict__.update(fields)
+
+    def _message(**overrides: object) -> _Obj:
+        base = {
+            "guild": _Obj(id="800"),
+            "author": _Obj(id="2100", bot=False),
+            "channel": _Obj(id="801"),
+            "id": "1750000000000000001",
+            # A real, timezone-aware datetime, exactly what discord.py supplies.
+            "created_at": datetime.datetime(2026, 10, 4, 12, 30, 15, tzinfo=datetime.UTC),
+            "webhook_id": None,
+            "content": "hello there",
+        }
+        base.update(overrides)
+        return _Obj(**base)
+
+    with _temp_database("tracker-real-ts") as db:
+        guilds_repo.upsert_guild(db, "800", name="Timestamp Guild")
+        service = GiveawayService(db, _isolated_settings())
+        actor = Actor("1", "owner", "discord")
+        service.create(
+            actor, guild_id="800", channel_id="801",
+            payload={"title": "t", "prize": "p", "duration": "1h", "min_messages": 1},
+        )
+
+        tracker = MessageActivityTracker(db, service)
+        tracker.refresh_requirements()
+
+        created = datetime.datetime(2026, 10, 4, 12, 30, 15, tzinfo=datetime.UTC)
+        expected_ms = int(created.timestamp() * 1000)
+
+        # The regression: this used to raise TypeError.
+        tracker.record(_message())
+        assert tracker.stats["seen"] >= 1, "record() did not see the message"
+        assert tracker.stats["skipped_invalid"] == 0, (
+            f"a real snowflake message was rejected as invalid: {dict(tracker.stats)}"
+        )
+
+        # The buffered event must carry the real send time, not "now".
+        with tracker._lock:
+            state = tracker._states.get("800")
+            buffered = list(state.buffer) if state is not None else []
+        assert len(buffered) == 1, (
+            f"expected exactly one buffered event, got {len(buffered)}: {dict(tracker.stats)}"
+        )
+        assert buffered[0].message_at == expected_ms, (
+            f"message_at is {buffered[0].message_at}, expected {expected_ms} "
+            "(datetime.timestamp() must be *called*, and scaled to milliseconds)"
+        )
+
+        # And it must actually land in the database.
+        tracker.flush_all()
+        assert activity_repo.get_count(db, "800", "2100") == 1, (
+            "the message was not persisted, so the requirement could never be met"
+        )
+
+        # Bots, webhooks and empty messages are still refused through record().
+        before = dict(tracker.stats)
+        tracker.record(_message(id="1750000000000000002", author=_Obj(id="2101", bot=True)))
+        tracker.record(_message(id="1750000000000000003", content=""))
+        tracker.record(_message(id="1750000000000000004", webhook_id="99"))
+        assert tracker.stats["skipped_bot"] == before["skipped_bot"] + 3, (
+            f"bot/webhook/empty messages were not all skipped: {dict(tracker.stats)}"
+        )
+
+        # A message with no usable timestamp falls back to now rather than raising.
+        fallback = _message(id="1750000000000000005")
+        fallback.created_at = None
+        tracker.record(fallback)
+        tracker.record(_message(id="1750000000000000006", created_at="not-a-datetime"))
+        with tracker._lock:
+            state = tracker._states.get("800")
+            assert state is not None and len(state.buffer) == 2, (
+                "a missing or unusable created_at must still be recorded"
+            )
+
+
 # --------------------------------------------------------------------------- #
 # Transaction lifecycle and concurrent claiming
 # --------------------------------------------------------------------------- #
@@ -2713,6 +2813,7 @@ def main() -> int:
     check.run("counters gate the join button", test_message_counting_and_gating)
     check.run("duplicate/backfilled events cannot inflate counts", test_message_count_idempotency)
     check.run("tracker skips work and flushes in batches", test_message_tracker_buffering)
+    check.run("record() reads a real discord timestamp", test_tracker_record_reads_a_real_timestamp)
     check.run("revalidation flags only who fails today", test_message_revalidation)
 
     check.section("Temporary entrants role")

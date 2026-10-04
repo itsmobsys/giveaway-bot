@@ -58,6 +58,28 @@ class _GuildState:
     any_requirement: bool = False
 
 
+def _message_timestamp_ms(message: Any) -> int:
+    """Creation time of a message, in epoch milliseconds.
+
+    ``discord.Message.created_at`` is a timezone-aware ``datetime``, and
+    ``datetime.timestamp`` is a *method*. Reading the attribute without calling it
+    yields the bound method, and ``bound_method * 1000`` raises ``TypeError``.
+    That is what this used to do, so every ``record()`` call raised, ``on_message``
+    logged a traceback per message, and no live message was ever counted - which
+    quietly made a message-gated giveaway impossible to enter.
+
+    Anything unusable falls back to now: a counter that is a few seconds out is
+    harmless, whereas raising would lose the message entirely.
+    """
+    created = getattr(message, "created_at", None)
+    if created is None:
+        return now_ms()
+    try:
+        return int(created.timestamp() * 1000)
+    except (AttributeError, TypeError, ValueError, OSError, OverflowError):
+        return now_ms()
+
+
 class MessageActivityTracker:
     """Buffers message events and flushes them to the database in batches."""
 
@@ -123,9 +145,7 @@ class MessageActivityTracker:
             user_id=str(author.id),
             channel_id=str(channel.id),
             message_id=str(getattr(message, "id", "") or ""),
-            message_at=int(
-                getattr(getattr(message, "created_at", None), "timestamp", 0) * 1000
-            ) or now_ms(),
+            message_at=_message_timestamp_ms(message),
             is_bot=bool(getattr(author, "bot", False))
             or bool(getattr(message, "webhook_id", None)),
             content_length=len(getattr(message, "content", "") or ""),
