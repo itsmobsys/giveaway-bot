@@ -498,29 +498,51 @@ class GiveawayService:
         # (and retries) the actual grant. A failed grant therefore never loses
         # the entry, and reconciliation can repair it later.
         role_id = giveaway.participant_role_id
-        with self.db.transaction() as tx:
-            entry_id = entries_repo.add_entry(
-                tx,
-                giveaway.id,
-                user_id,
-                next_seq,
-                account_created_at=member.get("account_created_at"),
-                guild_joined_at=member.get("guild_joined_at"),
-                snapshot={
-                    "role_ids": sorted(role_ids),
-                    "channel_id": channel_id,
-                    "is_member": is_member,
-                    "eligibility": verdict.reason,
-                },
-                role_granted_at=now_ms() if role_id else None,
-                grant_source="bot" if role_id else "none",
-            )
-            if entry_id is None:
-                return JoinOutcome(
-                    joined=False,
-                    eligibility=Eligibility(True, Reason.OK, "You are already entered."),
-                    duplicate=True,
+        try:
+            with self.db.transaction() as tx:
+                entry_id = entries_repo.add_entry(
+                    tx,
+                    giveaway.id,
+                    user_id,
+                    next_seq,
+                    account_created_at=member.get("account_created_at"),
+                    guild_joined_at=member.get("guild_joined_at"),
+                    snapshot={
+                        "role_ids": sorted(role_ids),
+                        "channel_id": channel_id,
+                        "is_member": is_member,
+                        "eligibility": verdict.reason,
+                    },
+                    role_granted_at=now_ms() if role_id else None,
+                    grant_source="bot" if role_id else "none",
                 )
+                if entry_id is None:
+                    return JoinOutcome(
+                        joined=False,
+                        eligibility=Eligibility(True, Reason.OK, "You are already entered."),
+                        duplicate=True,
+                    )
+                # Re-enforce both caps inside the transaction. The pre-checks above
+                # read outside any transaction, so two concurrent joins could both
+                # pass and over-fill. Raising rolls the insert back; the caller
+                # sees the same refusal as the pre-check.
+                inside = entries_repo.count_user_entries(
+                    tx, giveaway.id, user_id,
+                    max_entries_per_user=giveaway.max_entries_per_user,
+                )
+                if giveaway.max_entries_per_user and inside > giveaway.max_entries_per_user:
+                    raise ServiceError(
+                        "max_entries_reached",
+                        f"You have already used all {giveaway.max_entries_per_user} entr"
+                        + ("y." if giveaway.max_entries_per_user == 1 else "ies."),
+                    )
+                if giveaway.entry_limit:
+                    total_inside = entries_repo.active_entry_totals(tx, giveaway.id)[0]
+                    if total_inside > giveaway.entry_limit:
+                        raise ServiceError(
+                            "entry_limit_reached",
+                            "This giveaway has reached its entry limit.",
+                        )
             if role_id:
                 # Journal the grant. The Discord call happens in the bot layer and
                 # is retried from this queue, so neither a Discord failure nor a
@@ -557,6 +579,22 @@ class GiveawayService:
                     "participant_count": fresh_totals[1],
                 },
             )
+        except ServiceError as exc:
+            # Only the in-transaction cap re-checks raise these; anything else
+            # is a genuine error and propagates. The insert was rolled back,
+            # so returning a refusal keeps join()'s contract (no exceptions
+            # for eligibility outcomes).
+            if exc.code == "max_entries_reached":
+                return JoinOutcome(
+                    joined=False,
+                    eligibility=Eligibility(False, Reason.MAX_ENTRIES_REACHED, exc.message),
+                )
+            if exc.code == "entry_limit_reached":
+                return JoinOutcome(
+                    joined=False,
+                    eligibility=Eligibility(False, Reason.ENTRY_LIMIT_REACHED, exc.message),
+                )
+            raise
         return JoinOutcome(joined=True, eligibility=verdict, entry_seq=next_seq)
 
     def leave(self, giveaway: Giveaway, user_id: str) -> bool:

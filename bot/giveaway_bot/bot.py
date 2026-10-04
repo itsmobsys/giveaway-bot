@@ -243,11 +243,28 @@ class GiveawayBot(commands.Bot):
         return Actor(user_id=str(user.id), username=str(user.display_name), source=source)
 
     # --------------------------------------------------------------- rendering
+    def _text_channel(self, channel_id: str) -> Any | None:
+        """Resolve a channel ID to something we can post in, or None.
+
+        IDs are validated as snowflakes at input, but rows outlive validation:
+        a corrupt row must not crash a scheduler tick, and get_channel can
+        return a voice/stage/forum channel with no send/fetch_message.
+        """
+        try:
+            channel = self.get_channel(int(channel_id))
+        except (TypeError, ValueError):
+            return None
+        if channel is None:
+            return None
+        if not hasattr(channel, "send") or not hasattr(channel, "fetch_message"):
+            return None
+        return channel
+
     async def render_giveaway(
         self, giveaway: Giveaway, *, announce: bool = False
     ) -> discord.Message | None:
         """Create the live giveaway message, or refresh the existing one."""
-        channel = self.get_channel(int(giveaway.channel_id))
+        channel = self._text_channel(giveaway.channel_id)
         if channel is None:
             log.warning(
                 "cannot render giveaway %s: channel %s unavailable",
@@ -294,12 +311,18 @@ class GiveawayBot(commands.Bot):
 
     def _role_names(self, giveaway: Giveaway) -> dict[str, str]:
         names: dict[str, str] = {}
-        guild = self.get_guild(int(giveaway.guild_id))
+        try:
+            guild = self.get_guild(int(giveaway.guild_id))
+        except (TypeError, ValueError):
+            return names
         if guild is None:
             return names
         role_ids = giveaway.required_role_ids + giveaway.blacklist_role_ids
         for role_id in role_ids:
-            role = guild.get_role(int(role_id))
+            try:
+                role = guild.get_role(int(role_id))
+            except (TypeError, ValueError):
+                continue
             if role is not None:
                 names[role_id] = role.name
         return names
@@ -324,7 +347,7 @@ class GiveawayBot(commands.Bot):
         self, outcome: DrawOutcome, *, activity_report: dict[str, Any] | None = None
     ) -> None:
         giveaway = outcome.giveaway
-        channel = self.get_channel(int(giveaway.channel_id))
+        channel = self._text_channel(giveaway.channel_id)
         if channel is None:
             log.warning("cannot announce winners: channel %s missing", giveaway.channel_id)
             return
@@ -581,7 +604,10 @@ class GiveawayBot(commands.Bot):
     # ------------------------------------------------------- entrants role
     async def attach_entrants_role(self, giveaway: Giveaway) -> Giveaway:
         """Ensure this giveaway has an entrants role and record it."""
-        guild = self.get_guild(int(giveaway.guild_id))
+        try:
+            guild = self.get_guild(int(giveaway.guild_id))
+        except (TypeError, ValueError):
+            return giveaway
         if guild is None:
             return giveaway
         role = await self.roles.resolve_role(guild)
@@ -681,7 +707,7 @@ class GiveawayBot(commands.Bot):
 
     # ------------------------------------------------------------- utilities
     async def post_verify(self, giveaway: Giveaway, verification: dict[str, Any] | None) -> None:
-        channel = self.get_channel(int(giveaway.channel_id))
+        channel = self._text_channel(giveaway.channel_id)
         if channel is None:
             return
         embed = embeds.build_verify_embed(giveaway, verification)
