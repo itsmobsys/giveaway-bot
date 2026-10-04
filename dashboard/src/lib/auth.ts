@@ -238,7 +238,7 @@ export async function listAdminGuilds(userId: string): Promise<AdminGuild[]> {
         -- member whose only permission was VIEW_CHANNEL. Their guild then appeared
         -- on /admin with its name, icon, member count and giveaway analytics, and
         -- they could read every giveaway, entry and winner in it.
-        AND (CAST(a.permissions AS INTEGER) & 41) != 0
+        AND (CAST(a.permissions AS INTEGER) & 40) != 0
         AND g.bot_present = 1
       ORDER BY g.name COLLATE NOCASE`,
     [userId],

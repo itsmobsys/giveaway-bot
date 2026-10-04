@@ -334,7 +334,7 @@ async def _handle_announce(bot: Any, command: Any, actor: Actor) -> dict[str, An
     await channel.send(
         content=" ".join(f"<@{user_id}>" for user_id in winners) or "No winners this round.",
         allowed_mentions=discord.AllowedMentions(
-            users=[discord.ObjectID(int(uid)) for uid in winners]
+            users=[discord.Object(id=int(uid)) for uid in winners]
         ),
     )
     return {"ok": True, "mentions": len(winners)}

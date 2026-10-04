@@ -303,7 +303,7 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
         draws = draws_repo.list_draws(self.bot.db, record.id)
         winners = draws_repo.list_winners(self.bot.db, record.id)
         if not draws:
-            await interaction.response.send_message("This giveaway has not been drawn yet.", ephemeral=True)
+            await interaction.followup.send("This giveaway has not been drawn yet.", ephemeral=True)
             return
         lines = []
         for draw in draws:
@@ -317,7 +317,7 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
                 f"{draw.winner_count} winner(s) · {embeds.format_timestamp(draw.created_at, style='R')}\n"
                 + (", ".join(names) or "_no winners_")
             )
-        await interaction.response.send_message(
+        await interaction.followup.send(
             embed=discord.Embed(
                 title=f"🗂 {record.title} · winner history",
                 description="\n\n".join(lines)[:4000],

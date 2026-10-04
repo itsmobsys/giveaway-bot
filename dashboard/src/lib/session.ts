@@ -12,7 +12,8 @@
  */
 
 import { cookies } from "next/headers";
-import { SignJWT, jwtDecrypt } from "jose";
+import { EncryptJWT, jwtDecrypt } from "jose";
+import { createHash } from "node:crypto";
 
 const COOKIE_NAME = "gw_session";
 const ISSUER = "giveaway-dashboard";
@@ -32,9 +33,10 @@ function maxAgeSeconds(): number {
 
 function secretKey(): Uint8Array | null {
   const secret = process.env.SESSION_SECRET;
-  // 32 bytes exactly, required by A256GCM.
+  // 32 bytes exactly, required by A256GCM. Derive via SHA-256 so long
+  // secrets keep their full entropy and non-ASCII secrets still key correctly.
   if (!secret || secret.length < 32) return null;
-  return new TextEncoder().encode(secret.padEnd(32, "0").slice(0, 32));
+  return new Uint8Array(createHash("sha256").update(secret, "utf8").digest());
 }
 
 export function sessionsAvailable(): boolean {
@@ -47,7 +49,7 @@ export async function createSession(user: SessionUser): Promise<void> {
     throw new Error("SESSION_SECRET is missing or shorter than 32 characters");
   }
   const maxAge = maxAgeSeconds();
-  const token = await new SignJWT({
+  const token = await new EncryptJWT({
     username: user.username,
     globalName: user.globalName,
     avatar: user.avatar,
@@ -58,7 +60,7 @@ export async function createSession(user: SessionUser): Promise<void> {
     .setAudience(AUDIENCE)
     .setIssuedAt()
     .setExpirationTime(`${maxAge}s`)
-    .sign(key);
+    .encrypt(key);
 
   const store = await cookies();
   store.set(COOKIE_NAME, token, {

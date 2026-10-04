@@ -287,17 +287,23 @@ export function verifyDraw(input: {
   }
 
   // 5. Recompute the winner ordering.
-  const ranked = scores
-    .map((item) => ({
-      user_id: String(item.user_id),
-      entry_seq: Number(item.entry_seq),
-      score: BigInt(String(item.score)),
-    }))
-    .sort((a, b) => {
-      if (a.score !== b.score) return a.score < b.score ? -1 : 1;
-      if (a.user_id !== b.user_id) return a.user_id < b.user_id ? -1 : 1;
-      return a.entry_seq - b.entry_seq;
-    });
+  let ranked: { user_id: string; entry_seq: number; score: bigint }[];
+  try {
+    ranked = scores
+      .map((item) => ({
+        user_id: String(item.user_id),
+        entry_seq: Number(item.entry_seq),
+        score: BigInt(String(item.score)),
+      }))
+      .sort((a, b) => {
+        if (a.score !== b.score) return a.score < b.score ? -1 : 1;
+        if (a.user_id !== b.user_id) return a.user_id < b.user_id ? -1 : 1;
+        return a.entry_seq - b.entry_seq;
+      });
+  } catch (error) {
+    errors.push(`winner ordering is not verifiable: ${error instanceof Error ? error.message : String(error)}`);
+    return { ok: false, checks, errors, winners: [], participantDigest: digest };
+  }
 
   const declaredWinners = (manifest.winners ?? []).map((w) => ({
     rank: w.rank,

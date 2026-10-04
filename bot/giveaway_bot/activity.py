@@ -24,6 +24,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
+import discord
+
 from .db import Database, now_ms
 from .models import GiveawayStatus
 from .repositories import activity as activity_repo
@@ -279,7 +281,8 @@ class MessageActivityTracker:
 
         messages: list[dict[str, Any]] = []
         try:
-            async for message in channel.history(limit=200, oldest=high_water or None):
+            after = discord.Object(id=high_water) if high_water else None
+            async for message in channel.history(limit=200, after=after):
                 messages.append(
                     {
                         "id": str(message.id),

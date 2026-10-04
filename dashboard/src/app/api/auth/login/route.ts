@@ -1,6 +1,6 @@
 import { safeInternalPath } from "@/lib/security";
-import { all, first, nowMs, run } from "@/lib/db.ts";
-import { readSession } from "@/lib/session.ts";
+import { all, first, nowMs, run } from "@/lib/db";
+import { readSession } from "@/lib/session";
 
 /**
  * Start Discord OAuth2.

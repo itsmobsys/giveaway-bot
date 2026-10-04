@@ -16,10 +16,7 @@
 #
 # `render.yaml` is read from the repository root.
 
-databases:
-  - name: giveaway-db
-    # Turso/libSQL is the supported store; this entry documents intent.
-    # Replace with your own Turso credentials via the dashboard environment.
+databases: []
 
 services:
   # ---------------------------------------------------------------------
@@ -92,4 +89,6 @@ services:
       - key: TURSO_AUTH_TOKEN
         sync: false
       - key: NEXT_PUBLIC_APP_URL
+        sync: false
+      - key: CSRF_TRUSTED_ORIGINS
         sync: false

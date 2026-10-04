@@ -27,6 +27,9 @@ services:
       context: ./dashboard
       dockerfile: Dockerfile
     restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file: .env
     environment:
       # Required: the dashboard checks Manage Server against Discord before every
       # admin action. Without it every admin page is refused.
@@ -40,8 +43,11 @@ services:
       DISCORD_REDIRECT_URI: ${DISCORD_REDIRECT_URI}
       SESSION_SECRET: ${SESSION_SECRET}
       NEXT_PUBLIC_APP_URL: ${DASHBOARD_URL}
+      SQLITE_PATH: /app/data/giveaways.db
       MIGRATIONS_DIR: /app/migrations
     volumes:
+      # Shared SQLite file: same path as the bot so local dev uses one database.
+      - giveaway-data:/app/data
       # Migrations are read-only at runtime; only the migrate command needs them.
       - ./shared/migrations:/app/migrations:ro
     healthcheck:

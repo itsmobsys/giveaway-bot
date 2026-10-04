@@ -454,16 +454,16 @@ def create_oauth_state(db: Database, redirect_to: str | None, *, ttl_seconds: in
 
 
 def consume_oauth_state(db: Database, state: str) -> bool:
-    """Single-use, expiring state check."""
-    row = db.query_one("SELECT expires_at, consumed_at FROM oauth_states WHERE state = ?", (state,))
-    if not row:
-        return False
-    if row.get("consumed_at"):
-        return False
-    if int(row.get("expires_at") or 0) < now_ms():
-        return False
-    db.execute("UPDATE oauth_states SET consumed_at = ? WHERE state = ?", (now_ms(), state))
-    return True
+    """Single-use, expiring state check — atomic so concurrent consumes can't both win."""
+    cursor = db.execute(
+        "UPDATE oauth_states SET consumed_at = ? WHERE state = ? AND consumed_at IS NULL AND expires_at >= ?",
+        (now_ms(), state, now_ms()),
+    )
+    try:
+        changed = int(getattr(cursor, "rowcount", 0) or 0)
+    finally:
+        cursor.close()
+    return changed == 1
 
 
 def prune_oauth_states(db: Database) -> None:

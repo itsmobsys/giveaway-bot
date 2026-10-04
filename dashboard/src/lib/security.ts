@@ -63,7 +63,10 @@ function expectedOrigins(): Set<string> {
   const vercel = process.env.VERCEL_URL?.trim();
   if (vercel) origins.add(`https://${vercel}`);
   const render = process.env.RENDER_EXTERNAL_URL?.trim();
-  if (render) origins.add(render);
+  if (render) {
+    const origin = normaliseOrigin(render);
+    if (origin) origins.add(origin);
+  }
   return origins;
 }
 

@@ -28,9 +28,9 @@ ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV PORT=3000
 
-# Tolerates the directory being absent: git cannot track an empty directory,
-# so a fresh clone has no dashboard/public and this COPY would fail the build.
-COPY --from=builder /app/public* ./public
+# dashboard/public is required for the build (tracked via .gitkeep).
+# It always exists in a fresh clone, so copy it directly.
+COPY --from=builder /app/public ./public
 COPY --from=builder --chown=nextjs:nodejs /app/.next ./.next
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/package.json ./package.json

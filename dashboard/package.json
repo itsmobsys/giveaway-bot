@@ -14,12 +14,12 @@
                     "start":  "next start --port ${PORT:-3000}",
                     "lint":  "next lint",
                     "typecheck":  "tsc --noEmit",
-                    "db:migrate":  "node scripts/migrate.ts",
-                    "db:status":  "node scripts/migrate.ts --status",
-                    "db:reset":  "node scripts/migrate.ts --reset",
-                    "fairness:verify":  "node scripts/verify-fairness.ts",
+                    "db:migrate":  "tsx scripts/migrate.ts",
+                    "db:status":  "tsx scripts/migrate.ts --status",
+                    "db:reset":  "tsx scripts/migrate.ts --reset",
+                    "fairness:verify":  "tsx scripts/verify-fairness.ts",
                     "test":  "node --test tests/*.test.mjs",
-                    "db:seed":  "node scripts/seed-dev.ts"
+                    "db:seed":  "tsx scripts/seed-dev.ts"
                 },
     "dependencies":  {
                          "@libsql/client":  "^0.14.0",
@@ -36,6 +36,7 @@
                             "@types/react":  "^19.0.7",
                             "@types/react-dom":  "^19.0.3",
                             "tailwindcss":  "^4.0.0",
+                            "tsx":  "^4.19.0",
                             "typescript":  "^5.7.3"
                         },
     "overrides":  {

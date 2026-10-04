@@ -176,6 +176,7 @@ class GiveawayBot(commands.Bot):
           does not produce one write per message.
         """
         self.activity_tracker.record(message)
+        await self.process_commands(message)
 
     async def on_disconnect(self) -> None:
         log.warning("gateway disconnected - message counting will backfill on resume")
@@ -370,7 +371,7 @@ class GiveawayBot(commands.Bot):
                         await message.reply(
                             content=" ".join(f"<@{user_id}>" for user_id, _ in winners),
                             allowed_mentions=discord.AllowedMentions(
-                                users=[discord.ObjectID(int(uid)) for uid, _ in winners]
+                                users=[discord.Object(id=int(uid)) for uid, _ in winners]
                             ),
                         )
                     return

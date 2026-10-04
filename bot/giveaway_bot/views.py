@@ -17,10 +17,25 @@ import discord
 
 from .eligibility import Reason
 from .embeds import format_duration
-from .models import Giveaway, GiveawayStatus, snowflake_to_ms
+from .models import Giveaway, GiveawayStatus
 from .roles import DEFAULT_ROLE_NAME
 
 log = logging.getLogger("giveaway_bot.views")
+
+
+def _datetime_to_ms(value: Any) -> int | None:
+    """discord.py exposes created_at/joined_at as aware datetimes, not snowflakes."""
+    if value is None:
+        return None
+    try:
+        timestamp = value.timestamp()
+    except (AttributeError, TypeError, ValueError, OSError):
+        return None
+    try:
+        millis = int(timestamp * 1000)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return millis if millis > 0 else None
 
 ButtonHandler = Callable[[discord.Interaction, str], Awaitable[None]]
 
@@ -45,8 +60,8 @@ def member_context(member: discord.Member | discord.User, guild: discord.Guild) 
         "username": str(member.display_name if is_member else member.name),
         "role_ids": roles,
         "is_member": is_member,
-        "account_created_at": snowflake_to_ms(getattr(member, "created_at", None)),
-        "guild_joined_at": snowflake_to_ms(getattr(member, "joined_at", None)) if is_member else None,
+        "account_created_at": _datetime_to_ms(getattr(member, "created_at", None)),
+        "guild_joined_at": _datetime_to_ms(getattr(member, "joined_at", None)) if is_member else None,
         "guild_id": str(guild.id),
     }
 
