@@ -12,7 +12,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 #: Discord permission bitfields we care about.
@@ -45,7 +45,20 @@ class Settings(BaseSettings):
     discord_bot_token: str = Field(default="", repr=False)
     #: Single channel every giveaway is posted in. The bot owns this channel and
     #: admins never pick one - see `DISCORD_GIVEAWAY_CHANNEL_ID` in .env.example.
-    giveaway_channel_id: str = ""
+    #:
+    #: The alias is load-bearing. This Settings sets no `env_prefix`, so
+    #: pydantic-settings matches environment variables against the uppercased
+    #: *field* name: this field would read `GIVEAWAY_CHANNEL_ID`. But
+    #: .env.example, docs/DEPLOYMENT.md and the error raised from
+    #: repositories/control -> queue.py all told operators to set
+    #: `DISCORD_GIVEAWAY_CHANNEL_ID`, which was therefore silently ignored: the
+    #: field came back empty and every create failed with "No giveaway channel is
+    #: configured" however the variable was set. Both spellings are accepted so a
+    #: deployment that discovered the working one keeps working.
+    giveaway_channel_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("DISCORD_GIVEAWAY_CHANNEL_ID", "GIVEAWAY_CHANNEL_ID"),
+    )
     discord_client_id: str = ""
     discord_client_secret: str = Field(default="", repr=False)
     discord_redirect_uri: str = "http://localhost:3000/api/auth/callback"

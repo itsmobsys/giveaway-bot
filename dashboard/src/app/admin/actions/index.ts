@@ -65,6 +65,24 @@ async function enqueue(
   userId: string,
   username: string,
 ): Promise<number> {
+  // Ownership check. guard() authorises the caller-supplied guildId, but
+  // giveawayId arrives as a separate argument and was never checked against it.
+  // Without this, an admin of *any* server could pass a giveaway id belonging to
+  // a different one, and the bot would end it, reroll it, disqualify its
+  // participants or invalidate its message activity there. The bot trusts the
+  // dashboard for authorisation and only re-validates against live Discord, so
+  // it cannot catch this. Every giveaway-scoped action funnels through here, so
+  // checking once closes all of them.
+  if (giveawayId !== null) {
+    const owner = await first<{ guild_id: string }>(
+      "SELECT guild_id FROM giveaways WHERE id = ?",
+      [giveawayId],
+    );
+    if (!owner || owner.guild_id !== guildId) {
+      // 404 rather than 403: do not confirm the giveaway exists in another guild.
+      throw new ActionError("That giveaway does not exist in this server.", 404);
+    }
+  }
   const { commandId } = await enqueueCommand({
     guildId,
     giveawayId,
@@ -329,15 +347,37 @@ export async function revalidateActivityAction(
   }
 }
 
-/** Read the current command state, for the status strip. */
-export async function getCommandStatusAction(commandId: number): Promise<{
+/**
+ * Read the current command state, for the status strip.
+ *
+ * This is an exported Server Action, so it is an HTTP endpoint whether or not
+ * anything calls it. It previously had no session, no RBAC and no rate limit and
+ * returned a row for any id: `last_error` is bot-supplied free text, `result_json`
+ * carries draw output including winner user ids, and command ids are sequential,
+ * so that was a full harvest of every command result across every guild.
+ */
+export async function getCommandStatusAction(
+  guildId: string,
+  commandId: number,
+): Promise<{
   status: string;
   error: string | null;
   result: unknown;
 }> {
+  try {
+    await guard("command_status", guildId);
+  } catch (error) {
+    // Never throw from here: the status strip polls this, and a rejected read
+    // should read as "forbidden", not as a broken page.
+    return {
+      status: "forbidden",
+      error: error instanceof ActionError ? error.message : "Not permitted.",
+      result: null,
+    };
+  }
   const row = await first<{ status: string; last_error: string | null; result_json: string | null }>(
-    "SELECT status, last_error, result_json FROM command_queue WHERE id = ?",
-    [commandId],
+    "SELECT status, last_error, result_json FROM command_queue WHERE id = ? AND guild_id = ?",
+    [commandId, guildId],
   );
   let result: unknown = null;
   if (row?.result_json) {

@@ -2350,6 +2350,111 @@ def test_tracker_record_reads_a_real_timestamp() -> None:
             )
 
 
+def test_a_dead_database_stream_is_replaced() -> None:
+    """A dropped Hrana stream must not wedge the connection forever.
+
+    Turso closes an idle stream after a while, and outright on a restart or a
+    network blip. The libsql client keeps its Connection object, so the cached
+    per-thread connection stays permanently broken and every later statement
+    raises `ValueError: Hrana: ... stream not found` until the process restarts.
+    That is what wedged the scheduler's queue job in production.
+
+    libsql cannot be installed on this interpreter (no matching wheel), so the
+    dead stream is simulated with a driver that fails. The recovery path under
+    test is driver-independent: it keys off the message text.
+    """
+    from .db import _brief, _is_dead_connection
+
+    # Verbatim from production.
+    real = (
+        'Hrana: `api error: `status=404 Not Found, '
+        'body={"error":"stream not found: 6f250963:19da976"}`'
+    )
+    assert _is_dead_connection(real.lower()), "the production message is not recognised"
+    for dead in ("stream not found", "connection closed", "channel closed",
+                 "not connected", "broken pipe", "connection reset", "server closed"):
+        assert _is_dead_connection(dead), f"{dead!r} is not recognised as a dead stream"
+    for healthy in ("database is locked", "sql syntax error",
+                    "foreign key constraint failed", "unique constraint failed"):
+        assert not _is_dead_connection(healthy), (
+            f"{healthy!r} must not count as a dead connection, or a real error "
+            "would be retried behind the recovery path"
+        )
+    assert "\n" not in _brief(Exception(real)), "logged errors must stay single-line"
+
+    with _temp_database("dead-stream") as db:
+        from .repositories import control
+        from .repositories import guilds as guilds_repo
+
+        guilds_repo.upsert_guild(db, "1", name="Dead Stream")
+
+        # --- a stream that dies once must be replaced, and the work still lands
+        inner = db.connection()
+        attempts = {"n": 0}
+
+        class _DiesOnce:
+            def __init__(self, wrapped: object) -> None:
+                self._wrapped = wrapped
+                self.closed = False
+
+            def execute(self, sql: str, params: object = ()) -> object:
+                attempts["n"] += 1
+                raise ValueError(real)
+
+            def close(self) -> None:
+                self.closed = True
+
+        broken = _DiesOnce(inner)
+        db._local.conn = broken
+        db._states[id(broken)] = db._states.pop(id(inner))
+
+        control.enqueue(db, guild_id="1", kind="after-recovery", payload={},
+                        requested_by="1", source="bot")
+
+        assert attempts["n"] == 1, (
+            f"the dead connection was tried {attempts['n']} times; it must be "
+            "replaced after a single failure, not retried on itself"
+        )
+        assert broken.closed, "the dead connection was not closed"
+        assert db.connection() is not broken, "the dead connection was handed out again"
+        assert db.query_one(
+            "SELECT * FROM command_queue WHERE kind = 'after-recovery'"
+        ) is not None, "the statement did not run on the replacement connection"
+
+        # --- a database that is genuinely unreachable must still raise
+        opened = {"n": 0}
+
+        class _AlwaysDead:
+            def execute(self, sql: str, params: object = ()) -> object:
+                raise ValueError(real)
+
+            def close(self) -> None:
+                pass
+
+        real_factory = db._connect_factory
+
+        def dead_factory() -> object:
+            opened["n"] += 1
+            return _AlwaysDead()
+
+        db._local.conn = None
+        db._connect_factory = dead_factory  # type: ignore[assignment]
+        try:
+            db.query_one("SELECT 1")
+        except ValueError as exc:
+            assert "stream not found" in str(exc), f"the real error was lost: {exc}"
+            assert opened["n"] == 2, (
+                f"expected exactly one reconnect attempt, opened {opened['n']}"
+            )
+        else:
+            raise AssertionError(
+                "an unreachable database must raise, not retry forever"
+            )
+        finally:
+            db._connect_factory = real_factory  # type: ignore[assignment]
+            db._local.conn = None
+
+
 # --------------------------------------------------------------------------- #
 # Transaction lifecycle and concurrent claiming
 # --------------------------------------------------------------------------- #
@@ -2841,6 +2946,7 @@ def main() -> int:
     check.run("crash recovery finishes an interrupted draw", test_crash_recovery)
     check.run("migrations are immutable and idempotent", test_migration_integrity)
     check.run("the dashboard health check works", test_dashboard_health_check)
+    check.run("a dead database stream is replaced", test_a_dead_database_stream_is_replaced)
     check.run("a transaction never outlives its block", test_transactions_never_outlive_their_block)
     check.run("transactions nest without re-BEGIN", test_transactions_nest_without_re_begin)
     check.run("concurrent claim_batch never duplicates", test_concurrent_claims_never_duplicate)

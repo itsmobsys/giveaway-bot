@@ -31,6 +31,35 @@ log = logging.getLogger("giveaway_bot.db")
 Migration = tuple[str, str]  # (filename, sql)
 
 
+#: Substrings that mean the connection's underlying stream is gone. Turso speaks
+#: Hrana over HTTP, and the client holds a ``Connection`` that survives the server
+#: dropping the stream, so these have to be detected from the message text: the
+#: driver raises a bare ``ValueError`` and exports no exception hierarchy to match.
+_DEAD_CONNECTION_MARKERS = (
+    "stream not found",
+    "connection closed",
+    "channel closed",
+    "not connected",
+    "no current connection",
+    "broken pipe",
+    "connection reset",
+    "connection aborted",
+    "server closed",
+    "unexpected eof",
+    "socket is closed",
+)
+
+
+def _is_dead_connection(message: str) -> bool:
+    return any(marker in message for marker in _DEAD_CONNECTION_MARKERS)
+
+
+def _brief(exc: Exception, limit: int = 120) -> str:
+    """Single-line, length-capped form of an error, safe to log."""
+    text = " ".join(str(exc).split())
+    return text[:limit]
+
+
 @dataclasses.dataclass
 class _TxState:
     """Transaction bookkeeping for exactly one connection.
@@ -216,14 +245,41 @@ class Database:
 
     # ------------------------------------------------------------- primitives
     def execute(self, sql: str, params: Sequence[Any] = ()) -> Any:
-        """Execute one statement and return the cursor."""
-        conn = self.connection()
+        """Execute one statement and return the cursor.
+
+        Two distinct failures are handled, and neither hides an error:
+
+        * **A dead connection.** Turso closes an idle Hrana stream after a while,
+          and closes it outright on a server restart or a network blip. The
+          client keeps its ``Connection`` object, so with no intervention every
+          later statement on that connection fails with
+          ``ValueError: Hrana: ... stream not found`` - forever, until the
+          process restarts. The connection is retired and replaced, once per
+          statement. A dead stream means the statement never reached the server,
+          so replaying it cannot double-apply anything, and if the *replacement*
+          also fails then the error surfaces normally.
+        * **Genuine writer contention** that busy_timeout did not absorb, which
+          is retried with a short backoff exactly as before.
+        """
         attempts = 5 if not self._is_turso else 6
         last_error: Exception | None = None
+        reconnected = False
         for attempt in range(attempts):
+            # Re-read per attempt so a retired connection is never reused. This
+            # also fixes a pre-existing flaw: the transient retry re-ran the
+            # statement on the very connection that had just failed it.
+            conn = self.connection()
             try:
                 return conn.execute(sql, tuple(params))
-            except Exception as exc:  # noqa: BLE001 - re-raised unless transient
+            except Exception as exc:  # noqa: BLE001 - re-raised unless recoverable
+                message = str(exc).lower()
+                if not reconnected and _is_dead_connection(message):
+                    log.warning(
+                        "database stream went away (%s); replacing the connection", _brief(exc)
+                    )
+                    self._retire(conn, f"hrana stream lost: {_brief(exc)}", broken=True)
+                    reconnected = True
+                    continue
                 # Matching on sqlite3.OperationalError was SQLite-only: libSQL
                 # raises its own exception types and exports no OperationalError,
                 # so on Turso this retry could never fire and a transient

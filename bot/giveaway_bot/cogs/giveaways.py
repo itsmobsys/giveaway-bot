@@ -15,6 +15,7 @@ Command surface:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Any
@@ -346,26 +347,67 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
         await self.bot.post_verify(record, self.bot.service.verification_for(record.id))
         await interaction.followup.send("🔐 Seed revealed in this channel.", ephemeral=True)
 
-    # autocomplete helpers -----------------------------------------------------
-    async def _autocomplete(self, interaction: discord.Interaction, current: str) -> list[str]:
+    # ------------------------------------------------------------ autocomplete
+    async def _giveaway_autocomplete(
+        self, interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Suggest this guild's giveaways for a `giveaway` option.
+
+        Two things were wrong. The callback returned plain strings, and
+        discord.py builds the reply with ``[option.to_dict() for option in
+        choices]``, so every keystroke raised ``AttributeError: 'str' object has
+        no attribute 'to_dict'`` and Discord logged "Ignoring exception in
+        autocomplete". And the value it offered was ``"<id> - <title>"``, which
+        ``_find_giveaway`` looks up verbatim and so could never resolve - even a
+        working suggestion would have failed.
+
+        A Choice separates the displayed ``name`` from the submitted ``value``:
+        the title is shown, the bare id is sent.
+        """
         if interaction.guild_id is None:
             return []
-        records = gw_repo.list_for_guild(self.bot.db, str(interaction.guild_id), limit=50)
-        term = (current or "").lower()
+        # A database read must never run on the gateway thread.
+        records = await asyncio.to_thread(
+            gw_repo.list_for_guild, self.bot.db, str(interaction.guild_id), limit=50
+        )
+        term = (current or "").strip().lower()
         return [
-            f"{record.id} — {record.title}"
+            app_commands.Choice(name=record.title[:100], value=record.id)
             for record in records
             if term in record.title.lower() or term in record.id
         ][:25]
 
-    @create.autocomplete("duration")
     async def duration_autocomplete(
         self, interaction: discord.Interaction, current: str
-    ) -> list[str]:
-        return [value for value in ("30m", "1h", "6h", "12h", "24h", "3d", "7d") if current in value][:25]
+    ) -> list[app_commands.Choice[str]]:
+        """Suggest a duration.
+
+        Must return Choice objects, not strings: discord.py serialises each one
+        with ``option.to_dict()``, so bare strings crash the callback.
+        """
+        return [
+            app_commands.Choice(name=value, value=value)
+            for value in ("30m", "1h", "6h", "12h", "24h", "3d", "7d")
+            if current in value
+        ][:25]
 
     async def cog_load(self) -> None:
+        self._attach_autocomplete()
         log.info("giveaway commands loaded")
+
+    def _attach_autocomplete(self) -> None:
+        """Wire the autocomplete callbacks onto the commands that need them.
+
+        ``autocomplete`` is a method on the Command object rather than an argument
+        to its decorator, so it can only be attached once every command exists.
+        It also cannot be done by bare name inside the class body: ``create``,
+        ``join`` and friends are class attributes, and those names are not in
+        scope inside a method, so this goes through ``getattr`` on the class.
+        """
+        cls = type(self)
+        cls.create.autocomplete("duration")(self.duration_autocomplete)
+        for name in ("join", "leave", "info", "participants", "history", "verify", "reveal"):
+            getattr(cls, name).autocomplete("giveaway")(self._giveaway_autocomplete)
 
 
 def _parse_ids(value: str) -> list[str]:
