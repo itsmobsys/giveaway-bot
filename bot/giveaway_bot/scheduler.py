@@ -69,8 +69,14 @@ class Scheduler:
                 return
 
     async def _loop(self, job: Job) -> None:
-        # Small jitter so many bots in one guild do not stampede the API.
-        await asyncio.sleep(random.uniform(0, min(5.0, job.interval)))  # noqa: S311 - not security
+        # Small jitter so many bots in one guild do not stampede the API at
+        # startup. run_immediately=False opts out of the first run entirely
+        # and waits a full interval; previously the flag was accepted but
+        # ignored, so every job ran after the jitter regardless.
+        if job.run_immediately:
+            await asyncio.sleep(random.uniform(0, min(5.0, job.interval)))  # noqa: S311 - not security
+        else:
+            await asyncio.sleep(job.interval)
         while not self._stopping:
             started = time.monotonic()
             await self._safe_run(job)

@@ -148,6 +148,8 @@ class GiveawayBot(commands.Bot):
         await self.scheduler.stop()
         await super().close()
         with contextlib.suppress(Exception):
+            await self.dashboard_health.aclose()
+        with contextlib.suppress(Exception):
             self.activity_tracker.shutdown()
         with contextlib.suppress(Exception):
             # SQLite on Windows holds the file until every connection is released.

@@ -35,17 +35,28 @@ class DashboardHealth:
     def __init__(self, base_url: str) -> None:
         self.url = base_url.rstrip("/") + "/api/health"
         self.consecutive_failures = 0
+        self._client: httpx.AsyncClient | None = None
 
     @property
     def healthy(self) -> bool:
         return self.consecutive_failures == 0
 
+    async def aclose(self) -> None:
+        """Release the reused HTTP client. Called from GiveawayBot.close()."""
+        client, self._client = self._client, None
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:  # noqa: BLE001 - shutdown path
+                log.warning("failed to close the health-check client")
+
     async def poll(self) -> bool:
         """Ping once. Returns True when the dashboard answered."""
         try:
-            async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
-                response = await client.get(self.url)
-                response.raise_for_status()
+            if self._client is None:
+                self._client = httpx.AsyncClient(timeout=TIMEOUT_SECONDS)
+            response = await self._client.get(self.url)
+            response.raise_for_status()
         except Exception as exc:  # noqa: BLE001 - any failure means unreachable
             self.consecutive_failures += 1
             if self.consecutive_failures == 1:
