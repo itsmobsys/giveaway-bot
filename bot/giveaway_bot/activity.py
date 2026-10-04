@@ -247,6 +247,12 @@ class MessageActivityTracker:
         self.stats["batches"] += 1
         return written
 
+    def shutdown(self) -> None:
+        """Stop the background executor. Called from GiveawayBot.close()."""
+        executor = getattr(self, "_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True)
+
     def flush_all(self) -> int:
         """Flush every guild. Called by the scheduler and on shutdown."""
         with self._lock:

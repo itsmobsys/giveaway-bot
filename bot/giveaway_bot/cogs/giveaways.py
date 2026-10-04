@@ -133,6 +133,24 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
             "message_count_scope": "channel" if message_channel_ids else "guild",
         }
 
+        # Single-giveaway-per-guild, checked BEFORE anything is written. This used
+        # to run after service.create(), which inserts the row and seals a fresh
+        # seed commitment - so a rejected create left an orphan giveaway sitting in
+        # `running` with no message and no entrants role, which the scheduler then
+        # picked up and drew. Every refused attempt left another zombie, and the
+        # error even named the giveaway the bot had just created. queue.py checks
+        # in the right order; this did not.
+        existing = await asyncio.to_thread(
+            gw_repo.find_active, self.bot.db, str(interaction.guild_id)
+        )
+        if existing is not None:
+            await interaction.followup.send(
+                f"⚠️ This server already has an active giveaway: **{existing['title']}** "
+                f"(`{existing['id']}`).\nEnd it first with `/admin give end {existing['id']}`.",
+                ephemeral=True,
+            )
+            return
+
         try:
             giveaway = self.bot.service.create(
                 self.bot.actor_for(interaction.user),
@@ -145,17 +163,6 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
             return
         except Exception as exc:  # ValidationError and friends
             await interaction.followup.send(f"⚠️ {exc}", ephemeral=True)
-            return
-
-        # Single-giveaway-per-guild: the entrants role is only meaningful for one
-        # open giveaway at a time.
-        existing = gw_repo.find_active(self.bot.db, str(interaction.guild_id))
-        if existing is not None:
-            await interaction.followup.send(
-                f"⚠️ This server already has an active giveaway: **{existing['title']}** "
-                f"(`{existing['id']}`).\nEnd it first with `/admin give end {existing['id']}`.",
-                ephemeral=True,
-            )
             return
 
         # Temporary entrants role, created lazily and reused across giveaways.

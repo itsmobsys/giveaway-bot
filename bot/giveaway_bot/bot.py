@@ -15,6 +15,7 @@ or entry counts to this file, it belongs in :mod:`giveaway_bot.eligibility` or
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import Any
 
@@ -135,8 +136,22 @@ class GiveawayBot(commands.Bot):
         self._ready.set()
 
     async def close(self) -> None:
+        # Flush buffered message activity first. Up to MAX_PENDING_EVENTS per guild
+        # was being dropped on every clean shutdown, and nothing marks those
+        # messages for backfill - `activity_backfill_pending` is only set on a
+        # gateway *resume* - so the counts stayed permanently low and members were
+        # told they had not sent enough messages.
+        try:
+            await asyncio.to_thread(self.activity_tracker.flush_all)
+        except Exception:  # noqa: BLE001 - shutdown must continue regardless
+            log.exception("failed to flush message activity during shutdown")
         await self.scheduler.stop()
         await super().close()
+        with contextlib.suppress(Exception):
+            self.activity_tracker.shutdown()
+        with contextlib.suppress(Exception):
+            # SQLite on Windows holds the file until every connection is released.
+            self.db.close_all()
 
     # ---------------------------------------------------------------- gateway
     async def on_raw_guild_role_delete(self, payload: discord.RawGuildRoleDeletePayload) -> None:
@@ -337,6 +352,12 @@ class GiveawayBot(commands.Bot):
             dashboard_url=self.settings.dashboard_url,
             can_manage=True,
         )
+        # Register it. A view only routes interactions once discord.py has it, and
+        # the giveaway's own view is not registered for an *ended* giveaway, so
+        # after any restart the Reroll button on the winner message - the only
+        # place it appears - answered "This interaction failed".
+        self._views[giveaway.id] = view
+        self.add_view(view)
         try:
             if giveaway.message_id:
                 try:
@@ -632,10 +653,11 @@ class GiveawayBot(commands.Bot):
 
     async def _job_activity_backfill(self) -> None:
         """Repair counter gaps after a gateway resume."""
-        pending = control.get_state(self.db, "activity_backfill_pending")
+        # These are synchronous database calls and this is an async method, so they
+        # were blocking the gateway thread.
+        pending = await asyncio.to_thread(control.get_state, self.db, "activity_backfill_pending")
         if not pending:
             return
-        control.set_state(self.db, "activity_backfill_pending", "")
         guild_ids = [part for part in pending.split(",") if part]
         for guild_id in guild_ids:
             for channel_id in activity_repo.watched_channels(self.db, guild_id)[:10]:
@@ -643,6 +665,11 @@ class GiveawayBot(commands.Bot):
                     await self.activity_tracker.backfill_channel(self, guild_id, channel_id)
                 except Exception:  # noqa: BLE001 - backfill must never crash the bot
                     log.exception("activity backfill failed for %s/%s", guild_id, channel_id)
+        # Cleared only once the work is done. It used to be cleared *before* the
+        # loop, so a crash part-way through lost the marker and the remaining
+        # channels were never repaired - silently and permanently.
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(control.set_state, self.db, "activity_backfill_pending", "")
 
     # ------------------------------------------------------- command execution
     async def _execute_command(self, command: Any) -> dict[str, Any]:

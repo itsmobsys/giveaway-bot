@@ -211,15 +211,29 @@ class AdminCommands(commands.Cog, name="admin"):
     @app_commands.checks.has_permissions(manage_guild=True)
     async def cancel(self, interaction: discord.Interaction, giveaway: str, reason: str = "") -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self._run(
-            interaction,
-            giveaway,
-            lambda actor, record, **_: self.bot.service.end(
-                actor, record, reason=reason or "cancelled", draw=False
-            ),
-        )
+        # `giveaway` is the raw user-supplied identifier and may be a *message* id,
+        # which _lookup resolves but service.get does not - so this used to raise
+        # an uncaught ServiceError after the giveaway had already been ended. When
+        # _run failed (unknown giveaway, or one that was not running) it returned
+        # None and this still went on to claim success.
+        record = await self._lookup(interaction, giveaway)
+        if record is None:
+            await interaction.followup.send("⚠️ Giveaway not found.", ephemeral=True)
+            return
+        try:
+            await asyncio.to_thread(
+                self.bot.service.end,
+                self.bot.actor_for(interaction.user),
+                record,
+                reason=reason or "cancelled",
+                draw=False,
+            )
+        except ServiceError as exc:
+            await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
+            return
+        cancelled = await asyncio.to_thread(self.bot.service.get, record.id)
         released = await self.bot.release_entrants_role(
-            self.bot.service.get(giveaway), reason="slash_command_cancel"
+            cancelled, reason="slash_command_cancel"
         )
         await interaction.followup.send(
             f"🚫 Giveaway cancelled without a draw. Entrants role removed from "

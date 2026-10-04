@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
+import signal
 import sys
 from pathlib import Path
 
@@ -174,6 +176,35 @@ def cmd_run(_: argparse.Namespace) -> int:
 
     service = GiveawayService(db, settings)
 
+    def _install_signal_handlers() -> None:
+        """Make SIGTERM unwind the bot rather than kill the process.
+
+        ``asyncio.run`` only arranges for SIGINT. Every container platform,
+        orchestrator and panel sends SIGTERM, and with no handler for it the
+        process died instantly on deploy: the gateway session was never closed,
+        ``GiveawayBot.close()`` never ran, so buffered message activity was
+        dropped and database connections were left to the garbage collector. It
+        also left the in-flight queue command stuck in ``claimed``.
+
+        Cancelling the tasks makes ``bot.start()`` raise CancelledError, which
+        propagates through ``async with bot`` and runs ``close()``.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover - always inside a loop here
+            return
+
+        def _cancel() -> None:
+            log.info("signal received, shutting down")
+            for task in asyncio.all_tasks(loop):
+                task.cancel()
+
+        # Windows has neither SIGTERM nor add_signal_handler; the in-process shim
+        # still reaches KeyboardInterrupt there.
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError, AttributeError, RuntimeError, ValueError):
+                loop.add_signal_handler(sig, _cancel)
+
     async def _main() -> None:
         bot = GiveawayBot(service, db, settings)
         settings_ = settings
@@ -188,16 +219,16 @@ def cmd_run(_: argparse.Namespace) -> int:
                 "bot/giveaway_bot/api.py. (CONTROL_API_* and the bot-side rate "
                 "limit settings depend on it.)"
             )
-        if False:  # pragma: no cover - retained only to keep the branch obvious
-            from .api import start_control_api
-
-            await start_control_api(settings_, bot)
+        _install_signal_handlers()
         async with bot:
             await bot.start(settings.discord_bot_token)
 
     try:
         asyncio.run(_main())
-    except KeyboardInterrupt:  # pragma: no cover - interactive
+    except (KeyboardInterrupt, asyncio.CancelledError):  # SIGINT or SIGTERM
+        # CancelledError is a BaseException, so it escapes `except Exception`
+        # below and has to be named here or the process exits with a traceback
+        # on every ordinary deploy.
         log.info("shutting down")
     except Exception as exc:
         # Startup failures that are caused by configuration rather than by a bug
