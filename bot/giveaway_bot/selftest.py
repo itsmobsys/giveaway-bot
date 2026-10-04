@@ -1648,6 +1648,55 @@ def test_app_shim_entrypoint() -> None:
         shutil.rmtree(probe_dir, ignore_errors=True)
 
 
+def test_migrations_are_bom_free() -> None:
+    """No migration file may contain a BOM, and both loaders must strip one.
+
+    A BOM is not whitespace, so it silently becomes part of the first statement's
+    text. SQLite ignores it, which is why every local test passed, but Turso's
+    parser rejects the statement outright - a hosted deploy died on
+    ``SQL_PARSE_ERROR`` for a migration that was provably fine locally. Both
+    runtimes read the same files, so both loaders are checked.
+    """
+    root = Path(__file__).resolve().parents[2]
+    bom = "\ufeff"
+
+    migrations = sorted((root / "shared" / "migrations").glob("*.sql"))
+    assert migrations, "no migrations found"
+    for path in migrations:
+        raw = path.read_bytes()
+        assert not raw.startswith(b"\xef\xbb\xbf"), (
+            f"{path.name} starts with a UTF-8 BOM; strip it"
+        )
+        assert bom not in raw.decode("utf-8"), (
+            f"{path.name} contains a BOM character; strip it"
+        )
+
+    # The loaders must also cope with one, because a future editor can reintroduce
+    # it and the failure mode is a rejected statement rather than a warning.
+    from .db import load_migrations
+
+    tmp = Path(tempfile.mkdtemp(prefix="giveaway-bom-"))
+    try:
+        bommed = tmp / "0001_probe.sql"
+        bommed.write_bytes(b"\xef\xbb\xbf-- header\nCREATE TABLE t (id INTEGER);\n")
+        loaded = load_migrations(tmp)
+        assert len(loaded) == 1, "probe migration was not loaded"
+        assert bom not in loaded[0][1], (
+            "load_migrations must strip a BOM: it is not whitespace and Turso "
+            "rejects the resulting statement"
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    migrate_ts = root / "dashboard" / "scripts" / "migrate.ts"
+    if migrate_ts.exists():
+        source = migrate_ts.read_text(encoding="utf-8")
+        assert "uFEFF" in source, (
+            "the dashboard's migration loader must strip a BOM too - it applies "
+            "the same files, so it would fail on the same statement"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Cross-language vectors
 # --------------------------------------------------------------------------- #
@@ -1749,6 +1798,7 @@ def main() -> int:
     check.run("requirements.txt covers every runtime dependency", test_requirements_cover_runtime_deps)
     check.run("the shipped .env.example is a loadable config", test_example_env_file_loads)
     check.run("the root app.py shim reaches the bot", test_app_shim_entrypoint)
+    check.run("migrations are BOM-free and loaders strip one", test_migrations_are_bom_free)
 
     check.section("Persistence + lifecycle")
     check.run("create -> join -> manage -> draw -> reroll", test_lifecycle)

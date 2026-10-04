@@ -1,4 +1,4 @@
-﻿-- 0005_message_activity.sql -- per-user message counters
+-- 0005_message_activity.sql -- per-user message counters
 --
 -- Efficiency model
 -- ----------------

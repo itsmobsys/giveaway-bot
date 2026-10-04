@@ -97,7 +97,12 @@ function loadMigrations(dir: string): Array<{ name: string; sql: string; checksu
   if (files.length === 0) throw new Error(`No .sql migrations found in ${dir}`);
 
   return files.map((name) => {
-    const sql = readFileSync(join(dir, name), "utf8");
+    // A BOM is not whitespace. Node's utf8 decoding keeps one, so it would end
+    // up inside the first statement's text and inside the checksum. SQLite
+    // ignores it, but Turso's parser rejects the statement outright - which
+    // failed a hosted deploy on a migration every local test had passed.
+    // Stripped everywhere, not only at the start. Mirrors the bot's loader.
+    const sql = readFileSync(join(dir, name), "utf8").replace(/\uFEFF/g, "");
     return {
       name,
       sql,
@@ -179,11 +184,12 @@ async function main(): Promise<void> {
     return;
   }
 
-  if (pending.length === 0) {
-    console.log("Database is already up to date.");
-    return;
-  }
-
+  // Checked before the pending check below, and deliberately not inside it: this
+  // guard used to sit after an early `return` for the nothing-pending case,
+  // so it never ran in the one situation it exists for - an already-applied
+  // migration edited on disk. A rewritten migration was then skipped silently,
+  // and the two runtimes could drift onto different schemas while both reported
+  // success.
   for (const migration of migrations) {
     const appliedChecksum = known.get(migration.name);
     if (appliedChecksum !== undefined && appliedChecksum !== migration.checksum) {
@@ -193,6 +199,11 @@ async function main(): Promise<void> {
           "Migrations are immutable - add a new file instead.",
       );
     }
+  }
+
+  if (pending.length === 0) {
+    console.log("Database is already up to date.");
+    return;
   }
 
   console.log(`Applying ${pending.length} migration(s) from ${dir}`);

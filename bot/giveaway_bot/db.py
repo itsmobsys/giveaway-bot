@@ -330,7 +330,13 @@ def load_migrations(directory: Path) -> list[Migration]:
         raise FileNotFoundError(f"Migrations directory not found: {directory}")
     migrations: list[Migration] = []
     for path in sorted(directory.glob("*.sql")):
-        migrations.append((path.name, path.read_text(encoding="utf-8")))
+        # utf-8-sig drops a leading BOM, and the replace() catches one anywhere
+        # else in the file. A BOM is not whitespace, so it becomes part of the
+        # first statement's text: SQLite happens to ignore it, but Turso's parser
+        # rejects the statement outright, which made a hosted database fail on a
+        # migration that had passed every local test.
+        text = path.read_text(encoding="utf-8-sig")
+        migrations.append((path.name, text.replace("\ufeff", "")))
     if not migrations:
         raise FileNotFoundError(f"No .sql migrations found in {directory}")
     return migrations
