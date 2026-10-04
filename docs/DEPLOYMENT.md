@@ -155,8 +155,47 @@ The repo root has `render.yaml` describing both services:
 
 **Bot notes on Render**
 
-* It must be a **background worker**, not a web service — a worker keeps the
-  gateway connection alive, which is what a Discord bot needs.
+The bot runs directly on Render's native Python runtime - there is no container
+image. `render.yaml` sets:
+
+| | |
+| --- | --- |
+| `runtime` | `python` (3.13, the interpreter the old image used) |
+| `buildCommand` | `pip install -r requirements.txt` |
+| `startCommand` | `cd bot && exec python -m giveaway_bot run` |
+
+Those two commands are all a deploy needs, on Render or any other host:
+
+```bash
+pip install -r requirements.txt
+cd bot && exec python -m giveaway_bot run
+```
+
+Two details that are deliberate:
+
+* `cd bot` runs the package **from source** instead of installing it. Installing
+  would put `giveaway_bot` in `site-packages`, and the default migrations path is
+  derived from the source tree (`bot/giveaway_bot/../.. -> shared/migrations`),
+  so an installed copy would look for migrations that are not there. This is also
+  why `MIGRATIONS_DIR` is deliberately left unset in `render.yaml` - the default
+  is correct for this layout and does not depend on the working directory.
+* `exec` keeps Python as the process Render signals, so `SIGTERM` reaches
+  discord.py and the gateway closes cleanly on every redeploy instead of being
+  swallowed by a shell.
+
+Run migrations once before the first bot start (`npm run db:migrate` in
+`dashboard/`, or `python -m giveaway_bot migrate`).
+
+**Python version matters.** The Turso driver (`libsql`) is a Rust extension with
+prebuilt wheels for CPython 3.11, 3.12 and 3.13 only. On 3.14 pip tries to
+compile it from source, which needs a Rust toolchain and usually fails - so
+`pip install -r requirements.txt` breaks on 3.14 even though nothing else in the
+project does. That is why the worker is pinned to 3.13 above. Everything except
+Turso works on 3.14 if you install everything except `libsql`.
+
+* It must be a **background worker**, not a web service - a worker keeps the
+  gateway connection alive, which is what a Discord bot needs. A worker has no
+  HTTP port, which is also why there is no health-check path for it.
 * The free plan sleeps and has no persistent disk. Use **Starter** or above for a
   bot that must stay online. With Turso, no disk is needed at all, which is why
   the database is the hosted option.

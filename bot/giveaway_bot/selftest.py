@@ -1,4 +1,4 @@
-﻿"""Self-contained verification suite - no pytest, no network, no Discord token.
+"""Self-contained verification suite - no pytest, no network, no Discord token.
 
 Run with::
 
@@ -262,6 +262,20 @@ def test_random_seed_source() -> None:
 # --------------------------------------------------------------------------- #
 # Eligibility
 # --------------------------------------------------------------------------- #
+def _isolated_settings(**overrides: Any) -> Settings:
+    """Settings that cannot inherit a real database from the environment.
+
+    pydantic-settings reads ``.env`` *files* as well as ``os.environ``, and dotenv
+    sits below environment variables in precedence. Popping TURSO_DATABASE_URL
+    from ``os.environ`` therefore does nothing when the developer's ``.env``
+    carries one - the suite would then try to reach a real, possibly production,
+    database. Init arguments outrank both sources, so the driver is pinned to
+    local SQLite here. This keeps the suite hermetic: no network, no token, no
+    shared state, as its docstring promises.
+    """
+    return Settings(turso_database_url="", **overrides)
+
+
 @contextmanager
 def _temp_database(name: str) -> Iterator[Database]:
     """A migrated scratch database that always releases its file handle.
@@ -273,9 +287,8 @@ def _temp_database(name: str) -> Iterator[Database]:
 
     tmp = tempfile.mkdtemp(prefix="giveaway-selftest-")
     previous_path = os.environ.get("SQLITE_PATH")
-    previous_turso = os.environ.pop("TURSO_DATABASE_URL", None)
     os.environ["SQLITE_PATH"] = str(Path(tmp) / f"{name}.db")
-    db = Database(Settings())
+    db = Database(_isolated_settings())
     try:
         db.migrate(verbose=False)
         yield db
@@ -285,8 +298,6 @@ def _temp_database(name: str) -> Iterator[Database]:
             os.environ.pop("SQLITE_PATH", None)
         else:
             os.environ["SQLITE_PATH"] = previous_path
-        if previous_turso is not None:
-            os.environ["TURSO_DATABASE_URL"] = previous_turso
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -566,7 +577,7 @@ def test_message_counting_and_gating() -> None:
 
     with _temp_database("activity") as db:
         guilds_repo.upsert_guild(db, "700", name="Activity Guild")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
         now = int(time.time() * 1000)
 
@@ -746,7 +757,7 @@ def test_message_tracker_buffering() -> None:
 
     with _temp_database("tracker") as db:
         guilds_repo.upsert_guild(db, "500", name="Tracker Guild")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
         now = int(time.time() * 1000)
 
@@ -816,7 +827,7 @@ def test_message_revalidation() -> None:
 
     with _temp_database("revalidate") as db:
         guilds_repo.upsert_guild(db, "400", name="Revalidate Guild")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
         now = int(time.time() * 1000)
 
@@ -929,7 +940,7 @@ def test_role_grant_on_entry() -> None:
 
     with _temp_database("role-grant") as db:
         guilds_repo.upsert_guild(db, "300", name="Role Guild")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
 
         giveaway = service.create(
@@ -974,7 +985,7 @@ def test_role_release_provenance() -> None:
 
     with _temp_database("role-release") as db:
         guilds_repo.upsert_guild(db, "310", name="Role Guild 2")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
 
         giveaway = service.create(
@@ -1015,7 +1026,7 @@ def test_role_task_retry() -> None:
 
     with _temp_database("role-retry") as db:
         guilds_repo.upsert_guild(db, "320", name="Role Guild 3")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
 
         giveaway = service.create(
@@ -1069,7 +1080,7 @@ def test_single_active_giveaway() -> None:
 
     with _temp_database("single-active") as db:
         guilds_repo.upsert_guild(db, "330", name="Single Guild")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
 
         assert gw_repo.find_active(db, "330") is None, "no giveaway yet"
@@ -1117,7 +1128,7 @@ def test_lifecycle() -> None:
 
     with _temp_database("lifecycle") as db:
         guilds_repo.upsert_guild(db, "900", name="Test Guild", owner_id="1")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
         now = int(time.time() * 1000)
 
@@ -1328,7 +1339,7 @@ def test_crash_recovery() -> None:
 
     with _temp_database("crash") as db:
         guilds_repo.upsert_guild(db, "800", name="Crash Guild")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
 
         giveaway = service.create(
@@ -1457,6 +1468,101 @@ def test_giveaway_channel_is_fixed() -> None:
         )
 
 
+def test_requirements_cover_runtime_deps() -> None:
+    """requirements.txt must not fall behind pyproject, and must ship libsql.
+
+    The bot deploys from requirements.txt rather than from the package
+    definition, so those two lists can drift apart. A dependency added to
+    pyproject but forgotten here would install fine locally and then fail on the
+    server, which is exactly the kind of bug nobody notices until it is live.
+    """
+    import re
+    import tomllib
+
+    root = Path(__file__).resolve().parents[2]
+
+    def package_name(spec: str) -> str:
+        # "discord.py>=2.4,<3" -> "discord.py"
+        head = re.split(r"[<>=!~;\[\s]", spec.strip(), maxsplit=1)[0]
+        return head.strip().lower()
+
+    requirements: dict[str, str] = {}
+    for raw in (root / "requirements.txt").read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            requirements[package_name(line)] = line
+
+    pyproject = tomllib.loads(
+        (root / "bot" / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    for spec in pyproject["project"]["dependencies"]:
+        name = package_name(spec)
+        assert name in requirements, (
+            f"{name} is declared in pyproject.toml but missing from "
+            f"requirements.txt, so a deploy would not install it"
+        )
+
+    # Optional extra in pyproject, mandatory in production: db.py imports it the
+    # moment TURSO_DATABASE_URL is set, so a Turso deploy dies at startup without
+    # it while every local test still passes on SQLite.
+    assert "libsql" in requirements, (
+        "requirements.txt must include libsql - it is required to reach Turso"
+    )
+
+
+def test_example_env_file_loads() -> None:
+    """The .env.example we ship must itself be a loadable configuration.
+
+    Two separate startup crashes hid behind a correct-looking example file: an
+    empty CSV list (pydantic-settings JSON-decodes list-typed fields before any
+    validator runs, so `TRUSTED_PROXIES=` was fatal) and a hex `EMBED_COLOR`
+    (pydantic's int rejects 0x). Neither showed up for a developer whose local
+    .env happened to be hand-written, only for an operator copying the example
+    as the documentation tells them to. So the example is parsed and loaded here
+    rather than trusted.
+    """
+    root = Path(__file__).resolve().parents[2]
+    example = root / ".env.example"
+    assert example.exists(), ".env.example is missing; deployment depends on it"
+
+    values: dict[str, str] = {}
+    for raw in example.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip()] = value.strip()
+
+    from .config import Settings
+
+    known = set(Settings.model_fields)
+    kwargs = {key.lower(): value for key, value in values.items() if key.lower() in known}
+
+    # Guard against the test passing vacuously if field names ever drift from
+    # the env keys: an empty match would assert nothing.
+    assert len(kwargs) >= 15, (
+        f"only {len(kwargs)} of {len(values)} .env.example keys map to a Settings "
+        f"field, so this check would not prove anything"
+    )
+
+    settings = Settings(**kwargs)  # type: ignore[arg-type]
+
+    assert settings.embed_color == 0x7C5CFF, (
+        f"EMBED_COLOR from .env.example parsed as {settings.embed_color}, "
+        f"expected 0x7C5CFF"
+    )
+    assert settings.trusted_proxies == [], (
+        "an empty TRUSTED_PROXIES must become an empty list, not fail to parse"
+    )
+    assert settings.guild_allowlist == [], (
+        "an empty DISCORD_GUILD_ALLOWLIST must become an empty list"
+    )
+    assert not settings.uses_turso, (
+        "the example ships an empty TURSO_DATABASE_URL, so it must not select the "
+        "Turso driver - otherwise the example config cannot be validated offline"
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Cross-language vectors
 # --------------------------------------------------------------------------- #
@@ -1555,6 +1661,8 @@ def main() -> int:
     check.run("role tasks are retried, not lost", test_role_task_retry)
     check.run("one active giveaway per guild", test_single_active_giveaway)
     check.run("the giveaway channel is fixed by configuration", test_giveaway_channel_is_fixed)
+    check.run("requirements.txt covers every runtime dependency", test_requirements_cover_runtime_deps)
+    check.run("the shipped .env.example is a loadable config", test_example_env_file_loads)
 
     check.section("Persistence + lifecycle")
     check.run("create -> join -> manage -> draw -> reroll", test_lifecycle)
