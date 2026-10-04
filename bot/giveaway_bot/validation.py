@@ -195,7 +195,11 @@ def validate_giveaway_payload(payload: dict[str, Any], *, partial: bool = False)
         elif len(title) > MAX_TITLE:
             errors["title"] = f"Title must be {MAX_TITLE} characters or fewer."
 
-    description = _as_str(payload.get("description")).strip() if "description" in payload or not partial else ""
+    description = (
+        _as_str(payload.get("description")).strip()
+        if "description" in payload or not partial
+        else ""
+    )
     if len(description) > MAX_DESCRIPTION:
         errors["description"] = f"Description must be {MAX_DESCRIPTION} characters or fewer."
 

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Cross-language verification.
  *
  * Proves the TypeScript implementation in `src/lib/fairness.ts` produces

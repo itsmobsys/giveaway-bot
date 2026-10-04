@@ -1,4 +1,4 @@
-﻿-- 0006_participant_role.sql -- temporary "entrants" role
+-- 0006_participant_role.sql -- temporary "entrants" role
 --
 -- Why this exists
 -- ---------------

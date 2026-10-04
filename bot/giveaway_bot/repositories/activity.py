@@ -1,4 +1,4 @@
-﻿"""Message activity repositories.
+"""Message activity repositories.
 
 Counting strategy (the efficiency requirement in practice):
 
@@ -125,7 +125,7 @@ def get_counts(db: Database, guild_id: str, user_ids: list[str]) -> dict[str, in
 
 
 def get_activity(db: Database, guild_id: str, user_id: str) -> dict[str, Any] | None:
-    row = db.query_one(
+    return db.query_one(
         """
         SELECT user_id, message_count, distinct_channels, first_message_at,
                last_message_at, window_started_at, exactness, updated_at
@@ -133,7 +133,7 @@ def get_activity(db: Database, guild_id: str, user_id: str) -> dict[str, Any] | 
         """,
         (guild_id, user_id),
     )
-    return row
+
 
 
 def top_counters(db: Database, guild_id: str, *, limit: int = 25) -> list[dict[str, Any]]:

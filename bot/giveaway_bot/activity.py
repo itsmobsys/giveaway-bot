@@ -28,9 +28,6 @@ from .db import Database, now_ms
 from .models import GiveawayStatus
 from .repositories import activity as activity_repo
 from .repositories import giveaways as gw_repo
-
-from .repositories import activity as activity_repo
-from .repositories import giveaways as gw_repo
 from .repositories import guilds as guilds_repo
 
 log = logging.getLogger("giveaway_bot.activity")
@@ -86,7 +83,6 @@ class MessageActivityTracker:
         with self._lock:
             states = self._states
 
-        from .repositories import guilds as guilds_repo
 
         guild_ids: set[str] = {guild.id for guild in guilds_repo.list_guilds(self.db)}
         for giveaway in gw_repo.list_public(self.db, limit=500):
@@ -168,7 +164,6 @@ class MessageActivityTracker:
                 len(state.buffer) >= MAX_PENDING_EVENTS
                 or now_ms() - state.last_flush_ms >= MAX_PENDING_MS
             )
-            events = state.buffer if due else []
 
         if due:
             # Flush off the gateway thread: a DB write must never delay a

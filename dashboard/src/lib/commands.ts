@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Dashboard -> bot commands.
  *
  * The dashboard never calls Discord. It appends a row to `command_queue`; the

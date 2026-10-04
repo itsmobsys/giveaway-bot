@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Discord OAuth2 login and guild-administrator authorization.
  *
  * Trust model

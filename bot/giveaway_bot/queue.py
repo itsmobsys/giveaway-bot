@@ -18,7 +18,9 @@ from typing import Any
 import discord
 
 from .models import CommandKind, GiveawayStatus
-from .repositories import control, draws as draws_repo, giveaways as gw_repo
+from .repositories import control
+from .repositories import draws as draws_repo
+from .repositories import giveaways as gw_repo
 from .service import Actor, ServiceError
 from .validation import ValidationError, validate_mutation_action
 
@@ -346,7 +348,7 @@ async def _handle_message_requirement(bot: Any, command: Any, actor: Actor) -> d
         bot.service.set_message_requirement, actor, giveaway, payload=command.payload
     )
     # Recompute which guilds/channels need counting right away.
-    bot.activity.refresh_requirements()
+    bot.activity_tracker.refresh_requirements()
     await _refresh(bot, updated.id)
     return {
         "ok": True,

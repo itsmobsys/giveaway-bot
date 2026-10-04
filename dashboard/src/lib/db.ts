@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Database client for Turso / libSQL.
  *
  * Serverless-safe by design:

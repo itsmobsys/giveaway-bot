@@ -1,4 +1,4 @@
-﻿# Deployment
+# Deployment
 
 Two processes share one Turso database:
 
@@ -61,9 +61,23 @@ diverge.
    `DISCORD_GIVEAWAY_CHANNEL_ID`. Every giveaway is posted there - admins never
    choose a channel, and the bot refuses to create one if this is unset or
    points somewhere it cannot post.
-4. **Bot** -> enable both **Server Members Intent** and **Message Content Intent**
-   (message-activity counting needs Members; the Members intent is required to
-   resolve roles and join dates)
+4. **Bot** -> enable **Server Members Intent** (under *Privileged Gateway
+   Intents*), then press Save.
+
+   This one is **mandatory**. Discord refuses the whole connection if the bot
+   requests a privileged intent the portal has not enabled, and the bot has to
+   request it: giveaway eligibility reads a member's roles and their server join
+   date, and Discord omits the member object from interaction payloads without
+   it. If you skip this the bot exits immediately with
+   `PrivilegedIntentsRequired`.
+
+   Do **not** enable Message Content Intent. The bot never reads message text -
+   message counting uses gateway events - so it does not request it. discord.py
+   logs "privileged message content intent is missing" at startup regardless; that
+   warning is expected and harmless for a slash-command-only bot.
+
+   `python -m giveaway_bot doctor` prints exactly which intents this build
+   requests, read from the same code the client uses.
 5. **OAuth2 -> URLs** -> add your dashboard's redirect:
    - Render: `https://<app>.onrender.com/api/auth/callback`
    - Vercel: `https://<app>.vercel.app/api/auth/callback`
@@ -155,12 +169,73 @@ The repo root has `render.yaml` describing both services:
 
 **Bot notes on Render**
 
-* It must be a **background worker**, not a web service — a worker keeps the
-  gateway connection alive, which is what a Discord bot needs.
+The bot runs directly on Render's native Python runtime - there is no container
+image. `render.yaml` sets:
+
+| | |
+| --- | --- |
+| `runtime` | `python` (3.13, the interpreter the old image used) |
+| `buildCommand` | `pip install -r requirements.txt` |
+| `startCommand` | `cd bot && exec python -m giveaway_bot run` |
+
+Those two commands are all a deploy needs, on Render or any other host:
+
+```bash
+pip install -r requirements.txt
+cd bot && exec python -m giveaway_bot run
+```
+
+Two details that are deliberate:
+
+* `cd bot` runs the package **from source** instead of installing it. Installing
+  would put `giveaway_bot` in `site-packages`, and the default migrations path is
+  derived from the source tree (`bot/giveaway_bot/../.. -> shared/migrations`),
+  so an installed copy would look for migrations that are not there. This is also
+  why `MIGRATIONS_DIR` is deliberately left unset in `render.yaml` - the default
+  is correct for this layout and does not depend on the working directory.
+* `exec` keeps Python as the process Render signals, so `SIGTERM` reaches
+  discord.py and the gateway closes cleanly on every redeploy instead of being
+  swallowed by a shell.
+
+Run migrations once before the first bot start (`npm run db:migrate` in
+`dashboard/`, or `python -m giveaway_bot migrate`).
+
+**Python version matters.** The Turso driver (`libsql`) is a Rust extension with
+prebuilt wheels for CPython 3.11, 3.12 and 3.13 only. On 3.14 pip tries to
+compile it from source, which needs a Rust toolchain and usually fails - so
+`pip install -r requirements.txt` breaks on 3.14 even though nothing else in the
+project does. That is why the worker is pinned to 3.13 above. Everything except
+Turso works on 3.14 if you install everything except `libsql`.
+
+* It must be a **background worker**, not a web service - a worker keeps the
+  gateway connection alive, which is what a Discord bot needs. A worker has no
+  HTTP port, which is also why there is no health-check path for it.
 * The free plan sleeps and has no persistent disk. Use **Starter** or above for a
   bot that must stay online. With Turso, no disk is needed at all, which is why
   the database is the hosted option.
 * Keep `autoDeploy` off if you would rather deploy deliberately.
+
+### Panels that run a file (`PY_FILE`)
+
+Some hosts — Silly Development among them — do not let you choose a start command;
+they run a Python file at the repository root. That file is `app.py`, and it
+expects the same things the command above does:
+
+| Panel setting | Value |
+| --- | --- |
+| Python version | 3.13 (3.11–3.13 all have a `libsql` wheel; 3.14 does not) |
+| Requirements file | `requirements.txt` (repository root) |
+| App file | `app.py` |
+
+Run migrations once before the first start, as above.
+
+`app.py` runs the bot **in its own process** rather than spawning or exec'ing it,
+which is what makes both required properties hold without any forwarding code:
+SIGTERM and SIGINT reach the bot directly, and the exit status the panel reads is
+the bot's own. `os.execve` was rejected for this — it is a true `exec` on Linux
+but CPython emulates it on Windows without propagating the child's status, so the
+shim would have exited 0 on every crash. `selftest` asserts all of this, so the
+behaviour cannot silently regress.
 
 ### Vercel (dashboard only)
 
@@ -210,12 +285,33 @@ transaction, leaving the previous schema intact.
 
 ## Troubleshooting
 
+These two lines on every start are **expected and harmless**:
+
+`
+WARNING discord.client  PyNaCl is not installed, voice will NOT be supported
+WARNING discord.client  davey is not installed, voice will NOT be supported
+`
+
+They come from discord.py and mean only that voice channels are unavailable. This
+bot never joins one, so neither package is a dependency. They are left unfixed on
+purpose rather than silenced by installing an unused crypto library.
+
+A third startup line is also expected, for the same kind of reason:
+
+`
+WARNING discord.ext.commands.bot  Privileged message content intent is missing
+`
+
+The bot uses slash commands only and never reads message text, so it does not
+request that intent. This warning is harmless.
+
 | Symptom | Cause |
 | --- | --- |
 | Dashboard shows "Not authorised" | Missing **Manage Server** in that server, or the bot is not in the server |
 | Admin action says "request rejected" | `CSRF_TRUSTED_ORIGINS` / `NEXT_PUBLIC_APP_URL` mismatch |
 | Giveaway creates in the dashboard but not in Discord | The bot is not polling, or it cannot post in the channel (check `/admin give sync`) |
 | Entrants never receive the role | Bot lacks **Manage Roles**, or its role is below the entrants role |
+| `PrivilegedIntentsRequired` on startup | **Server Members Intent** not enabled in the Developer Portal (Bot -> Privileged Gateway Intents). The bot exits immediately rather than running with broken eligibility |
 | Message counts stay at zero | **Server Members Intent** not enabled, or the bot lacks **Read Message History** |
 | `migration ... is malformed` | A `; statement-breakpoint` line is missing between two statements |
 | Live updates stall on Vercel | Expected — SSE hits `maxDuration` and the client reconnects |

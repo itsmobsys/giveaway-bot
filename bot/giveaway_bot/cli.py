@@ -1,4 +1,4 @@
-﻿"""Command line interface.
+"""Command line interface.
 
     python -m giveaway_bot migrate        # apply pending SQL migrations
     python -m giveaway_bot selftest       # run the fairness + eligibility suite
@@ -57,6 +57,29 @@ def cmd_migrate(_: argparse.Namespace) -> int:
     return 0
 
 
+def _describe_intents() -> str:
+    """Which privileged intents this build asks for, and where to enable them.
+
+    Read from the same helper the bot uses, so this cannot drift from what is
+    actually requested at connect time. The portal setting is invisible from here,
+    so it is surfaced as a warning rather than reported as a pass or a failure.
+    """
+
+    from .bot import build_intents
+
+    intents = build_intents()
+    needed = [name for name, on in (("Server Members Intent", intents.members),) if on]
+    summary = ", ".join(needed) if needed else "none"
+    message = f"{summary} (privileged)"
+    if needed:
+        message += (
+            " - must be enabled at https://discord.com/developers/applications"
+            " -> your app -> Bot -> Privileged Gateway Intents, or the connection"
+            " is refused"
+        )
+    return message
+
+
 def cmd_doctor(_: argparse.Namespace) -> int:
     settings = get_settings()
     configure_logging(settings)
@@ -84,6 +107,7 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     _safe_print(f"database backend: {db.backend}")
     _safe_print(f"dashboard url:    {settings.dashboard_url}")
     _safe_print(f"fairness freeze:  {settings.fairness_freeze_entries_on_draw}")
+    _safe_print(f"gateway intents:  {_describe_intents()}")
 
     if problems:
         _safe_print("\nProblems:")
@@ -164,7 +188,62 @@ def cmd_run(_: argparse.Namespace) -> int:
         asyncio.run(_main())
     except KeyboardInterrupt:  # pragma: no cover - interactive
         log.info("shutting down")
+    except Exception as exc:
+        # Startup failures that are caused by configuration rather than by a bug
+        # get an actionable message instead of a traceback. These two are by far
+        # the most common first-run failures and neither is diagnosable from the
+        # exception alone.
+        hint = _explain_startup_failure(exc)
+        if hint is None:
+            raise
+        _safe_print("")
+        _safe_print(f"error: {hint}")
+        return 1
     return 0
+
+
+def _explain_startup_failure(exc: BaseException) -> str | None:
+    """Turn a known Discord startup error into a fix, or None if unexplained.
+
+    Kept separate from cmd_run so the self-test can assert the wording without
+    opening a gateway connection.
+    """
+    import discord
+
+    if isinstance(exc, discord.errors.PrivilegedIntentsRequired):
+        return (
+            "Discord rejected the connection: a privileged intent this bot needs is "
+            "not enabled for the application.\n"
+            "\n"
+            "  Fix (about a minute, and only once per application):\n"
+            "    1. Open https://discord.com/developers/applications\n"
+            "    2. Pick this application -> Bot -> Privileged Gateway Intents\n"
+            "    3. Turn ON 'Server Members Intent' and press Save\n"
+            "    4. Restart this server\n"
+            "\n"
+            "  Server Members Intent is required because giveaway eligibility reads\n"
+            "  a member's roles and their server join date. Without it those two rules\n"
+            "  cannot be evaluated.\n"
+            "\n"
+            "  Message Content Intent is NOT required - this bot counts messages from\n"
+            "  gateway events and never reads message text, so the 'privileged message\n"
+            "  content intent is missing' warning above is expected and harmless."
+        )
+
+    if isinstance(exc, discord.errors.LoginFailure):
+        return (
+            "Discord rejected the bot token. Check DISCORD_BOT_TOKEN: it must be the\n"
+            "bot token from the Bot tab (a 'Bot' prefix and two dots), not the client\n"
+            "secret or an application ID, and it must not have been reset since."
+        )
+
+    if isinstance(exc, discord.errors.HTTPException):
+        return (
+            f"Discord returned an HTTP error while connecting: {exc}. This is usually\n"
+            "network or DNS trouble on the host rather than a configuration problem."
+        )
+
+    return None
 
 
 def build_parser() -> argparse.ArgumentParser:

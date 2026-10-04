@@ -73,11 +73,14 @@ class AdminCommands(commands.Cog, name="admin"):
     async def pause(self, interaction: discord.Interaction, giveaway: str, reason: str = "") -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
         updated = await self._run(
-            interaction, giveaway, lambda actor, record, **_: self.bot.service.pause(actor, record, reason=reason)
+            interaction,
+            giveaway,
+            lambda actor, record, **_: self.bot.service.pause(actor, record, reason=reason),
         )
         if updated is not None:
             await interaction.followup.send(
-                f"⏸️ Paused with {updated.paused_remaining_ms and updated.paused_remaining_ms // 1000}s remaining.",
+                f"⏸️ Paused with "
+                f"{updated.paused_remaining_ms and updated.paused_remaining_ms // 1000}s remaining.",
                 ephemeral=True,
             )
 
@@ -86,7 +89,11 @@ class AdminCommands(commands.Cog, name="admin"):
     @app_commands.checks.has_permissions(manage_guild=True)
     async def resume(self, interaction: discord.Interaction, giveaway: str) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
-        updated = await self._run(interaction, giveaway, lambda actor, record, **_: self.bot.service.resume(actor, record))
+        updated = await self._run(
+            interaction,
+            giveaway,
+            lambda actor, record, **_: self.bot.service.resume(actor, record),
+        )
         if updated is not None:
             await interaction.followup.send("▶️ Resumed.", ephemeral=True)
 
@@ -105,7 +112,10 @@ class AdminCommands(commands.Cog, name="admin"):
             lambda actor, record, **_: self.bot.service.extend(actor, record, duration_ms=duration_ms),
         )
         if updated is not None:
-            await interaction.followup.send(f"➕ Extended. New end: <t:{int((updated.ends_at or 0) / 1000)}:R>", ephemeral=True)
+            await interaction.followup.send(
+                f"➕ Extended. New end: <t:{int((updated.ends_at or 0) / 1000)}:R>",
+                ephemeral=True,
+            )
 
     @give.command(name="shorten", description="Remove time from a giveaway")
     @app_commands.describe(giveaway="Giveaway ID or message ID", duration="e.g. 30m, 2h, 1d")
@@ -122,7 +132,10 @@ class AdminCommands(commands.Cog, name="admin"):
             lambda actor, record, **_: self.bot.service.shorten(actor, record, duration_ms=duration_ms),
         )
         if updated is not None:
-            await interaction.followup.send(f"➖ Shortened. New end: <t:{int((updated.ends_at or 0) / 1000)}:R>", ephemeral=True)
+            await interaction.followup.send(
+                f"➖ Shortened. New end: <t:{int((updated.ends_at or 0) / 1000)}:R>",
+                ephemeral=True,
+            )
 
     @give.command(name="end", description="End a giveaway and draw winners now")
     @app_commands.describe(giveaway="Giveaway ID or message ID", no_draw="End without selecting winners")
@@ -236,7 +249,11 @@ class AdminCommands(commands.Cog, name="admin"):
             )
 
     @give.command(name="unflag", description="Restore a participant's entries")
-    @app_commands.describe(giveaway="Giveaway ID", user="Member to restore", reason="Recorded in the audit log")
+    @app_commands.describe(
+        giveaway="Giveaway ID",
+        user="Member to restore",
+        reason="Recorded in the audit log",
+    )
     @app_commands.checks.has_permissions(manage_guild=True)
     async def unflag(
         self, interaction: discord.Interaction, giveaway: str, user: discord.Member, reason: str = ""
@@ -250,7 +267,10 @@ class AdminCommands(commands.Cog, name="admin"):
             ),
         )
         if changed is not None:
-            await interaction.followup.send(f"✅ Restored {changed} entries for {user.display_name}.", ephemeral=True)
+            await interaction.followup.send(
+                f"✅ Restored {changed} entries for {user.display_name}.",
+                ephemeral=True,
+            )
 
     # ------------------------------------------------------------------- misc
     @give.command(name="sync", description="Re-post the giveaway message and buttons")
@@ -307,7 +327,7 @@ class AdminCommands(commands.Cog, name="admin"):
             await interaction.followup.send("⚠️ " + "; ".join(exc.errors.values()), ephemeral=True)
             return
 
-        self.bot.activity.refresh_requirements()
+        self.bot.activity_tracker.refresh_requirements()
         await self.bot.render_giveaway(updated)
 
         report: dict[str, Any] = {"checked": 0, "flagged": 0, "restored": 0}
@@ -414,7 +434,8 @@ class AdminCommands(commands.Cog, name="admin"):
             await interaction.followup.send("No audit entries yet.", ephemeral=True)
             return
         lines = [
-            f"`{row['created_at']}` **{row['action']}** by {row.get('actor_name') or row.get('actor_id') or 'system'} "
+            f"`{row['created_at']}` **{row['action']}** by "
+            f"{row.get('actor_name') or row.get('actor_id') or 'system'} "
             f"({row['source']}, {row['outcome']})"
             for row in rows
         ]
@@ -437,3 +458,12 @@ def _progress_bar(current: int, required: int, width: int = 20) -> str:
         return "▱" * width
     filled = int(round((min(current, required) / required) * width))
     return "".join("▰" if index < filled else "▱" for index in range(width))
+
+
+async def setup(bot: Any) -> None:
+    """Entry point required by ``Bot.load_extension``.
+
+    Without this, ``setup_hook`` raised NoEntryPointError the moment the gateway
+    connected - the class existed and was never registered.
+    """
+    await bot.add_cog(AdminCommands(bot))

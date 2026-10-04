@@ -10,10 +10,10 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 #: Discord permission bitfields we care about.
 PERM_ADMINISTRATOR = 0x00000008
@@ -49,8 +49,14 @@ class Settings(BaseSettings):
     discord_client_id: str = ""
     discord_client_secret: str = Field(default="", repr=False)
     discord_redirect_uri: str = "http://localhost:3000/api/auth/callback"
-    guild_allowlist: list[str] = Field(default_factory=list)
-    guild_blocklist: list[str] = Field(default_factory=list)
+    # `NoDecode` is load-bearing, not decoration. pydantic-settings otherwise
+    # JSON-decodes any list-typed field straight out of the environment, so
+    # `DISCORD_GUILD_ALLOWLIST=1,2` would fail to parse, and an operator who
+    # followed .env.example and left it empty (`=`) would crash the bot at
+    # startup - the decode happens before any validator can run. Suppressing it
+    # hands the raw string to _split_csv, which is what the CSV syntax needs.
+    guild_allowlist: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    guild_blocklist: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     # --- Database ----------------------------------------------------------
     turso_database_url: str = ""
@@ -85,10 +91,31 @@ class Settings(BaseSettings):
     # --- Misc --------------------------------------------------------------
     dashboard_url: str = "http://localhost:3000"
     embed_color: int = 0x7C5CFF
-    trusted_proxies: list[str] = Field(default_factory=list)
+    trusted_proxies: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     # --- Derived -----------------------------------------------------------
     migrations_dir: Path = Path(__file__).resolve().parents[2] / "shared" / "migrations"
+
+    @field_validator("embed_color", mode="before")
+    @classmethod
+    def _parse_color(cls, value: object) -> object:
+        """Accept a colour written the way it is written everywhere else.
+
+        The default and .env.example both use ``0x7C5CFF``, which is how Discord
+        colours are quoted, but pydantic's int type only accepts base-10. Without
+        this an operator who copies .env.example - the documented first step -
+        gets a bot that refuses to start.
+        """
+        if isinstance(value, str):
+            text = value.strip().lstrip("#")
+            try:
+                return int(text, 0)  # base 0 -> honours 0x, 0o, 0b and decimal
+            except ValueError:
+                raise ValueError(
+                    f"EMBED_COLOR must be an integer, optionally hex like 0x7C5CFF "
+                    f"(got {value!r})"
+                ) from None
+        return value
 
     @field_validator("guild_allowlist", "guild_blocklist", "trusted_proxies", mode="before")
     @classmethod
@@ -139,9 +166,7 @@ class Settings(BaseSettings):
     def guild_allowed(self, guild_id: str) -> bool:
         if guild_id in self.guild_blocklist:
             return False
-        if self.guild_allowlist and guild_id not in self.guild_allowlist:
-            return False
-        return True
+        return not self.guild_allowlist or guild_id in self.guild_allowlist
 
 
 @lru_cache(maxsize=1)

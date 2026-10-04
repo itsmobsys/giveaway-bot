@@ -1,4 +1,4 @@
-﻿-- 0004_indexes.sql -- hot-path indexes
+-- 0004_indexes.sql -- hot-path indexes
 --
 -- Every index below backs a query that actually runs on a hot giveaway:
 -- queue polling, public listing, participant pages, audit tails, live feeds.

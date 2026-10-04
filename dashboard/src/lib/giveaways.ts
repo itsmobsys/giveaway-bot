@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Giveaway reads for the UI.
  *
  * Privacy rule enforced here: the public-facing projections never include

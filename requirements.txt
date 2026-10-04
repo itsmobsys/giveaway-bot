@@ -1,0 +1,37 @@
+# Python runtime dependencies for the Discord bot.
+#
+# The bot is deployed directly to a Python runtime (Render's native worker, or
+# any host that can run `pip install -r requirements.txt`):
+#
+#   build:  pip install -r requirements.txt
+#   start:  cd bot && exec python -m giveaway_bot run
+#
+# There is no container image. `bot/pyproject.toml` remains the package
+# definition and holds the dev extras; `selftest` asserts the two agree, so a
+# dependency added there cannot silently go missing from a deploy.
+#
+# These versions are the ones the 27-check suite passes against, pinned exactly
+# so a redeploy cannot quietly pick up a new major. Transitive dependencies are
+# left unpinned.
+
+discord.py==2.7.1
+pydantic==2.13.5
+pydantic-settings==2.15.0
+python-dotenv==1.2.4
+httpx==0.28.1
+tenacity==9.1.4
+
+# Mandatory in production, and deliberately the only ranged entry.
+# db.py imports this lazily the moment TURSO_DATABASE_URL is set and raises at
+# startup if it is missing, so without it the bot only ever works against a
+# local SQLite file. It is an optional extra in pyproject because the suite runs
+# on SQLite with no network, which also means it is not covered by the pinning
+# above and is NOT exercised by `selftest`.
+#
+# 0.1.11 is the newest published release - there is no 0.2.x. The previous
+# `>=0.2.1` specifier resolved to nothing, so a Turso deploy could not install.
+#
+# This is a Rust extension with prebuilt wheels, and there is no cp314 wheel:
+# Python 3.14 has to compile it from source. 3.11, 3.12 and 3.13 all have Linux
+# wheels, which is why render.yaml pins the bot to 3.13.
+libsql>=0.1.11,<2

@@ -1,4 +1,4 @@
-﻿"""Business logic for giveaways.
+"""Business logic for giveaways.
 
 Every mutating operation follows the same shape:
 
@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import secrets
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any
 
 from .config import Settings, get_settings
@@ -37,15 +37,22 @@ from .fairness import (
 from .models import CommandKind, EntryStatus, Giveaway, GiveawayStatus
 from .repositories import (
     activity as activity_repo,
+)
+from .repositories import (
     control,
+)
+from .repositories import (
     draws as draws_repo,
+)
+from .repositories import (
     entries as entries_repo,
+)
+from .repositories import (
     giveaways as gw_repo,
 )
 from .validation import (
     ValidationError,
     validate_giveaway_payload,
-    validate_mutation_action,
 )
 
 log = logging.getLogger("giveaway_bot.service")
@@ -362,14 +369,22 @@ class GiveawayService:
         if giveaway.status is GiveawayStatus.PAUSED:
             new_remaining = max(MINUTE, (giveaway.paused_remaining_ms or 0) - duration_ms)
             return self._set_remaining(
-                actor, giveaway, new_remaining, action="giveaway.shortened", extra={"duration_ms": duration_ms}
+                actor,
+                giveaway,
+                new_remaining,
+                action="giveaway.shortened",
+                extra={"duration_ms": duration_ms},
             )
 
         current = giveaway.remaining_ms()
         new_remaining = max(MINUTE, current - duration_ms)
         new_end = now_ms() + new_remaining
         return self._set_end(
-            actor, giveaway, new_end, "giveaway.shortened", {"duration_ms": duration_ms, "new_remaining_ms": new_remaining}
+            actor,
+            giveaway,
+            new_end,
+            "giveaway.shortened",
+            {"duration_ms": duration_ms, "new_remaining_ms": new_remaining},
         )
 
     def _set_end(
@@ -589,14 +604,13 @@ class GiveawayService:
 
         guild_id = giveaway.guild_id
         if giveaway.message_count_scope == "channel" and giveaway.message_count_channel_ids:
-            per_channel = activity_repo.counts_in_channels(
+            return activity_repo.counts_in_channels(
                 self.db,
                 guild_id=guild_id,
                 user_id=user_id,
                 channel_ids=giveaway.message_count_channel_ids,
                 since=giveaway.message_count_since,
             )
-            return per_channel
 
         return activity_repo.count_since(
             self.db,
@@ -664,7 +678,6 @@ class GiveawayService:
         if giveaway.locked_at is not None:
             raise ServiceError("locked", "A draw is in progress for this giveaway.")
 
-        before = _giveaway_audit_view(giveaway)
         # On a partial update, unspecified fields inherit their current value so
         # that changing only min_messages does not silently clear a channel list.
         channels = payload.get("message_count_channel_ids")
@@ -697,7 +710,6 @@ class GiveawayService:
             changed = gw_repo.update_fields(tx, giveaway.id, columns, actor_id=actor.user_id)
             if not changed:
                 raise ServiceError("conflict", "Giveaway changed while you were editing it.")
-            fresh = gw_repo.get_giveaway(tx, giveaway.id)
             control.audit(
                 tx,
                 guild_id=giveaway.guild_id,
@@ -735,7 +747,6 @@ class GiveawayService:
                     "enabled": data.min_messages > 0,
                 },
             )
-            del fresh
         return self.get(giveaway.id)
 
     def participants_needing_messages(self, giveaway: Giveaway, *, limit: int = 50) -> list[dict[str, Any]]:
@@ -1050,7 +1061,6 @@ class GiveawayService:
                 duration_ms=elapsed_ms,
             )
             gw_repo.refresh_stats(tx, giveaway.id)
-            fresh = gw_repo.get_giveaway(tx, giveaway.id)
             control.audit(
                 tx,
                 guild_id=giveaway.guild_id,

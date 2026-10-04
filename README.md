@@ -12,9 +12,10 @@ files, and `npm run fairness:verify` proves the two implementations agree.
 ├── dashboard/      Next.js dashboard (Render or Vercel) with Turso
 ├── shared/         Cross-language contract: SQL migrations, fairness spec, test vectors
 ├── docs/           Architecture · Fairness · Security · Deployment
-├── docker-compose.yml
+├── app.py          Entry point for panels that start a file (e.g. SillyDev)
+├── requirements.txt  Python dependencies for the bot (no container image)
 ├── render.yaml     Render blueprint: bot (worker) + dashboard (web)
-└── Dockerfile
+└── docker-compose.yml  Dashboard only; the bot is not containerised
 ```
 
 ## How the two halves work together
@@ -70,13 +71,18 @@ live updates, dark mode.
 
 ```bash
 # 1. Bot: install, migrate, verify
+#    No Docker: the bot runs directly on Python, from the bot/ directory.
+#    Use Python 3.11-3.13. The Turso driver (libsql) is a Rust extension with
+#    no 3.14 wheel, so 3.14 has to compile it from source.
+python -m pip install -r requirements.txt
 cd bot
-python -m pip install -e ".[dev]"
 python -m giveaway_bot migrate
-python -m giveaway_bot selftest      # 26 checks, no token or network needed
+python -m giveaway_bot selftest      # 35 checks, no token or network needed
+python -m ruff check giveaway_bot  # or: ruff check .  (from bot/)
+cd ..
 
 # 2. Dashboard
-cd ../dashboard
+cd dashboard
 npm install
 cp .env.example .env.local
 npm run db:migrate
@@ -95,12 +101,29 @@ credentials; everything else works offline against a local SQLite file.
 Bot on **Render** (background worker), dashboard on **Render** or **Vercel** —
 both supported, `render.yaml` wires up the bot and dashboard together.
 
-Full walkthrough, including Discord application setup, bot permissions and the
-intents required for message counting: **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**
+**The bot is not containerised.** It runs directly on Python:
 
 ```bash
-docker compose up -d --build    # bot + dashboard locally
+pip install -r requirements.txt
+cd bot && python -m giveaway_bot run
 ```
+
+That is the whole story for the bot on any host — no image build, no
+`docker compose`. Only the dashboard uses Docker
+(`dashboard/Dockerfile`); `docker compose up -d --build` starts the dashboard
+alone.
+
+For panels that start a Python file at the repository root rather than a command
+(Silly Development's `PY_FILE`, for instance), `app.py` is the entry point. It
+runs the bot in the same process and forwards its exit code:
+
+```bash
+python app.py             # starts the bot
+python app.py selftest    # other subcommands work too
+```
+
+Full walkthrough, including Discord application setup, bot permissions and the
+intents required for message counting: **[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)**
 
 ## Documentation
 

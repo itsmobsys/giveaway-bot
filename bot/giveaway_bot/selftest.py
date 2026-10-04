@@ -1,4 +1,4 @@
-﻿"""Self-contained verification suite - no pytest, no network, no Discord token.
+"""Self-contained verification suite - no pytest, no network, no Discord token.
 
 Run with::
 
@@ -28,15 +28,14 @@ import sys
 import tempfile
 import time
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .config import Settings
 from .db import Database
 from .eligibility import Reason, evaluate_join
-from .repositories import control
 from .fairness import (
     METHOD,
     DrawEntry,
@@ -48,6 +47,7 @@ from .fairness import (
     score_entry,
     verify_draw,
 )
+from .repositories import control
 from .validation import parse_duration, validate_giveaway_payload
 
 VECTOR_PATH = Path(__file__).resolve().parents[2] / "shared" / "test_vectors.json"
@@ -262,6 +262,20 @@ def test_random_seed_source() -> None:
 # --------------------------------------------------------------------------- #
 # Eligibility
 # --------------------------------------------------------------------------- #
+def _isolated_settings(**overrides: Any) -> Settings:
+    """Settings that cannot inherit a real database from the environment.
+
+    pydantic-settings reads ``.env`` *files* as well as ``os.environ``, and dotenv
+    sits below environment variables in precedence. Popping TURSO_DATABASE_URL
+    from ``os.environ`` therefore does nothing when the developer's ``.env``
+    carries one - the suite would then try to reach a real, possibly production,
+    database. Init arguments outrank both sources, so the driver is pinned to
+    local SQLite here. This keeps the suite hermetic: no network, no token, no
+    shared state, as its docstring promises.
+    """
+    return Settings(turso_database_url="", **overrides)
+
+
 @contextmanager
 def _temp_database(name: str) -> Iterator[Database]:
     """A migrated scratch database that always releases its file handle.
@@ -273,9 +287,8 @@ def _temp_database(name: str) -> Iterator[Database]:
 
     tmp = tempfile.mkdtemp(prefix="giveaway-selftest-")
     previous_path = os.environ.get("SQLITE_PATH")
-    previous_turso = os.environ.pop("TURSO_DATABASE_URL", None)
     os.environ["SQLITE_PATH"] = str(Path(tmp) / f"{name}.db")
-    db = Database(Settings())
+    db = Database(_isolated_settings())
     try:
         db.migrate(verbose=False)
         yield db
@@ -285,8 +298,6 @@ def _temp_database(name: str) -> Iterator[Database]:
             os.environ.pop("SQLITE_PATH", None)
         else:
             os.environ["SQLITE_PATH"] = previous_path
-        if previous_turso is not None:
-            os.environ["TURSO_DATABASE_URL"] = previous_turso
         shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -560,13 +571,13 @@ def test_message_requirement_validation() -> None:
 def test_message_counting_and_gating() -> None:
     """End-to-end: counters, duplicate protection and the join gate."""
     from .repositories import activity as activity_repo
-    from .repositories import activity as activity_repo, control
-    from .repositories import entries as entries_repo, guilds as guilds_repo
+    from .repositories import control
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("activity") as db:
         guilds_repo.upsert_guild(db, "700", name="Activity Guild")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
         now = int(time.time() * 1000)
 
@@ -741,12 +752,13 @@ def test_message_count_idempotency() -> None:
 def test_message_tracker_buffering() -> None:
     """The tracker must skip work when no requirement exists, and flush in bulk."""
     from .activity import MessageActivityTracker
-    from .repositories import activity as activity_repo, entries as entries_repo, guilds as guilds_repo
+    from .repositories import activity as activity_repo
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("tracker") as db:
         guilds_repo.upsert_guild(db, "500", name="Tracker Guild")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
         now = int(time.time() * 1000)
 
@@ -811,12 +823,14 @@ def test_message_tracker_buffering() -> None:
 
 def test_message_revalidation() -> None:
     """Revalidation flags only who fails today, and is audited."""
-    from .repositories import activity as activity_repo, entries as entries_repo, guilds as guilds_repo
+    from .repositories import activity as activity_repo
+    from .repositories import entries as entries_repo
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("revalidate") as db:
         guilds_repo.upsert_guild(db, "400", name="Revalidate Guild")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
         now = int(time.time() * 1000)
 
@@ -924,12 +938,14 @@ def test_no_admin_override_exists() -> None:
 
 def test_role_grant_on_entry() -> None:
     """Joining must queue exactly one role grant for the entrants role."""
-    from .repositories import entries as entries_repo, giveaways as gw_repo, guilds as guilds_repo
+    from .repositories import entries as entries_repo
+    from .repositories import giveaways as gw_repo
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("role-grant") as db:
         guilds_repo.upsert_guild(db, "300", name="Role Guild")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
 
         giveaway = service.create(
@@ -969,12 +985,14 @@ def test_role_grant_on_entry() -> None:
 
 def test_role_release_provenance() -> None:
     """Only bot grants are released; a human-assigned role is left alone."""
-    from .repositories import entries as entries_repo, giveaways as gw_repo, guilds as guilds_repo
+    from .repositories import entries as entries_repo
+    from .repositories import giveaways as gw_repo
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("role-release") as db:
         guilds_repo.upsert_guild(db, "310", name="Role Guild 2")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
 
         giveaway = service.create(
@@ -1010,12 +1028,13 @@ def test_role_release_provenance() -> None:
 
 def test_role_task_retry() -> None:
     """A failing role task is retried, then marked failed - never lost."""
-    from .repositories import giveaways as gw_repo, guilds as guilds_repo
+    from .repositories import giveaways as gw_repo
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("role-retry") as db:
         guilds_repo.upsert_guild(db, "320", name="Role Guild 3")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
 
         giveaway = service.create(
@@ -1064,12 +1083,13 @@ def test_role_task_retry() -> None:
 
 def test_single_active_giveaway() -> None:
     """One open giveaway per guild keeps the entrants role unambiguous."""
-    from .repositories import giveaways as gw_repo, guilds as guilds_repo
+    from .repositories import giveaways as gw_repo
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("single-active") as db:
         guilds_repo.upsert_guild(db, "330", name="Single Guild")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
 
         assert gw_repo.find_active(db, "330") is None, "no giveaway yet"
@@ -1108,16 +1128,24 @@ def test_single_active_giveaway() -> None:
 def test_lifecycle() -> None:
     from .repositories import (
         control,
+    )
+    from .repositories import (
         draws as draws_repo,
+    )
+    from .repositories import (
         entries as entries_repo,
+    )
+    from .repositories import (
         giveaways as gw_repo,
+    )
+    from .repositories import (
         guilds as guilds_repo,
     )
     from .service import Actor, GiveawayService
 
     with _temp_database("lifecycle") as db:
         guilds_repo.upsert_guild(db, "900", name="Test Guild", owner_id="1")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
         now = int(time.time() * 1000)
 
@@ -1323,12 +1351,13 @@ def test_lifecycle() -> None:
 
 def test_crash_recovery() -> None:
     """A draw interrupted between phases must finish on restart."""
-    from .repositories import giveaways as gw_repo, guilds as guilds_repo
+    from .repositories import giveaways as gw_repo
+    from .repositories import guilds as guilds_repo
     from .service import Actor, GiveawayService
 
     with _temp_database("crash") as db:
         guilds_repo.upsert_guild(db, "800", name="Crash Guild")
-        service = GiveawayService(db, Settings())
+        service = GiveawayService(db, _isolated_settings())
         actor = Actor("1", "owner", "discord")
 
         giveaway = service.create(
@@ -1457,6 +1486,701 @@ def test_giveaway_channel_is_fixed() -> None:
         )
 
 
+def test_requirements_cover_runtime_deps() -> None:
+    """requirements.txt must not fall behind pyproject, and must ship libsql.
+
+    The bot deploys from requirements.txt rather than from the package
+    definition, so those two lists can drift apart. A dependency added to
+    pyproject but forgotten here would install fine locally and then fail on the
+    server, which is exactly the kind of bug nobody notices until it is live.
+    """
+    import re
+    import tomllib
+
+    root = Path(__file__).resolve().parents[2]
+
+    def package_name(spec: str) -> str:
+        # "discord.py>=2.4,<3" -> "discord.py"
+        head = re.split(r"[<>=!~;\[\s]", spec.strip(), maxsplit=1)[0]
+        return head.strip().lower()
+
+    requirements: dict[str, str] = {}
+    for raw in (root / "requirements.txt").read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            requirements[package_name(line)] = line
+
+    pyproject = tomllib.loads(
+        (root / "bot" / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    for spec in pyproject["project"]["dependencies"]:
+        name = package_name(spec)
+        assert name in requirements, (
+            f"{name} is declared in pyproject.toml but missing from "
+            f"requirements.txt, so a deploy would not install it"
+        )
+
+    # Optional extra in pyproject, mandatory in production: db.py imports it the
+    # moment TURSO_DATABASE_URL is set, so a Turso deploy dies at startup without
+    # it while every local test still passes on SQLite.
+    assert "libsql" in requirements, (
+        "requirements.txt must include libsql - it is required to reach Turso"
+    )
+
+
+def test_example_env_file_loads() -> None:
+    """The .env.example we ship must itself be a loadable configuration.
+
+    Two separate startup crashes hid behind a correct-looking example file: an
+    empty CSV list (pydantic-settings JSON-decodes list-typed fields before any
+    validator runs, so `TRUSTED_PROXIES=` was fatal) and a hex `EMBED_COLOR`
+    (pydantic's int rejects 0x). Neither showed up for a developer whose local
+    .env happened to be hand-written, only for an operator copying the example
+    as the documentation tells them to. So the example is parsed and loaded here
+    rather than trusted.
+    """
+    root = Path(__file__).resolve().parents[2]
+    example = root / ".env.example"
+    assert example.exists(), ".env.example is missing; deployment depends on it"
+
+    values: dict[str, str] = {}
+    for raw in example.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip()] = value.strip()
+
+    from .config import Settings
+
+    known = set(Settings.model_fields)
+    kwargs = {key.lower(): value for key, value in values.items() if key.lower() in known}
+
+    # Guard against the test passing vacuously if field names ever drift from
+    # the env keys: an empty match would assert nothing.
+    assert len(kwargs) >= 15, (
+        f"only {len(kwargs)} of {len(values)} .env.example keys map to a Settings "
+        f"field, so this check would not prove anything"
+    )
+
+    settings = Settings(**kwargs)  # type: ignore[arg-type]
+
+    assert settings.embed_color == 0x7C5CFF, (
+        f"EMBED_COLOR from .env.example parsed as {settings.embed_color}, "
+        f"expected 0x7C5CFF"
+    )
+    assert settings.trusted_proxies == [], (
+        "an empty TRUSTED_PROXIES must become an empty list, not fail to parse"
+    )
+    assert settings.guild_allowlist == [], (
+        "an empty DISCORD_GUILD_ALLOWLIST must become an empty list"
+    )
+    assert not settings.uses_turso, (
+        "the example ships an empty TURSO_DATABASE_URL, so it must not select the "
+        "Turso driver - otherwise the example config cannot be validated offline"
+    )
+
+
+#: The os.exec* family. Matched by name rather than a "starts with exec" prefix,
+#: because sys.executable - a legitimate, unrelated attribute - also starts with
+#: "exec" and would otherwise be flagged.
+_EXEC_FAMILY = frozenset(
+    {"execv", "execve", "execvp", "execvpe", "execl", "execle", "execlp", "execlpe"}
+)
+
+
+def test_app_shim_entrypoint() -> None:
+    """The root app.py must reach the bot and report the bot's exit code.
+
+    Some hosting panels start a Python app from a file at the repository root, so
+    app.py exists purely to bridge to `python -m giveaway_bot run`. Two things
+    about it are easy to break and hard to notice:
+
+    * the bot has to run *in* the app's own process. If it were spawned as a
+      child, a SIGTERM arriving before or between the handler install and the wait
+      would be lost and leave an orphaned bot holding a gateway connection. If it
+      were exec'd, the behaviour would differ per platform - CPython emulates
+      os.exec* on Windows without propagating the child's status.
+    * the panel decides whether the deploy worked from the exit status, so the
+      bot's code has to reach it unmodified.
+
+    Both are asserted against a real interpreter rather than by reading the file
+    alone. The probe subcommands chosen here are config-independent (argparse
+    rejects them before any settings or database are touched), so this stays
+    offline and needs no token.
+    """
+    import ast
+    import subprocess
+
+    root = Path(__file__).resolve().parents[2]
+    app = root / "app.py"
+    assert app.exists(), "app.py is missing from the repository root"
+
+    # Inspect the parsed code rather than the text: the module docstring explains
+    # at length why os.exec* is avoided, and a substring search would flag its own
+    # explanation.
+    tree = ast.parse(app.read_text(encoding="utf-8"))
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            offenders += [
+                f"import {alias.name}"
+                for alias in node.names
+                if alias.name.split(".")[0] == "subprocess"
+            ]
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] == "subprocess":
+                offenders.append(f"from {node.module} import ...")
+        elif isinstance(node, ast.Attribute) and node.attr in _EXEC_FAMILY:
+            offenders.append(f".{node.attr}()")
+
+    assert not offenders, (
+        "app.py must run the bot in its own process, but it uses "
+        f"{sorted(set(offenders))}: spawning a child would need signal "
+        "forwarding, and os.exec* does not propagate the exit code on Windows"
+    )
+
+    # Run from an unrelated directory to prove paths come from __file__ rather
+    # than the working directory a panel might choose.
+    probe_dir = tempfile.mkdtemp(prefix="giveaway-appshim-")
+    try:
+        def probe(args: list[str]) -> int:
+            # S603: fixed argv, no shell, and args come from this file's own
+            # literals - the point is to assert the exit code app.py returns.
+            return subprocess.run(  # noqa: S603
+                [sys.executable, str(app), *args],
+                cwd=probe_dir,
+                capture_output=True,
+                timeout=120,
+                check=False,
+            ).returncode
+
+        # --help exercises the import wiring and the forwarding of arguments.
+        assert probe(["--help"]) == 0, "app.py must forward arguments to the bot CLI"
+
+        # An unknown subcommand makes argparse exit 2. If app.py returned anything
+        # else, the panel would read every crash as a successful deploy.
+        assert probe(["not-a-real-command"]) == 2, (
+            "app.py must exit with the bot's own status; argparse exits 2 for an "
+            "invalid subcommand, so anything else means the code was swallowed"
+        )
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+
+
+def test_migrations_are_bom_free() -> None:
+    """No migration file may contain a BOM, and both loaders must strip one.
+
+    A BOM is not whitespace, so it silently becomes part of the first statement's
+    text. SQLite ignores it, which is why every local test passed, but Turso's
+    parser rejects the statement outright - a hosted deploy died on
+    ``SQL_PARSE_ERROR`` for a migration that was provably fine locally. Both
+    runtimes read the same files, so both loaders are checked.
+    """
+    root = Path(__file__).resolve().parents[2]
+    bom = "\ufeff"
+
+    migrations = sorted((root / "shared" / "migrations").glob("*.sql"))
+    assert migrations, "no migrations found"
+    for path in migrations:
+        raw = path.read_bytes()
+        assert not raw.startswith(b"\xef\xbb\xbf"), (
+            f"{path.name} starts with a UTF-8 BOM; strip it"
+        )
+        assert bom not in raw.decode("utf-8"), (
+            f"{path.name} contains a BOM character; strip it"
+        )
+
+    # The loaders must also cope with one, because a future editor can reintroduce
+    # it and the failure mode is a rejected statement rather than a warning.
+    from .db import load_migrations
+
+    tmp = Path(tempfile.mkdtemp(prefix="giveaway-bom-"))
+    try:
+        bommed = tmp / "0001_probe.sql"
+        bommed.write_bytes(b"\xef\xbb\xbf-- header\nCREATE TABLE t (id INTEGER);\n")
+        loaded = load_migrations(tmp)
+        assert len(loaded) == 1, "probe migration was not loaded"
+        assert bom not in loaded[0][1], (
+            "load_migrations must strip a BOM: it is not whitespace and Turso "
+            "rejects the resulting statement"
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    migrate_ts = root / "dashboard" / "scripts" / "migrate.ts"
+    if migrate_ts.exists():
+        source = migrate_ts.read_text(encoding="utf-8")
+        assert "uFEFF" in source, (
+            "the dashboard's migration loader must strip a BOM too - it applies "
+            "the same files, so it would fail on the same statement"
+        )
+
+
+def test_rows_are_mapped_for_any_driver() -> None:
+    """Result rows must be readable by name on both backends, not just SQLite.
+
+    SQLite can be configured to hand back sqlite3.Row, which supports row.keys().
+    libSQL has no row_factory attribute at all, so it returns plain tuples, and
+    code that called row.keys() unconditionally died with
+
+        AttributeError: 'tuple' object has no attribute 'keys'
+
+    on the first query against a hosted database - after migrations had already
+    been applied, so it looked like a data problem rather than a driver one.
+
+    The point of this check is the seam. It runs the real read path through a
+    connection that behaves like libSQL (tuples, description, no row_factory) so
+    the behaviour is asserted directly instead of inferred from SQLite passing.
+    """
+    from .db import Database
+
+    class _TupleCursor:
+        """A cursor shaped like libSQL's: tuples plus a description."""
+
+        def __init__(self, cursor: Any) -> None:
+            self._cursor = cursor
+
+        @property
+        def description(self) -> Any:
+            return self._cursor.description
+
+        @property
+        def lastrowid(self) -> Any:
+            return self._cursor.lastrowid
+
+        @property
+        def rowcount(self) -> Any:
+            return self._cursor.rowcount
+
+        def fetchall(self) -> list[tuple[Any, ...]]:
+            return [tuple(row) for row in self._cursor.fetchall()]
+
+        def close(self) -> None:
+            self._cursor.close()
+
+    class _TupleConnection:
+        """A connection that offers no row_factory, exactly like libSQL."""
+
+        def __init__(self, conn: Any) -> None:
+            self._conn = conn
+            assert not hasattr(self, "row_factory"), "stub must not accept row_factory"
+
+        def execute(self, sql: str, params: Any = ()) -> _TupleCursor:
+            return _TupleCursor(self._conn.execute(sql, params))
+
+        def close(self) -> None:
+            self._conn.close()
+
+    with _temp_database("driver-rows") as db:
+        # The migrations themselves populated schema_migrations, so this needs no
+        # extra fixture and no coupling to another table's columns.
+        assert db.scalar("SELECT COUNT(*) AS n FROM schema_migrations") == 6, (
+            "expected all six migrations applied in the scratch database"
+        )
+
+        # Read back through a libSQL-shaped connection.
+        inner = Database(_isolated_settings())
+        try:
+            real = inner._connect_factory()  # noqa: SLF001 - exercising the seam
+            inner._connect_factory = lambda: _TupleConnection(real)  # noqa: SLF001
+            assert inner.backend == "sqlite"
+
+            # The reported crash came through this exact query.
+            applied = inner.query_one("SELECT filename, checksum FROM schema_migrations")
+            assert applied is not None, "libSQL-shaped query returned nothing"
+            assert set(applied) == {"filename", "checksum"}, (
+                f"expected filename/checksum keys, got {applied!r}"
+            )
+            assert applied["filename"] == "0001_core.sql", (
+                f"values must line up with their columns, got {applied!r}"
+            )
+
+            listed = inner.query("SELECT filename, checksum FROM schema_migrations")
+            assert len(listed) == 6 and all(
+                isinstance(r["checksum"], str) and r["checksum"] for r in listed
+            ), "repeated reads must stay name-addressable over tuple rows"
+
+            count = inner.scalar("SELECT COUNT(*) AS n FROM schema_migrations")
+            assert count == 6, f"scalar() over tuple rows returned {count!r}"
+
+            # A join proves aliases and multiple columns map in order.
+            joined = inner.query(
+                "SELECT a.filename AS name, b.filename AS other"
+                " FROM schema_migrations a, schema_migrations b"
+                " WHERE a.filename = b.filename LIMIT 1"
+            )
+            assert len(joined) == 1 and set(joined[0]) == {"name", "other"}, (
+                f"aliased columns must map by name, got {joined!r}"
+            )
+        finally:
+            inner.close_all()
+
+        # And the real connection must not be relying on a row_factory either.
+        raw = db.connection()
+        assert getattr(raw, "row_factory", None) is None, (
+            "Database.connection() must not set row_factory: it is a silent no-op on "
+            "libSQL, so relying on it makes named rows work on SQLite only"
+        )
+
+
+def _build_offline_bot(name: str) -> tuple[Any, Database, Settings, str]:
+    """A GiveawayBot wired to a throwaway database, without any gateway.
+
+    Constructing one is enough to catch attribute and construction errors, and it
+    needs neither a token nor a network, so the startup path can be exercised in
+    CI rather than discovered on a deploy.
+    """
+    from .bot import GiveawayBot
+    from .db import Database
+    from .service import GiveawayService
+
+    tmp = tempfile.mkdtemp(prefix=f"giveaway-{name}-")
+    settings = _isolated_settings(
+        sqlite_path=str(Path(tmp) / "bot.db"),
+        discord_bot_token="x" * 59,  # shape only; never used to connect
+        migrations_dir=Path(__file__).resolve().parents[2] / "shared" / "migrations",
+    )
+    db = Database(settings)
+    db.migrate(verbose=False)
+    bot = GiveawayBot(GiveawayService(db, settings), db, settings)
+    return bot, db, settings, tmp
+
+
+def test_startup_lifecycle_runs_offline() -> None:
+    """setup_hook and on_ready must run without a gateway connection.
+
+    Everything from construction to a live client had only ever executed on a
+    deployed host, and it failed three times in a row there, each failure hiding
+    the next: the activity collision, then a missing cog entry point, and each one
+    sat in front of the next crash. Both hooks are driven here with the single
+    gateway-dependent call stubbed out - tree.sync() needs a real connection, and
+    is the only thing in setup_hook that does.
+    """
+    import asyncio
+
+
+    bot, db, _settings, tmp = _build_offline_bot("lifecycle")
+    synced: list[str] = []
+
+    async def fake_sync(*_args: object, **_kwargs: object) -> list[Any]:
+        synced.append("tree.sync")
+        return []
+
+    async def drive() -> None:
+        # The one call that genuinely requires a live gateway.
+        bot.tree.sync = fake_sync  # type: ignore[method-assign]
+        await bot.setup_hook()
+
+        job_names = {job.name for job in bot.scheduler.jobs}
+        expected = {
+            "end_due",
+            "queue",
+            "refresh",
+            "maintenance",
+            "activity_flush",
+            "activity_backfill",
+            "role_tasks",
+        }
+        missing = expected - job_names
+        assert not missing, f"setup_hook did not register job(s): {sorted(missing)}"
+
+        assert len(bot.tree.get_commands()) > 0, "no slash commands were registered"
+        # Two groups: `giveaway` (public commands) and `give` (staff commands).
+        for group_name in ("giveaway", "give"):
+            group = bot.tree.get_command(group_name)
+            assert group is not None, f"command group {group_name!r} was not registered"
+            assert len(group.commands) > 0, f"group {group_name!r} has no subcommands"
+
+        # on_ready normally fires after a connection; the recovery and
+        # reconciliation it performs are all database work, so they run offline.
+        await bot.on_ready()
+
+        await bot.close()
+
+    try:
+        asyncio.run(drive())
+        assert synced == ["tree.sync"], "setup_hook must sync application commands"
+        assert db.backend in {"sqlite", "turso"}
+    finally:
+        db.close_all()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_bot_constructs_without_shadowing_discord() -> None:
+    """GiveawayBot must be constructible, and must not shadow discord.py.
+
+    The bot had never been constructed outside a real gateway session, so nothing
+    checked that assigning our attributes onto a commands.Bot was legal. It was
+    not: `self.activity = MessageActivityTracker(...)` hit discord.Client's
+    `activity` property, whose setter demands a BaseActivity, and every deploy
+    died with
+
+        TypeError: activity must derive from BaseActivity.
+
+    Two things are asserted. First that construction and extension loading
+    actually work, offline. Second - and this is the part that generalises - that
+    no attribute assigned in __init__ collides with a name discord.py already
+    defines, so the next person to add one is caught before a deploy rather than
+    after.
+    """
+    import asyncio
+    import inspect
+    import re
+
+    import discord
+    from discord.ext import commands as dpy_commands
+
+    from .bot import GiveawayBot
+    from .db import Database
+    from .service import GiveawayService
+
+    # --- the generic guard, checked before anything is instantiated ---------
+    assigned = sorted(set(re.findall(r"self\.(\w+)\s*=", inspect.getsource(GiveawayBot.__init__))))
+    assert assigned, "could not read GiveawayBot.__init__ to check for collisions"
+    reserved: dict[str, str] = {}
+    for klass in dpy_commands.Bot.__mro__:
+        for name in vars(klass):
+            reserved.setdefault(name, klass.__name__)
+    collisions = [
+        f"{name} (defined on {reserved[name]})"
+        for name in assigned
+        if name in reserved
+    ]
+    assert not collisions, (
+        "GiveawayBot.__init__ assigns attribute(s) that discord.py already "
+        f"defines: {collisions}. Assigning over them either silently breaks the "
+        "client or hits a property setter that validates the type."
+    )
+
+    # --- construction, offline ------------------------------------------------
+    tmp = tempfile.mkdtemp(prefix="giveaway-construct-")
+    try:
+        settings = _isolated_settings(
+            sqlite_path=str(Path(tmp) / "bot.db"),
+            discord_bot_token="x" * 59,  # shape only; never used to connect
+            migrations_dir=Path(__file__).resolve().parents[2] / "shared" / "migrations",
+        )
+        db = Database(settings)
+        db.migrate(verbose=False)
+        bot = GiveawayBot(GiveawayService(db, settings), db, settings)
+
+        async def exercise() -> None:
+            # Cog loading is the other thing that only ever ran on a live
+            # connection. tree.sync() needs the gateway, so it is not called.
+            await bot.load_extension("giveaway_bot.cogs.giveaways")
+            await bot.load_extension("giveaway_bot.cogs.admin")
+            assert len(bot.tree.get_commands()) > 0, "no slash commands registered"
+            await bot.close()
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            db.close_all()
+
+        assert isinstance(bot, discord.Client), "GiveawayBot must still be a Client"
+        # The client's own activity attribute must be untouched and unused: this
+        # bot never joins a voice channel.
+        assert bot.activity is None, (
+            "GiveawayBot must leave discord.Client.activity alone (None); "
+            f"found {bot.activity!r}"
+        )
+        assert type(bot.activity_tracker).__name__ == "MessageActivityTracker", (
+            "the message-activity tracker must be reachable as .activity_tracker"
+        )
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_every_embed_and_view_renders() -> None:
+    """Every embed builder and view must render without a NameError.
+
+    The whole presentation layer was untested, and it shipped a function calling a
+    name that does not exist:
+
+        def progress_footer(giveaway):
+            ...
+            return entry_count_footer(giveaway)   # never defined
+
+    Nothing caught it because no test ever called a builder - the failure only
+    appeared on a live deploy. Every public builder and every view constructor is
+    now called here with a synthetic giveaway, in both the requirement and no
+    requirement configurations, so an undefined or misspelled name in any of them
+    fails here instead of in front of a user.
+    """
+    import discord
+
+    from . import embeds, views
+
+    outcomes: list[str] = []
+
+    def attempt(label: str, fn: Any) -> None:
+        try:
+            value = fn()
+        except Exception as exc:  # noqa: BLE001 - reported below
+            raise AssertionError(
+                f"{label} raised {type(exc).__name__}: {exc}"
+            ) from exc
+        assert value is not None, f"{label} returned None"
+        if isinstance(value, discord.Embed):
+            assert value.title is not None or len(value.fields) > 0, (
+                f"{label} produced an empty embed"
+            )
+        outcomes.append(label)
+
+    # Both configurations: with a message requirement and without, because the
+    # requirement branch is exactly where the missing helper was referenced.
+    plain = _giveaway()
+    with_requirement = _giveaway(
+        id="gw_req",
+        min_messages=25,
+        message_count_scope="channel",
+        message_count_channel_ids=["11", "12"],
+    )
+
+    for giveaway in (plain, with_requirement):
+        tag = "req" if giveaway.min_messages else "plain"
+        attempt(f"embeds.status_line[{tag}]", lambda g=giveaway: embeds.status_line(g))
+        attempt(f"embeds.build_giveaway_embed[{tag}]",
+                lambda g=giveaway: embeds.build_giveaway_embed(g))
+        attempt(f"embeds.build_paused_embed[{tag}]",
+                lambda g=giveaway: embeds.build_paused_embed(g, reason="testing"))
+        attempt(f"embeds.build_cancelled_embed[{tag}]",
+                lambda g=giveaway: embeds.build_cancelled_embed(g, reason="testing"))
+        attempt(f"views.joined_embed[{tag}]",
+                lambda g=giveaway: views.joined_embed(g, entry_seq=1, max_entries=1))
+        attempt(f"views.left_embed[{tag}]", lambda g=giveaway: views.left_embed(g))
+        # progress_footer is the function that referenced the undefined name.
+        attempt(f"views.progress_footer[{tag}]", lambda g=giveaway: views.progress_footer(g))
+
+    attempt("embeds.build_winner_embed",
+            lambda: embeds.build_winner_embed(plain, [("200000000000000001", "Winner")]))
+    attempt("embeds.build_winner_embed[reroll]",
+            lambda: embeds.build_winner_embed(
+                plain, [("200000000000000001", "Winner")], round_number=2, reroll=True))
+    attempt("embeds.build_verify_embed[ok]",
+            lambda: embeds.build_verify_embed(plain, {"ok": True, "checks": []}))
+    attempt("embeds.build_verify_embed[missing]",
+            lambda: embeds.build_verify_embed(plain, None))
+
+    attempt("embeds.format_duration", lambda: embeds.format_duration(90_000))
+    attempt("embeds.format_timestamp", lambda: embeds.format_timestamp(1_700_000_000_000))
+    attempt("embeds.relative_time", lambda: embeds.relative_time(1_700_000_000_000))
+    attempt("embeds.progress_bar", lambda: embeds.progress_bar(1000, 10000))
+    attempt("embeds.member_mention", lambda: embeds.member_mention("200000000000000001"))
+    # Round-trip the custom id: the button callbacks depend on this format, and a
+    # separator change here would silently break every button.
+    cid = views.custom_id("gw_x", "join")
+    parsed = views.parse_custom_id(cid)
+    assert parsed == ("gw_x", "join"), f"custom id round-trip failed: {cid!r} -> {parsed!r}"
+    assert views.parse_custom_id("nonsense") is None, "malformed custom ids must be rejected"
+
+    async def noop(*_a: Any, **_k: Any) -> None:
+        return None
+
+    attempt("views.GiveawayView",
+            lambda: views.GiveawayView("gw_x", on_join=noop, on_leave=noop))
+    attempt("views.GiveawayView[manage]",
+            lambda: views.GiveawayView(
+                "gw_x", on_join=noop, on_leave=noop, can_manage=True, dashboard_url="https://x"))
+    attempt("views.WinnerView", lambda: views.WinnerView("gw_x", dashboard_url="https://x"))
+    attempt("views.VerifyView", lambda: views.VerifyView("gw_x", dashboard_url="https://x"))
+
+    # The views must actually carry their buttons. Constructing without raising is
+    # not enough: a view that silently lost a button would still "work" here.
+    async def _noop(*_a: Any, **_k: Any) -> None:
+        return None
+
+    public_view = views.GiveawayView("gw_x", on_join=_noop, on_leave=_noop)
+    assert len(public_view.children) == 2, (
+        f"a public giveaway needs join + leave, got {len(public_view.children)}"
+    )
+
+    managed_view = views.GiveawayView(
+        "gw_x", on_join=_noop, on_leave=_noop, on_reroll=_noop, can_manage=True
+    )
+    assert len(managed_view.children) == 3, (
+        "a manageable giveaway needs join + leave + reroll, got "
+        f"{len(managed_view.children)}"
+    )
+    assert managed_view.is_entered("42") is False
+    managed_view.mark_entered("42", True)
+    assert managed_view.is_entered("42") is True
+    managed_view.mark_entered("42", False)
+    assert managed_view.is_entered("42") is False
+
+    winner = views.WinnerView("gw_x", on_reroll=_noop, can_manage=True)
+    assert len(winner.children) == 1, "winner view lost its reroll button"
+    assert len(views.WinnerView("gw_x").children) == 0, (
+        "a public winner view must have no privileged buttons"
+    )
+
+    assert len(views.VerifyView("gw_x", dashboard_url="https://x").children) == 1
+    assert len(views.VerifyView("gw_x").children) == 0
+
+    assert len(outcomes) >= 20, f"expected the whole surface to be covered, ran {len(outcomes)}"
+
+def test_intents_and_startup_error_explanations() -> None:
+    """The privileged-intent contract, and actionable startup failures.
+
+    Discord refuses the connection outright when a privileged intent is requested
+    but not enabled in the Developer Portal:
+
+        discord.errors.PrivilegedIntentsRequired: Shard ID None is requesting
+        privileged intents that have not been explicitly enabled
+
+    That is a configuration step only an operator can perform, so two things are
+    asserted. That the bot requests exactly one privileged intent - the minimum -
+    and never asks for message content, since it never reads message text. And
+    that the two most common first-run failures come back as an explanation with
+    the portal path in it, rather than as a bare traceback.
+    """
+    import discord
+
+    from .bot import build_intents
+    from .cli import _explain_startup_failure
+
+    intents = build_intents()
+    assert intents.members is True, (
+        "Server Members Intent is required: eligibility reads member roles and the "
+        "server join date, which Discord omits without it"
+    )
+    assert intents.message_content is False, (
+        "message content must stay off - the bot counts message events and never "
+        "reads text, so requesting it would widen access for no benefit"
+    )
+
+    privileged = [n for n in ("members", "message_content", "presences") if getattr(intents, n)]
+    assert privileged == ["members"], (
+        f"only Server Members Intent should be requested, got {privileged}"
+    )
+
+    # The client must use that same definition, not a second copy of it.
+    bot, db, _settings, tmp = _build_offline_bot("intents")
+    try:
+        assert bot.intents.members is True, "the client did not request members intent"
+        assert bot.intents.message_content is False, "the client requested message content"
+    finally:
+        db.close_all()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    # A configuration failure must explain itself.
+    hint = _explain_startup_failure(discord.errors.PrivilegedIntentsRequired(0))
+    assert hint is not None, "PrivilegedIntentsRequired produced no explanation"
+    assert "Server Members Intent" in hint, f"the hint does not name the intent: {hint}"
+    assert "developers/applications" in hint, (
+        f"the hint does not link the Developer Portal: {hint}"
+    )
+
+    login = _explain_startup_failure(discord.errors.LoginFailure())
+    assert login is not None and "DISCORD_BOT_TOKEN" in login, (
+        f"a bad token produced no useful hint: {login!r}"
+    )
+
+    assert _explain_startup_failure(ValueError("something else")) is None, (
+        "unrelated errors must be re-raised, not swallowed into a config message"
+    )
+
 # --------------------------------------------------------------------------- #
 # Cross-language vectors
 # --------------------------------------------------------------------------- #
@@ -1555,6 +2279,19 @@ def main() -> int:
     check.run("role tasks are retried, not lost", test_role_task_retry)
     check.run("one active giveaway per guild", test_single_active_giveaway)
     check.run("the giveaway channel is fixed by configuration", test_giveaway_channel_is_fixed)
+    check.run("requirements.txt covers every runtime dependency", test_requirements_cover_runtime_deps)
+    check.run("the shipped .env.example is a loadable config", test_example_env_file_loads)
+    check.run("the root app.py shim reaches the bot", test_app_shim_entrypoint)
+    check.run("migrations are BOM-free and loaders strip one", test_migrations_are_bom_free)
+    check.run("rows map by name on any driver, not just SQLite", test_rows_are_mapped_for_any_driver)
+    check.run(
+        "the bot constructs without shadowing discord.py",
+        test_bot_constructs_without_shadowing_discord,
+    )
+    check.run("setup_hook and on_ready run without a gateway", test_startup_lifecycle_runs_offline)
+    check.run("every embed and view renders", test_every_embed_and_view_renders)
+    check.run("privileged intents and startup errors are actionable",
+               test_intents_and_startup_error_explanations)
 
     check.section("Persistence + lifecycle")
     check.run("create -> join -> manage -> draw -> reroll", test_lifecycle)

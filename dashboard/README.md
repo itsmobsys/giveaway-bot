@@ -67,7 +67,9 @@ cd ../bot && python -m giveaway_bot genvectors
 
 ## Deployment
 
-* **Render** — see [`../render.yaml`](../render.yaml) and `Dockerfile`.
+* **Render** - see [`../render.yaml`](../render.yaml) and this directory's
+   `Dockerfile`. The Python bot is *not* containerised; see
+   [`../requirements.txt`](../requirements.txt).
 * **Vercel** — import the repo, set the variables below, done. See `vercel.json`.
 
 Required in both:

@@ -1,13 +1,19 @@
 # Render blueprint: bot (background worker) + dashboard (web service).
 #
+# The bot runs directly on Render's native Python runtime - no container image.
+# It installs `requirements.txt` and starts with `python -m giveaway_bot run`.
+# The dashboard is still containerised, from dashboard/Dockerfile.
+#
 # One-time setup:
 #   1. Create a Turso database and set TURSO_DATABASE_URL / TURSO_AUTH_TOKEN
 #      in both services' environment.
 #   2. Add DISCORD_BOT_TOKEN, DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET,
 #      SESSION_SECRET to the services that need them.
-#   3. Set DASHBOARD_URL to the dashboard's public URL after first deploy, then
+#   3. Set DISCORD_GIVEAWAY_CHANNEL_ID on the bot to the one channel giveaways
+#      are posted in. The bot refuses to create a giveaway without it.
+#   4. Set DASHBOARD_URL to the dashboard's public URL after first deploy, then
 #      register that exact URL as a Discord OAuth2 redirect.
-#   4. Run migrations once (`npm run db:migrate` locally or in a shell).
+#   5. Run migrations once (`npm run db:migrate` locally or in a shell).
 #
 # `render.yaml` is read from the repository root.
 
@@ -18,19 +24,26 @@ databases:
 
 services:
   # ---------------------------------------------------------------------
-  # Discord bot: a long-running background worker.
+  # Discord bot: a long-running background worker, native Python.
   # ---------------------------------------------------------------------
   - type: worker
     name: giveaway-bot
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
+    runtime: python
+    # Same interpreter the container image used (python:3.13-slim), so removing
+    # Docker does not change the runtime.
+    pythonVersion: 3.13
     plan: starter
     region: oregon
     autoDeploy: true
-    healthCheckPath: /healthz
+    buildCommand: pip install -r requirements.txt
+    # Run from `bot/` so `python -m giveaway_bot` resolves without installing the
+    # package; `exec` keeps Python as the process Render signals, so SIGTERM
+    # reaches discord.py and the gateway closes cleanly on every redeploy.
+    startCommand: cd bot && exec python -m giveaway_bot run
     envVars:
       - key: DISCORD_BOT_TOKEN
+        sync: false
+      - key: DISCORD_GIVEAWAY_CHANNEL_ID
         sync: false
       - key: DISCORD_CLIENT_ID
         sync: false
@@ -54,11 +67,13 @@ services:
         value: "false"
       - key: FAIRNESS_FREEZE_ENTRIES_ON_DRAW
         value: "true"
-      - key: MIGRATIONS_DIR
-        value: /app/shared/migrations
+      # MIGRATIONS_DIR is deliberately unset. It defaults to a path derived from
+      # the source tree (bot/giveaway_bot/../.. -> shared/migrations), which is
+      # correct for this layout and independent of the working directory the
+      # start command leaves us in.
 
   # ---------------------------------------------------------------------
-  # Dashboard: a web service.
+  # Dashboard: a web service (still containerised).
   # ---------------------------------------------------------------------
   - type: web
     name: giveaway-dashboard

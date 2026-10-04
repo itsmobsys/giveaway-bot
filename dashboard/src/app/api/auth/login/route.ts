@@ -1,4 +1,4 @@
-﻿import { all, first, nowMs, run } from "@/lib/db.ts";
+import { all, first, nowMs, run } from "@/lib/db.ts";
 import { readSession } from "@/lib/session.ts";
 
 /**

@@ -1,4 +1,4 @@
-﻿/**
+/**
  * End-to-end smoke test against a real database.
  *
  * Exercises the exact query shapes used by the UI so a bad column name or a
