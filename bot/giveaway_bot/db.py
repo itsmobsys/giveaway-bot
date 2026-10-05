@@ -8,6 +8,7 @@ of data loss.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
@@ -39,6 +40,21 @@ _DEAD_STREAM_MARKERS = (
 
 def _is_dead_stream(message: str) -> bool:
     return any(marker in message for marker in _DEAD_STREAM_MARKERS)
+
+
+def _is_write(sql: str) -> bool:
+    """True for statements that change data and need a COMMIT under libsql.
+
+    libsql opens an implicit transaction around writes (like sqlite3's legacy
+    default) and never auto-commits. Forgetting the commit means the writing
+    thread sees its own row while every other connection sees nothing — the
+    exact "created fine, join says not found, restart forgets everything"
+    failure. SELECTs/PRAGMAs commit nothing.
+    """
+    verb = sql.strip().split(None, 1)
+    return bool(verb) and verb[0].upper() not in (
+        "SELECT", "PRAGMA", "EXPLAIN", "WITH", "VALUES",
+    )
 
 
 def _brief(exc: Exception, limit: int = 120) -> str:
@@ -115,6 +131,8 @@ class Database:
         conn = getattr(self._local, "conn", None)
         if conn is None:
             conn = self._factory()
+            with contextlib.suppress(Exception):
+                conn.isolation_level = None  # autocommit, where the driver offers it
             try:
                 conn.execute("PRAGMA busy_timeout=10000")
             except Exception:
@@ -123,9 +141,8 @@ class Database:
         return conn
 
     def init_schema(self) -> None:
-        conn = self._conn()
         for stmt in [s.strip() for s in SCHEMA_TABLES.split(";") if s.strip()]:
-            conn.execute(stmt)
+            self.execute(stmt)
         # Full column set, so a table created by any earlier v2 revision
         # gains whatever it is missing (live databases are never rebuilt).
         # Indexes come last: they reference columns that may only just have
@@ -164,7 +181,7 @@ class Database:
                 "entered_at": "INTEGER NOT NULL DEFAULT 0",
             },
         )
-        conn.execute(
+        self.execute(
             """CREATE TABLE IF NOT EXISTS simple_message_counts (
   guild_id TEXT NOT NULL,
   user_id TEXT NOT NULL,
@@ -173,14 +190,14 @@ class Database:
 )"""
         )
         # One-time per-server setup: the role pinged on every giveaway event.
-        conn.execute(
+        self.execute(
             """CREATE TABLE IF NOT EXISTS simple_guild_settings (
   guild_id TEXT PRIMARY KEY,
   notify_role_id TEXT
 )"""
         )
         for stmt in [s.strip() for s in SCHEMA_INDEXES.split(";") if s.strip()]:
-            conn.execute(stmt)
+            self.execute(stmt)
 
     def _ensure_columns(self, table: str, desired: dict[str, str]) -> None:
         try:
@@ -205,7 +222,11 @@ class Database:
         last_error: Exception | None = None
         for attempt in range(6):
             try:
-                return self._conn().execute(sql, tuple(params))
+                conn = self._conn()
+                cur = conn.execute(sql, tuple(params))
+                if _is_write(sql):
+                    conn.commit()
+                return cur
             except Exception as exc:
                 message = str(exc).lower()
                 if _is_dead_stream(message):
