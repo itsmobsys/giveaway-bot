@@ -16,7 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
+import secrets
+import time
 from typing import Any
 
 import discord
@@ -84,6 +87,11 @@ class GiveawayBot(commands.Bot):
         self.db = db
         self.settings = settings
         self.scheduler = Scheduler()
+        #: Random per process. Published to the DB as a heartbeat so two
+        #: processes running the same token (local + hosted) is a loud log
+        #: line instead of a mystery: token-sharing makes the gateway
+        #: disconnect in a loop and interactions die as "didn't respond".
+        self._instance_id = secrets.token_hex(4)
         #: Pinged every 30s so a free-tier dashboard is not idled out, and so
         #: we notice when it goes away.
         self.dashboard_health = DashboardHealth(settings.dashboard_url)
@@ -123,7 +131,8 @@ class GiveawayBot(commands.Bot):
         await self.scheduler.start()
 
     async def on_ready(self) -> None:
-        log.info("logged in as %s (%d guilds)", self.user, len(self.guilds))
+        log.info("logged in as %s (%d guilds) instance=%s", self.user, len(self.guilds), self._instance_id)
+        await self._claim_instance()
         for guild in self.guilds:
             await self._sync_guild(guild)
         # Finish any draw that a crash interrupted.
@@ -203,6 +212,55 @@ class GiveawayBot(commands.Bot):
     async def on_guild_remove(self, guild: discord.Guild) -> None:
         await asyncio.to_thread(guilds_repo.touch_guild, self.db, str(guild.id), bot_present=False)
         log.info("left guild %s", guild.id)
+
+    #: Another process holding the same token makes the gateway flap
+    #: (disconnect/resume in a loop) and interactions time out. The DB
+    #: heartbeat turns that into a one-line diagnosis.
+    INSTANCE_HEARTBEAT_KEY = "bot_instance_heartbeat"
+    INSTANCE_LEASE_SECONDS = 90.0
+
+    async def _claim_instance(self) -> None:
+        """Publish this process's heartbeat; warn if another one is alive."""
+        mine = {"instance": self._instance_id, "ts": time.time()}
+        try:
+            raw = await asyncio.to_thread(control.get_state, self.db, self.INSTANCE_HEARTBEAT_KEY)
+        except Exception:  # noqa: BLE001 - heartbeat must never block startup
+            log.exception("could not read the instance heartbeat")
+            return
+        if raw:
+            try:
+                other = json.loads(raw)
+            except (TypeError, ValueError):
+                other = None
+            if (
+                isinstance(other, dict)
+                and other.get("instance") not in (None, self._instance_id)
+                and time.time() - float(other.get("ts", 0)) < self.INSTANCE_LEASE_SECONDS
+            ):
+                log.error(
+                    "another bot instance (%s) holds a fresh heartbeat - "
+                    "two processes share one token and will disconnect each other "
+                    "until one is stopped. This instance continues, but expect "
+                    "'did not respond' interactions.",
+                    other.get("instance"),
+                )
+        try:
+            await asyncio.to_thread(
+                control.set_state, self.db, self.INSTANCE_HEARTBEAT_KEY, json.dumps(mine)
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("could not write the instance heartbeat")
+
+    async def _refresh_instance_heartbeat(self) -> None:
+        try:
+            await asyncio.to_thread(
+                control.set_state,
+                self.db,
+                self.INSTANCE_HEARTBEAT_KEY,
+                json.dumps({"instance": self._instance_id, "ts": time.time()}),
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("could not refresh the instance heartbeat")
 
     async def _sync_guild(self, guild: discord.Guild) -> None:
         if not self.settings.guild_allowed(str(guild.id)):
@@ -466,6 +524,7 @@ class GiveawayBot(commands.Bot):
             return False
 
     async def _handle_entry(self, interaction: discord.Interaction, giveaway_id: str, *, join: bool) -> None:
+        received = time.perf_counter()
         user = interaction.user
         guild = interaction.guild
         if guild is None:
@@ -480,6 +539,18 @@ class GiveawayBot(commands.Bot):
 
         if not await self._defer_interaction(interaction):
             return
+        ack_ms = (time.perf_counter() - received) * 1000
+        if ack_ms > 2000:
+            # Discord kills the token at ~3000ms. Landing the ack after 2000ms
+            # means the loop was starved (host CPU throttle, blocking call) and
+            # the next click may not be so lucky.
+            log.warning(
+                "slow interaction ack: %.0fms for %s on %s (instance=%s)",
+                ack_ms,
+                interaction.id,
+                giveaway_id,
+                self._instance_id,
+            )
 
         giveaway = await asyncio.to_thread(gw_repo.get_giveaway, self.db, giveaway_id)
         if giveaway is None:
@@ -678,6 +749,7 @@ class GiveawayBot(commands.Bot):
 
     async def _job_dashboard_health(self) -> None:
         await self.dashboard_health.poll()
+        await self._refresh_instance_heartbeat()
 
     async def _job_maintenance(self) -> None:
         await asyncio.to_thread(self.service.housekeeping)
