@@ -48,6 +48,7 @@ class GiveawayBot(commands.Bot):
         log.info("commands synced (%d)", len(self.tree.get_commands()))
         self.tick.change_interval(seconds=max(5, self.settings.tick_seconds))
         self.tick.start()
+        self.heartbeat.start()
 
     async def on_ready(self) -> None:
         log.info("logged in as %s (%d guilds)", self.user, len(self.guilds))
@@ -59,6 +60,10 @@ class GiveawayBot(commands.Bot):
     async def close(self) -> None:
         try:
             self.tick.cancel()
+        except Exception:
+            pass
+        try:
+            self.heartbeat.cancel()
         except Exception:
             pass
         await super().close()
@@ -374,6 +379,37 @@ class GiveawayBot(commands.Bot):
 
     @tick.before_loop
     async def _before_tick(self) -> None:
+        await self.wait_until_ready()
+
+    # -- 1-minute health heartbeat ---------------------------------------
+    @tasks.loop(seconds=60)
+    async def heartbeat(self) -> None:
+        """Ping our own /health like an external monitor would.
+
+        Proves the web server half of the process is alive and leaves a
+        visible 1-minute heartbeat in the logs. (Note: localhost traffic does
+        not count as external traffic for Render's free-tier sleep — keep the
+        UptimeRobot monitor for that.)
+        """
+        import time
+        import urllib.request
+
+        port = max(1, self.settings.port)
+
+        def _ping() -> tuple[int, float]:
+            started = time.perf_counter()
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=10) as resp:
+                return resp.status, (time.perf_counter() - started) * 1000
+
+        try:
+            status, ms = await asyncio.to_thread(_ping)
+        except Exception as exc:
+            log.warning("health check failed: %s", exc)
+            return
+        log.info("health check ok (%d, %.0fms)", status, ms)
+
+    @heartbeat.before_loop
+    async def _before_heartbeat(self) -> None:
         await self.wait_until_ready()
 
     async def _announce(self, gw: Giveaway, winners: list[str]) -> None:
