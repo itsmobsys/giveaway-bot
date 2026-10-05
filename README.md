@@ -5,7 +5,8 @@ Simple standalone Discord giveaway bot. MIT licensed.
 ```
 .
 ├── bot/            Python Discord bot (discord.py), Turso-backed
-├── dashboard/      Vercel Node.js read-only API (live + previous giveaways)
+├── api/            Vercel Node.js functions (live + previous giveaways)
+├── public/         Dashboard website (static, no framework)
 ├── app.py          Root entry point for panels that start a file
 ├── requirements.txt  Bot dependencies
 ├── render.yaml     Render blueprint: bot web service
@@ -27,6 +28,46 @@ Simple standalone Discord giveaway bot. MIT licensed.
 - Built-in `/health` server, so it runs on Render's free Web Service tier
 
 Details: [bot/README.md](bot/README.md).
+
+## Dashboard (website + API, Vercel)
+
+Read-only view over the **same Turso DB** the bot writes. Shows only
+**live + previous** giveaways, 4 fields per card: prize, entrants, win chance, timer.
+No framework, no build step — `public/` is served as-is, `api/` runs as Node 20
+functions (`framework: null` in `vercel.json` forces the "Other" preset, so
+Vercel never asks for Next.js).
+
+| Route | What |
+| --- | --- |
+| `GET /` | the dashboard page |
+| `GET /api/health` | `{ ok, now }` — also verifies Turso `SELECT 1` |
+| `GET /api/giveaways` | `{ now, live: [...], previous: [...] }` |
+| `GET /api/giveaways?id=gw_xxx` | `{ now, giveaway: {...} }` — single card |
+
+Query params: `guild_id` (optional filter), `previous_limit` (1–10, default 5).
+
+Privacy: usernames only, capped at 100 — **user ids never leave the DB**.
+Entry rows are wiped 5h after end by the bot, so old `entrants.count` decays
+to 0 by design.
+
+Behaviour notes:
+
+- Countdown ticks locally every second from `timer.ends_at`, corrected by the
+  server clock offset in the response `now`. Under 60s the timer turns amber.
+- Refreshes every 15s, on tab focus, and on the Refresh button.
+- Light/dark follows the OS setting; the ticking clock is screen-reader-safe
+  (`role="timer"`, absolute `<time>` label); all untrusted text is escaped.
+
+Local preview (no Turso credentials needed — the API is mocked):
+
+```bash
+npm i
+node serve.js      # http://localhost:4321
+node smoke.js      # helper + card-shape tests
+```
+
+Deploy: import the repo on Vercel with **Root Directory empty (repo root)**,
+set env vars `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN` (same as the bot), deploy.
 
 ## Quick start
 

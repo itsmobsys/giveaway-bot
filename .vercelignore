@@ -1,0 +1,17 @@
+# Keep the Python bot and local-only files out of Vercel deployments.
+# Vercel only needs: api/, public/, package.json, vercel.json.
+bot/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+data/
+render.yaml
+Dockerfile
+.dockerignore
+docker-compose.yml
+app.py
+requirements.txt
+sillydev.conf
+serve.js
+smoke.js
