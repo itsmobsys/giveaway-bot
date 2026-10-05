@@ -704,6 +704,41 @@ def wire_commands(bot: GiveawayBot) -> None:
             interaction,
             f"⏳ **{fresh.prize}** extended — now ends <t:{int(fresh.ends_at/1000)}:R>.",
         )
+        # Tell the people waiting: ping every entrant in the giveaway channel.
+        try:
+            entrants = await asyncio.to_thread(svc.entries, fresh.id)
+        except Exception:
+            log.exception("entrant lookup failed for extend notice (%s)", fresh.id)
+            entrants = []
+        if not entrants:
+            return
+        try:
+            channel = bot.get_channel(int(fresh.channel_id))
+        except (TypeError, ValueError):
+            channel = None
+        if not isinstance(channel, discord.TextChannel):
+            return
+        notice = (
+            f"⏳ **{fresh.prize}** got more time — now ends"
+            f" <t:{int(fresh.ends_at/1000)}:R>!"
+        )
+        try:
+            role = bot._role_for(fresh)
+            if role is not None:
+                await channel.send(
+                    f"{notice}\n{role.mention}",
+                    allowed_mentions=discord.AllowedMentions(roles=True),
+                )
+            else:
+                ids = [str(row["user_id"]) for row in entrants]
+                for i in range(0, len(ids), 80):
+                    chunk = " ".join(f"<@{uid}>" for uid in ids[i : i + 80])
+                    await channel.send(
+                        f"{notice}\n{chunk}" if i == 0 else chunk,
+                        allowed_mentions=discord.AllowedMentions(users=True),
+                    )
+        except (discord.Forbidden, discord.HTTPException):
+            log.warning("extend notice failed for %s", fresh.id)
 
     @bot.tree.command(name="giveaway_list", description="Show entrants, or active giveaways")
     @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
