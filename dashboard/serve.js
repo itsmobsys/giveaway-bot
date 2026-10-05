@@ -31,6 +31,18 @@ const sample = {
       chance: { winners: 1, entrants: 3, percent: 33.3, one_in: 3, text: "1 winner / 3 entrants" },
       timer: { ends_at: now - 90_000_000, ended_at: now - 90_000_000, ms_remaining: 0, seconds_remaining: 0, is_live: false },
     },
+    {
+      id: "gw_prev3", status: "ended", prize: "₹150 Steam voucher", image_url: "https://picsum.photos/id/180/540/460", host_name: "ModPete",
+      entrants: { count: 27, usernames: [] },
+      chance: { winners: 2, entrants: 27, percent: 7.41, one_in: 13.5, text: "2 winners / 27 entrants" },
+      timer: { ends_at: now - 260_000_000, ended_at: now - 260_000_000, ms_remaining: 0, seconds_remaining: 0, is_live: false },
+    },
+    {
+      id: "gw_prev4", status: "cancelled", prize: "Give up your data", image_url: null, host_name: "SysAdmin",
+      entrants: { count: 0, usernames: [] },
+      chance: { winners: 1, entrants: 0, percent: 0, one_in: null, text: "No entries yet" },
+      timer: { ends_at: now - 400_000_000, ended_at: now - 400_000_000, ms_remaining: 0, seconds_remaining: 0, is_live: false },
+    },
   ],
 };
 
@@ -40,7 +52,40 @@ createServer(async (req, res) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify(sample));
   }
-  const file = path === "/" ? "index.html" : path.slice(1);
+
+  // The admin panel needs a POST mock, or it can't be previewed locally.
+  if (path === "/api/admin") {
+    let raw = "";
+    for await (const chunk of req) raw += chunk;
+    let body = {};
+    try {
+      body = JSON.parse(raw || "{}");
+    } catch {}
+    const json = (code, obj) => {
+      res.writeHead(code, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(obj));
+    };
+    if (body.password !== "duggalbadmoshnahirahalol") return json(401, { error: "Wrong password" });
+    if (body.action === "list") {
+      const offset = Number(body.offset) || 0;
+      const limit = Number(body.limit) || 25;
+      return json(200, {
+        now,
+        live: sample.live.length,
+        total: sample.previous.length,
+        previous: sample.previous.slice(offset, offset + limit),
+      });
+    }
+    if (body.action === "delete") {
+      const ids = new Set(Array.isArray(body.ids) ? body.ids : [body.id]);
+      const gone = sample.previous.filter((g) => ids.has(g.id)).length;
+      sample.previous = sample.previous.filter((g) => !ids.has(g.id));
+      return json(200, { deleted: gone, failed: [] });
+    }
+    return json(200, { ok: true });
+  }
+
+  const file = path === "/" ? "index.html" : path === "/admin" ? "admin.html" : path.slice(1);
   try {
     const body = await readFile(join(PUB, file));
     res.writeHead(200, { "Content-Type": TYPES[extname(file)] ?? "application/octet-stream" });

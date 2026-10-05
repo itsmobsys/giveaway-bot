@@ -4,6 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Admin — Giveaways</title>
+    <meta name="robots" content="noindex, nofollow" />
     <meta name="color-scheme" content="dark light" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -12,77 +13,171 @@
       href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=Russo+One&display=swap"
     />
     <link rel="stylesheet" href="/styles.css" />
-    <style>
-      .login { max-width: 380px; margin: 8vh auto 0; display: grid; gap: 12px; }
-      .login input {
-        min-height: var(--tap);
-        padding: 0 14px;
-        font: inherit;
-        color: var(--text);
-        background: var(--surface-2);
-        border: 1px solid var(--line);
-        border-radius: 12px;
-      }
-      .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-      .row .prize { font-size: .95rem; }
-      .danger {
-        flex: none;
-        min-height: var(--tap);
-        padding: 0 16px;
-        font: inherit;
-        font-size: .82rem;
-        font-weight: 700;
-        color: #fff;
-        background: var(--danger, #b91c1c);
-        border: none;
-        border-radius: 999px;
-        cursor: pointer;
-      }
-      .danger:disabled { opacity: .5; cursor: default; }
-      .admin-list { display: grid; gap: 10px; }
-      .admin-item {
-        display: flex;
-        align-items: center;
-        justify-content: space-between;
-        gap: 12px;
-        padding: 12px 14px;
-        background: var(--surface);
-        border: 1px solid var(--line);
-        border-radius: 12px;
-      }
-    </style>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%237c3aed'/%3E%3Cpath d='M13 15v-2a3 3 0 0 1 6 0v2' fill='none' stroke='%23fff' stroke-width='2.4' stroke-linecap='round'/%3E%3Crect x='11' y='15' width='10' height='8' rx='2' fill='%23fff'/%3E%3C/svg%3E"
+    />
   </head>
   <body>
+    <div class="glow" aria-hidden="true"></div>
+
     <header class="top">
       <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 11h18v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-9Z" />
+            <path d="M3 11h18M12 7v15" />
+            <path d="M12 7H8.5A2.5 2.5 0 1 1 11 4.5V7ZM12 7h3.5A2.5 2.5 0 1 0 13 4.5V7Z" />
+          </svg>
+        </span>
         <div>
           <h1>Admin</h1>
-          <p class="sub"><a href="/" style="color:inherit">← back to giveaways</a></p>
+          <p class="sub">Review and clear finished giveaways</p>
         </div>
       </div>
       <div class="top-right">
-        <button class="ghost" id="logout" type="button" hidden>Log out</button>
+        <span class="status" id="status" data-state="ok" role="status">
+          <i class="dot" aria-hidden="true"></i><span id="status-text">Locked</span>
+        </span>
+        <a class="ghost" href="/">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M19 12H5M11 18l-6-6 6-6" />
+          </svg>
+          Dashboard
+        </a>
+        <button class="ghost" id="logout" type="button" hidden>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />
+          </svg>
+          Log out
+        </button>
       </div>
     </header>
 
     <main>
-      <form class="login" id="login">
-        <h2 style="margin:0">Password</h2>
-        <input id="pw" type="password" autocomplete="current-password" placeholder="Admin password" />
-        <button class="ghost" type="submit" style="justify-content:center">Unlock</button>
-        <p class="err" id="login-err" hidden role="alert"></p>
-      </form>
+      <!-- login -->
+      <section class="auth" id="login-view">
+        <form class="login-card" id="login" novalidate>
+          <span class="login-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="4" y="10.5" width="16" height="10.5" rx="2.5" />
+              <path d="M8 10.5V7.5a4 4 0 0 1 8 0v3" />
+            </svg>
+          </span>
+          <h2>Unlock panel</h2>
+          <p class="hint">Enter the admin password to manage past giveaways.</p>
+          <label class="field">
+            <span>Password</span>
+            <input
+              class="input"
+              id="pw"
+              type="password"
+              name="password"
+              autocomplete="current-password"
+              required
+              placeholder="••••••••••"
+            />
+          </label>
+          <button class="btn" id="unlock" type="submit">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3" />
+            </svg>
+            Unlock
+          </button>
+          <p class="err" id="login-err" hidden role="alert"></p>
+        </form>
+      </section>
 
+      <!-- panel -->
       <section id="panel" hidden>
-        <div class="sec-head">
-          <h2>Previous giveaways</h2>
-          <span class="count" id="prev-count"></span>
+        <div class="stats">
+          <div class="stat">
+            <b id="stat-total">0</b>
+            <span>Previous</span>
+          </div>
+          <div class="stat live">
+            <b id="stat-live">0</b>
+            <span>Live now</span>
+          </div>
+          <div class="stat entrants">
+            <b id="stat-entrants">0</b>
+            <span>Entrants listed</span>
+          </div>
         </div>
-        <div class="admin-list" id="prev-list"></div>
-        <p class="empty" id="prev-empty" hidden>Nothing to delete.</p>
+
+        <div class="sec-head">
+          <h2>Finished giveaways</h2>
+          <span class="count" id="shown-count"></span>
+        </div>
+
+        <div class="toolbar">
+          <div class="search">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="7" />
+              <path d="m20 20-3.2-3.2" />
+            </svg>
+            <label class="sr-only" for="q">Search by prize or host</label>
+            <input class="input" id="q" type="search" placeholder="Search prize or host…" autocomplete="off" />
+          </div>
+          <div class="chips" role="group" aria-label="Filter by status">
+            <button class="chip" type="button" data-filter="all" aria-pressed="true">All</button>
+            <button class="chip" type="button" data-filter="ended" aria-pressed="false">Ended</button>
+            <button class="chip" type="button" data-filter="cancelled" aria-pressed="false">Cancelled</button>
+          </div>
+          <button class="ghost" id="refresh" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+              <path d="M21 3v6h-6" />
+            </svg>
+            Refresh
+          </button>
+        </div>
+
+        <div class="selbar" id="selbar" hidden>
+          <span id="sel-count">0 selected</span>
+          <span class="selbar-actions">
+            <button class="btn btn-quiet btn-sm" id="clear-sel" type="button">Clear</button>
+            <button class="btn btn-danger btn-sm" id="bulk-del" type="button">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14" />
+              </svg>
+              Delete selected
+            </button>
+          </span>
+        </div>
+
+        <div class="rows" id="rows"></div>
+        <p class="empty" id="rows-empty" hidden>No finished giveaways to show.</p>
         <p class="err" id="err" hidden role="alert"></p>
+
+        <div class="pager" id="pager" hidden>
+          <button class="btn btn-quiet btn-sm" id="prev-page" type="button">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M15 18l-6-6 6-6" />
+            </svg>
+            Newer
+          </button>
+          <span class="count" id="page-count"></span>
+          <button class="btn btn-quiet btn-sm" id="next-page" type="button">
+            Older
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M9 18l6-6-6-6" />
+            </svg>
+          </button>
+        </div>
       </section>
     </main>
+
+    <dialog id="confirm" aria-labelledby="confirm-title">
+      <h3 id="confirm-title">Delete giveaway?</h3>
+      <p id="confirm-text">This cannot be undone.</p>
+      <div class="dialog-actions">
+        <button class="btn btn-quiet" id="confirm-no" type="button">Keep it</button>
+        <button class="btn btn-danger" id="confirm-yes" type="button">Delete forever</button>
+      </div>
+    </dialog>
+
+    <div class="toast" id="toast" hidden role="status"></div>
 
     <script type="module" src="/admin.js"></script>
   </body>

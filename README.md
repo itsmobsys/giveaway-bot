@@ -70,9 +70,11 @@ The page is served by `api/page.js`, which has the `public/` files baked in —
 after editing anything in `public/`, run `node build-page.js` (from
 `dashboard/`) before committing, or the live page won't pick up the change.
 
-`/admin` (linked in the page footer) is a password-gated panel for deleting
-previous giveaways. Live ones can't be deleted there — end them in Discord
-first. The password defaults to the one in `api/admin.js` and can be
+`/admin` (linked in the page footer) is a password-gated panel for clearing
+finished giveaways. Live ones can't be deleted there — end them in Discord
+first. It pages through the whole table (the public API only returns the last
+10), with search, status filters, multi-select and bulk delete behind a
+confirm dialog. The password defaults to the one in `api/admin.js` and can be
 overridden with the `ADMIN_PASSWORD` env var; anyone with repo access can see
 it, so it only keeps casual visitors out.
 
