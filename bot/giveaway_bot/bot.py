@@ -40,6 +40,10 @@ class GiveawayBot(commands.Bot):
         self.db = db
         self.service = GiveawayService(db)
         self._views: dict[str, GiveawayView] = {}
+        #: (guild_id, giveaway_id, prize) snapshot for autocomplete. Discord
+        #: kills autocomplete after 3s and a Turso round-trip can exceed that,
+        #: so suggestions are served from this tick-refreshed cache — never DB.
+        self._autocomplete_cache: list[tuple[str, str, str]] = []
 
     # -- lifecycle ------------------------------------------------------
     async def setup_hook(self) -> None:
@@ -56,6 +60,7 @@ class GiveawayBot(commands.Bot):
             "SELECT * FROM simple_giveaways WHERE status = 'active' LIMIT 200",
         )
         log.info("tracking %d active giveaway(s) from the database", len(live))
+        self._autocomplete_cache = [(g["guild_id"], g["id"], g["prize"]) for g in live]
         for gw in live:
             self._register_view(gw["id"])
 
@@ -394,12 +399,14 @@ class GiveawayBot(commands.Bot):
             await self._strip_entrants_role(ended)
         # Live timer: re-render active embeds every tick so the countdown
         # visibly ticks down (soonest deadline first, capped per tick).
+        # The same fetch feeds the autocomplete cache (max 25 = Discord limit).
         try:
-            live = await asyncio.to_thread(self.service.list_all_active, 10)
+            live = await asyncio.to_thread(self.service.list_all_active, 25)
         except Exception:
             log.exception("live list failed")
             return
-        for gw in live:
+        self._autocomplete_cache = [(g.guild_id, g.id, g.prize) for g in live]
+        for gw in live[:10]:
             try:
                 await self._refresh_embed(gw)
             except Exception:
@@ -488,20 +495,27 @@ def wire_commands(bot: GiveawayBot) -> None:
     async def _gw_autocomplete(
         interaction: discord.Interaction, current: str
     ) -> list[app_commands.Choice[str]]:
-        """Suggest running giveaways so ids never need typing."""
-        if interaction.guild is None:
-            return []
+        """Suggest running giveaways so ids never need typing.
+
+        Served from the tick cache, never the database: autocomplete dies at
+        3s and a Turso round-trip can exceed that. Any failure returns no
+        suggestions instead of an "Unknown interaction" traceback.
+        """
         try:
-            active = await asyncio.to_thread(svc.list_active, str(interaction.guild.id))
+            if interaction.guild is None:
+                return []
+            gid = str(interaction.guild.id)
+            needle = (current or "").lower()
+            choices = [
+                app_commands.Choice(name=f"🏆 {prize} ({gw_id})"[:100], value=gw_id)
+                for (g, gw_id, prize) in bot._autocomplete_cache
+                if g == gid
+                and (not needle or needle in prize.lower() or needle in gw_id.lower())
+            ]
+            return choices[:25]
         except Exception:
+            log.exception("autocomplete failed")
             return []
-        needle = (current or "").lower()
-        choices = [
-            app_commands.Choice(name=f"🏆 {gw.prize} ({gw.id})"[:100], value=gw.id)
-            for gw in active
-            if not needle or needle in gw.prize.lower() or needle in gw.id.lower()
-        ]
-        return choices[:25]
 
     @bot.tree.command(name="giveaway_create", description="Start a giveaway")
     @app_commands.describe(
