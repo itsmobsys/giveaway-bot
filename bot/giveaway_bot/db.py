@@ -64,6 +64,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_GIVEAWAYS} (
   image_url TEXT,
   entrants_role_id TEXT,
   created_by TEXT NOT NULL,
+  host_id TEXT,
+  host_name TEXT,
   created_at INTEGER NOT NULL,
   ended_at INTEGER,
   winners_json TEXT NOT NULL DEFAULT '[]'
@@ -145,6 +147,8 @@ class Database:
                 "image_url": "TEXT",
                 "entrants_role_id": "TEXT",
                 "created_by": "TEXT NOT NULL DEFAULT ''",
+                "host_id": "TEXT",
+                "host_name": "TEXT",
                 "created_at": "INTEGER NOT NULL DEFAULT 0",
                 "ended_at": "INTEGER",
                 "winners_json": "TEXT NOT NULL DEFAULT '[]'",

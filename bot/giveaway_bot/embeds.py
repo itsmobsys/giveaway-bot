@@ -46,6 +46,9 @@ def giveaway_embed(gw: Giveaway, entries: int, color: int) -> discord.Embed:
     if reqs:
         desc += f"\n**Requirements**\n{reqs}\n"
     desc += "\nClick **Join** to enter, **Leave** to withdraw."
+    if gw.host_id:
+        host_label = gw.host_name or "host"
+        desc += f"\n\n🎤 Hosted by <@{gw.host_id}> ({host_label})"
     embed = discord.Embed(title="🎉 Giveaway", description=desc, colour=color)
     if gw.image_url:
         embed.set_image(url=gw.image_url)
@@ -56,9 +59,18 @@ def giveaway_embed(gw: Giveaway, entries: int, color: int) -> discord.Embed:
 def winner_embed(gw: Giveaway, winners: list[str], entries: int, color: int) -> discord.Embed:
     if winners:
         mentions = ", ".join(f"<@{w}>" for w in winners)
-        desc = f"🏆 **{gw.prize}**\n\nCongratulations {mentions}!\nEntries: **{entries}**"
+        desc = (
+            f"## 🎊 {gw.prize} 🎊\n\n"
+            f"Congratulations {mentions} — you won!\n\n"
+            f"👥 Entries: **{entries}**  •  🏆 Winners: **{len(winners)}**"
+        )
     else:
-        desc = f"🏆 **{gw.prize}**\n\nNo valid entries — no winners."
-    embed = discord.Embed(title="🎉 Giveaway Ended", description=desc, colour=color)
+        desc = f"## 🎊 {gw.prize} 🎊\n\nNo valid entries — no winners this time."
+    if gw.host_id:
+        host_label = gw.host_name or "host"
+        desc += f"\n🎤 Hosted by <@{gw.host_id}> ({host_label})"
+    embed = discord.Embed(title="Giveaway Ended", description=desc, colour=color)
+    if gw.image_url:
+        embed.set_image(url=gw.image_url)
     embed.set_footer(text=f"ID: {gw.id}")
     return embed

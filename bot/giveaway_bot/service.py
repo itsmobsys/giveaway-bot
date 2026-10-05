@@ -39,6 +39,8 @@ class Giveaway:
     min_messages: int
     image_url: str | None
     entrants_role_id: str | None
+    host_id: str | None
+    host_name: str | None
     winners: list[str]
 
     @property
@@ -66,6 +68,8 @@ class Giveaway:
             min_messages=int(row.get("min_messages") or 0),
             image_url=str(row["image_url"]) if row.get("image_url") else None,
             entrants_role_id=str(row["entrants_role_id"]) if row.get("entrants_role_id") else None,
+            host_id=str(row["host_id"]) if row.get("host_id") else None,
+            host_name=str(row["host_name"]) if row.get("host_name") else None,
             winners=[str(w) for w in winners] if isinstance(winners, list) else [],
         )
 
@@ -90,6 +94,8 @@ class GiveawayService:
         min_account_age_days: int = 0,
         min_messages: int = 0,
         image_url: str | None = None,
+        host_id: str | None = None,
+        host_name: str | None = None,
     ) -> Giveaway:
         prize = prize.strip()
         if not prize or len(prize) > 256:
@@ -108,12 +114,13 @@ class GiveawayService:
         self.db.execute(
             "INSERT INTO simple_giveaways (id, guild_id, channel_id, prize, winner_count, ends_at,"
             " status, required_role_id, blocked_role_id, min_account_age_days, min_messages,"
-            " image_url, created_by, created_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
+            " image_url, created_by, created_at, host_id, host_name)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 gid, guild_id, channel_id, prize, winner_count, created + duration_seconds * 1000,
                 required_role_id or None, blocked_role_id or None, max(0, min_account_age_days),
                 max(0, min_messages), image_url, created_by, created,
+                host_id or created_by, (host_name or "")[:64] or None,
             ),
         )
         return self.get(gid)

@@ -37,7 +37,9 @@ giveaway, so you can ping everyone in it). Leaving removes it; when the
 giveaway ends or is cancelled it is taken from everyone — winners and losers
 alike — and the role is deleted. The bot needs **Manage Roles** for this; if
 it lacks the permission the giveaway still runs, just without the role.
-- `/giveaway_list`
+- `/giveaway_list [giveaway_id]` — without an id: active giveaways; with
+  an id (suggestions as you type): the full entrant list
+- `/giveaway_ping giveaway_id [text]` — pings every entrant (Manage Server)
 - `/giveaway_end giveaway_id` — suggestions appear as you type; with one live
   giveaway any id falls back to it
 - `/giveaway_reroll giveaway_id [count]` — same suggestions + fallback

@@ -297,8 +297,8 @@ class GiveawayBot(commands.Bot):
             except Exception:
                 log.exception("end failed for %s", gw.id)
                 continue
-            await self._strip_entrants_role(ended)
             await self._announce(ended, winners)
+            await self._strip_entrants_role(ended)
         # Live timer: re-render active embeds every tick so the countdown
         # visibly ticks down (soonest deadline first, capped per tick).
         try:
@@ -317,26 +317,40 @@ class GiveawayBot(commands.Bot):
         await self.wait_until_ready()
 
     async def _announce(self, gw: Giveaway, winners: list[str]) -> None:
+        """Winner celebration. Runs BEFORE the entrants role is stripped so the
+        role mention below still reaches everyone who joined."""
         try:
             channel = self.get_channel(int(gw.channel_id))
         except (TypeError, ValueError):
             return
         if not isinstance(channel, discord.TextChannel):
             return
-        entries = self.service.entry_count(gw.id)
+        try:
+            entries = await asyncio.to_thread(self.service.entry_count, gw.id)
+        except Exception:
+            entries = 0
         embed = embeds.winner_embed(gw, winners, entries, self.settings.embed_color)
-        mentions = " ".join(f"<@{w}>" for w in winners) if winners else ""
+        parts: list[str] = []
+        if winners:
+            parts.append("🎉 " + " ".join(f"<@{w}>" for w in winners))
+        role = self._role_for(gw)
+        if role is not None:
+            parts.append(f"{role.mention} — thanks to everyone who entered!")
+        elif not winners:
+            parts.append("No valid entries — no winners this time.")
+        content = "\n".join(parts) or None
+        mentions = discord.AllowedMentions(users=True, roles=True)
         try:
             if gw.message_id:
                 try:
                     msg = await channel.fetch_message(int(gw.message_id))
                     await msg.edit(embed=embed, view=None)
-                    if mentions:
-                        await msg.reply(mentions, allowed_mentions=discord.AllowedMentions(users=True))
+                    if content:
+                        await msg.reply(content, allowed_mentions=mentions)
                     return
                 except discord.HTTPException:
                     pass
-            await channel.send(embed=embed, content=mentions or None)
+            await channel.send(embed=embed, content=content)
         except discord.HTTPException:
             log.warning("announce failed for %s", gw.id)
 
@@ -409,6 +423,8 @@ def wire_commands(bot: GiveawayBot) -> None:
                 min_account_age_days=max(0, min_account_age_days),
                 min_messages=max(0, min_messages),
                 image_url=image,
+                host_id=str(interaction.user.id),
+                host_name=interaction.user.display_name,
             )
         except ServiceError as exc:
             try:
@@ -460,8 +476,8 @@ def wire_commands(bot: GiveawayBot) -> None:
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
-        await bot._strip_entrants_role(ended)
         await bot._announce(ended, winners)
+        await bot._strip_entrants_role(ended)
         await bot._safe_followup(interaction, f"Ended with {len(winners)} winner(s).")
 
     @bot.tree.command(name="giveaway_reroll", description="Draw new winner(s)")
@@ -502,8 +518,12 @@ def wire_commands(bot: GiveawayBot) -> None:
         await bot._strip_entrants_role(ended)
         await interaction.response.send_message("Giveaway cancelled.", ephemeral=True)
 
-    @bot.tree.command(name="giveaway_list", description="Show active giveaways")
-    async def giveaway_list(interaction: discord.Interaction) -> None:
+    @bot.tree.command(name="giveaway_list", description="Show entrants, or active giveaways")
+    @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
+    @app_commands.describe(giveaway_id="Leave empty to list active giveaways")
+    async def giveaway_list(
+        interaction: discord.Interaction, giveaway_id: str | None = None
+    ) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
@@ -511,7 +531,31 @@ def wire_commands(bot: GiveawayBot) -> None:
             await interaction.response.defer(ephemeral=True, thinking=True)
         except (discord.NotFound, discord.HTTPException):
             return
-        active = await asyncio.to_thread(svc.list_active, str(interaction.guild.id))
+        gid = str(interaction.guild.id)
+        if giveaway_id:
+            try:
+                gw = await asyncio.to_thread(svc.resolve, gid, giveaway_id)
+            except ServiceError as exc:
+                await bot._safe_followup(interaction, f"⚠️ {exc.message}")
+                return
+            entrants = await asyncio.to_thread(svc.entries, gw.id)
+            host = f" by <@{gw.host_id}>" if gw.host_id else ""
+            if not entrants:
+                await bot._safe_followup(
+                    interaction, f"🏆 **{gw.prize}**{host} — no entrants yet."
+                )
+                return
+            shown = [f"<@{row['user_id']}>" for row in entrants[:50]]
+            extra = f"\n…and {len(entrants) - 50} more." if len(entrants) > 50 else ""
+            status = "running 🟢" if gw.active else gw.status
+            await bot._safe_followup(
+                interaction,
+                f"🏆 **{gw.prize}**{host} — **{len(entrants)}** entrant(s) ({status}):\n"
+                + ", ".join(shown)
+                + extra,
+            )
+            return
+        active = await asyncio.to_thread(svc.list_active, gid)
         if not active:
             await bot._safe_followup(interaction, "No active giveaways.")
             return
@@ -519,7 +563,59 @@ def wire_commands(bot: GiveawayBot) -> None:
         for gw in active[:10]:
             n = await asyncio.to_thread(svc.entry_count, gw.id)
             lines.append(f"• **{gw.prize}** — {n} entries — `{gw.id}` — <t:{int(gw.ends_at/1000)}:R>")
+        lines.append("\nTip: run `/giveaway_list` with an id to see who entered.")
         await bot._safe_followup(interaction, "\n".join(lines))
+
+    @bot.tree.command(name="giveaway_ping", description="Ping everyone who joined a giveaway")
+    @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
+    async def giveaway_ping(
+        interaction: discord.Interaction, giveaway_id: str, text: str | None = None
+    ) -> None:
+        """Ping all entrants — via their entrants role, or direct mentions."""
+        if interaction.guild is None or not _can_manage(interaction.user):
+            await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
+            return
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        try:
+            gw = await asyncio.to_thread(
+                svc.resolve, str(interaction.guild.id), giveaway_id
+            )
+            entrants = await asyncio.to_thread(svc.entries, gw.id)
+        except ServiceError as exc:
+            await bot._safe_followup(interaction, f"⚠️ {exc.message}")
+            return
+        if not entrants:
+            await bot._safe_followup(interaction, "Nobody has joined this giveaway yet.")
+            return
+        body = f"📢 **{gw.prize}**" + (f" — {text}" if text else "")
+        role = bot._role_for(gw)
+        channel = interaction.channel
+        if not isinstance(channel, discord.TextChannel):
+            await bot._safe_followup(interaction, "Run this in a text channel.")
+            return
+        try:
+            if role is not None:
+                await channel.send(
+                    f"{body}\n{role.mention}",
+                    allowed_mentions=discord.AllowedMentions(roles=True),
+                )
+            else:
+                ids = [str(row["user_id"]) for row in entrants]
+                for i in range(0, len(ids), 80):
+                    chunk = " ".join(f"<@{uid}>" for uid in ids[i : i + 80])
+                    await channel.send(
+                        f"{body}\n{chunk}" if i == 0 else chunk,
+                        allowed_mentions=discord.AllowedMentions(users=True),
+                    )
+        except (discord.Forbidden, discord.HTTPException):
+            await bot._safe_followup(interaction, "⚠️ I cannot send messages there.")
+            return
+        await bot._safe_followup(
+            interaction, f"📢 Pinged {len(entrants)} entrant(s)."
+        )
 
 
 async def amain(settings: Settings) -> None:
