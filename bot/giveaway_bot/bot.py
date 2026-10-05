@@ -44,6 +44,9 @@ class GiveawayBot(commands.Bot):
         #: kills autocomplete after 3s and a Turso round-trip can exceed that,
         #: so suggestions are served from this tick-refreshed cache — never DB.
         self._autocomplete_cache: list[tuple[str, str, str]] = []
+        #: Giveaway ids whose entrants-role delete is already scheduled.
+        #: Stops end + cancel + tick racing to queue the same role twice.
+        self._scheduled_role_deletes: set[str] = set()
 
     # -- lifecycle ------------------------------------------------------
     async def setup_hook(self) -> None:
@@ -63,6 +66,21 @@ class GiveawayBot(commands.Bot):
         self._autocomplete_cache = [(g["guild_id"], g["id"], g["prize"]) for g in live]
         for gw in live:
             self._register_view(gw["id"])
+        # Restart recovery: finished giveaways whose entrants role was never
+        # deleted (bot was down during the 5-minute window, or the delete
+        # failed). Clean the pileup now instead of leaving roles forever.
+        try:
+            leftovers = await asyncio.to_thread(self.service.ended_with_roles)
+        except Exception:
+            log.exception("leftover role sweep failed")
+            leftovers = []
+        if leftovers:
+            log.info("cleaning up %d leftover entrants role(s)", len(leftovers))
+            for row in leftovers:
+                self._schedule_role_delete(
+                    str(row.guild_id), str(row.entrants_role_id or ""), row.id,
+                    delay=60.0,
+                )
 
     async def close(self) -> None:
         try:
@@ -204,8 +222,14 @@ class GiveawayBot(commands.Bot):
         except (discord.Forbidden, discord.HTTPException):
             pass
 
+    #: Grace period between a giveaway ending and its entrants role being
+    #: deleted from the server. Users are stripped immediately; the role
+    #: itself lingers so the winner announcement's mention still resolves,
+    #: then goes away for good instead of piling up.
+    ROLE_DELETE_DELAY = 300.0
+
     async def _strip_entrants_role(self, gw: Giveaway) -> None:
-        """Take the role from every entrant, then delete it. Win or lose."""
+        """Take the role from every entrant now, delete it in 5 minutes."""
         role = self._role_for(gw)
         if role is None:
             return
@@ -227,10 +251,58 @@ class GiveawayBot(commands.Bot):
                     await member.remove_roles(role, reason=f"Giveaway {gw.id} ended")
                 except (discord.Forbidden, discord.HTTPException):
                     pass
+        self._schedule_role_delete(
+            str(gw.guild_id), str(role.id), gw.id, delay=self.ROLE_DELETE_DELAY
+        )
+        log.info(
+            "stripped entrants role for %s; deleting it in %.0fs",
+            gw.id, self.ROLE_DELETE_DELAY,
+        )
+
+    def _schedule_role_delete(
+        self, guild_id: str, role_id: str, giveaway_id: str, delay: float
+    ) -> None:
+        """Queue a one-shot task that deletes the role after `delay` seconds."""
+        if not guild_id or not role_id or giveaway_id in self._scheduled_role_deletes:
+            return
+        self._scheduled_role_deletes.add(giveaway_id)
+        asyncio.get_running_loop().create_task(
+            self._delete_entrants_role_later(guild_id, role_id, giveaway_id, delay),
+            name=f"delete-role-{giveaway_id}",
+        )
+
+    async def _delete_entrants_role_later(
+        self, guild_id: str, role_id: str, giveaway_id: str, delay: float
+    ) -> None:
+        await asyncio.sleep(delay)
         try:
-            await role.delete(reason=f"Giveaway {gw.id} ended")
-        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
-            pass
+            guild = self.get_guild(int(guild_id))
+        except (TypeError, ValueError):
+            guild = None
+        if guild is not None:
+            role = guild.get_role(int(role_id)) if role_id.isdigit() else None
+            if role is not None:
+                try:
+                    await role.delete(reason=f"Giveaway {giveaway_id} ended")
+                    log.info("deleted entrants role for %s", giveaway_id)
+                except discord.Forbidden:
+                    log.warning(
+                        "no permission to delete entrants role for %s —"
+                        " move the bot role above it / grant Manage Roles",
+                        giveaway_id,
+                    )
+                    self._scheduled_role_deletes.discard(giveaway_id)
+                    return
+                except (discord.HTTPException, discord.NotFound):
+                    log.warning("role delete failed for %s", giveaway_id)
+            # Role already gone (or guild gone): record that, stop retrying.
+            try:
+                await asyncio.to_thread(
+                    self.service.set_entrants_role, giveaway_id, None
+                )
+            except Exception:
+                log.exception("could not clear entrants role for %s", giveaway_id)
+        self._scheduled_role_deletes.discard(giveaway_id)
 
     # -- button handlers ------------------------------------------------
     async def _safe_defer(self, interaction: discord.Interaction) -> bool:

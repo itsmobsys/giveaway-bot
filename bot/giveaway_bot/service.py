@@ -373,6 +373,20 @@ class GiveawayService:
             (role_id, giveaway_id),
         )
 
+    def ended_with_roles(self, limit: int = 200) -> list[Giveaway]:
+        """Finished giveaways whose entrants role was never deleted.
+
+        Restart recovery for the delayed role cleanup: anything listed here
+        is a leftover whose 5-minute delete never ran.
+        """
+        rows = self.db.query(
+            "SELECT * FROM simple_giveaways WHERE status != 'active'"
+            " AND entrants_role_id IS NOT NULL AND entrants_role_id != ''"
+            " ORDER BY ended_at DESC LIMIT ?",
+            (limit,),
+        )
+        return [Giveaway.from_row(r) for r in rows]
+
     def due(self, now: int | None = None) -> list[Giveaway]:
         ts = now if now is not None else now_ms()
         rows = self.db.query(
