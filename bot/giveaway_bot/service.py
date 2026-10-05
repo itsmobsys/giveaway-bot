@@ -354,6 +354,19 @@ class GiveawayService:
             "UPDATE simple_giveaways SET message_id = ? WHERE id = ?", (message_id, giveaway_id)
         )
 
+    def extend(self, giveaway_id: str, extra_seconds: int) -> Giveaway:
+        """Push the deadline back. Only on a running giveaway."""
+        gw = self.get(giveaway_id)
+        if not gw.active:
+            raise ServiceError("Only a running giveaway can be extended.")
+        if extra_seconds < 60 or extra_seconds > 60 * 86400:
+            raise ServiceError("Extend by 1 minute to 60 days at a time.")
+        self.db.execute(
+            "UPDATE simple_giveaways SET ends_at = ends_at + ? WHERE id = ?",
+            (extra_seconds * 1000, gw.id),
+        )
+        return self.get(gw.id)
+
     def set_entrants_role(self, giveaway_id: str, role_id: str | None) -> None:
         self.db.execute(
             "UPDATE simple_giveaways SET entrants_role_id = ? WHERE id = ?",

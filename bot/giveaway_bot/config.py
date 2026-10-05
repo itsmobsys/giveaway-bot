@@ -29,9 +29,6 @@ class Settings:
     )
     turso_url: str = field(default_factory=lambda: os.getenv("TURSO_DATABASE_URL", "").strip())
     turso_token: str = field(default_factory=lambda: os.getenv("TURSO_AUTH_TOKEN", "").strip())
-    sqlite_path: str = field(
-        default_factory=lambda: os.getenv("SQLITE_PATH", "./data/giveaways.db").strip()
-    )
     tick_seconds: int = field(default_factory=lambda: _int("TICK_SECONDS", 30))
     embed_color: int = 0x7C5CFF
 

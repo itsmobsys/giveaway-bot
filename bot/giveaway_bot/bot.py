@@ -70,7 +70,6 @@ class GiveawayBot(commands.Bot):
             view = GiveawayView(giveaway_id)
             view._join_handler = self.handle_join
             view._leave_handler = self.handle_leave
-            view._notify_handler = self.handle_notify
             self._views[giveaway_id] = view
             self.add_view(view)
         return view
@@ -279,54 +278,6 @@ class GiveawayBot(commands.Bot):
             await interaction.followup.send(text, ephemeral=True)
         except (discord.NotFound, discord.HTTPException):
             pass
-
-    async def handle_notify(self, interaction: discord.Interaction, giveaway_id: str) -> None:
-        """🔔 toggle: give/remove the server notify role for this member."""
-        del giveaway_id  # the role is per-server, not per-giveaway
-        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            try:
-                await interaction.response.send_message(
-                    "Use this button inside the server.", ephemeral=True
-                )
-            except (discord.NotFound, discord.HTTPException):
-                pass
-            return
-        if not await self._safe_defer(interaction):
-            return
-        try:
-            role_id = await asyncio.to_thread(
-                self.service.get_notify_role, str(interaction.guild.id)
-            )
-        except Exception:
-            role_id = None
-        if not role_id:
-            await self._safe_followup(
-                interaction,
-                "No notify role is set up yet — staff, run `/giveaway_notifyer` once.",
-            )
-            return
-        role = interaction.guild.get_role(int(role_id)) if role_id.isdigit() else None
-        if role is None:
-            await self._safe_followup(
-                interaction, "The notify role no longer exists — staff, re-run `/giveaway_notifyer`."
-            )
-            return
-        member = interaction.user
-        try:
-            if role in member.roles:
-                await member.remove_roles(role, reason="Notify-me toggled off")
-                await self._safe_followup(
-                    interaction, f"🔕 You will no longer be pinged ({role.name})."
-                )
-            else:
-                await member.add_roles(role, reason="Notify-me toggled on")
-                await self._safe_followup(
-                    interaction, f"🔔 You will be pinged for giveaways ({role.name})."
-                )
-        except (discord.Forbidden, discord.HTTPException):
-            await self._safe_followup(
-                interaction, "⚠️ I cannot manage that role (need Manage Roles)."
-            )
 
     async def handle_leave(self, interaction: discord.Interaction, giveaway_id: str) -> None:
         if not await self._safe_defer(interaction):
@@ -618,6 +569,33 @@ def wire_commands(bot: GiveawayBot) -> None:
             except (discord.Forbidden, discord.HTTPException):
                 pass
 
+    @bot.tree.command(name="giveaway_extend", description="Add more time to a running giveaway")
+    @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
+    @app_commands.describe(minutes="Extra minutes to add (1-43200)")
+    async def giveaway_extend(
+        interaction: discord.Interaction, giveaway_id: str, minutes: int
+    ) -> None:
+        if interaction.guild is None or not _can_manage(interaction.user):
+            await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
+            return
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        try:
+            gw = await asyncio.to_thread(
+                svc.resolve, str(interaction.guild.id), giveaway_id
+            )
+            fresh = await asyncio.to_thread(svc.extend, gw.id, max(1, minutes) * 60)
+        except ServiceError as exc:
+            await bot._safe_followup(interaction, f"⚠️ {exc.message}")
+            return
+        await bot._refresh_embed(fresh)
+        await bot._safe_followup(
+            interaction,
+            f"⏳ **{fresh.prize}** extended — now ends <t:{int(fresh.ends_at/1000)}:R>.",
+        )
+
     @bot.tree.command(name="giveaway_list", description="Show entrants, or active giveaways")
     @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
     @app_commands.describe(giveaway_id="Leave empty to list active giveaways")
@@ -640,6 +618,11 @@ def wire_commands(bot: GiveawayBot) -> None:
                 return
             entrants = await asyncio.to_thread(svc.entries, gw.id)
             host = f" by <@{gw.host_id}>" if gw.host_id else ""
+            chance = (gw.winner_count / len(entrants) * 100) if entrants else 0.0
+            odds = (
+                f"\n📊 Each entrant has a **{chance:.1f}%** chance"
+                f" ({gw.winner_count} winner(s) / {len(entrants)} entries)."
+            )
             if not entrants:
                 await bot._safe_followup(
                     interaction, f"🏆 **{gw.prize}**{host} — no entrants yet."
@@ -650,7 +633,8 @@ def wire_commands(bot: GiveawayBot) -> None:
             status = "running 🟢" if gw.active else gw.status
             await bot._safe_followup(
                 interaction,
-                f"🏆 **{gw.prize}**{host} — **{len(entrants)}** entrant(s) ({status}):\n"
+                f"🏆 **{gw.prize}**{host} — **{len(entrants)}** entrant(s) ({status})"
+                + odds + ":\n"
                 + ", ".join(shown)
                 + extra,
             )
@@ -662,7 +646,11 @@ def wire_commands(bot: GiveawayBot) -> None:
         lines = []
         for gw in active[:10]:
             n = await asyncio.to_thread(svc.entry_count, gw.id)
-            lines.append(f"• **{gw.prize}** — {n} entries — `{gw.id}` — <t:{int(gw.ends_at/1000)}:R>")
+            each = f" — **{gw.winner_count / n * 100:.1f}%** each" if n else ""
+            lines.append(
+                f"• **{gw.prize}** — {n} entries{each} — `{gw.id}`"
+                f" — <t:{int(gw.ends_at/1000)}:R>"
+            )
         lines.append("\nTip: run `/giveaway_list` with an id to see who entered.")
         await bot._safe_followup(interaction, "\n".join(lines))
 
@@ -684,8 +672,8 @@ def wire_commands(bot: GiveawayBot) -> None:
                 current = None
             if current and interaction.guild.get_role(int(current)) is not None:
                 await interaction.response.send_message(
-                    f"🔔 Notify role: <@&{current}> — members grab it with the"
-                    " **Notify me** button.",
+                    f"🔔 Notify role: <@&{current}> — give it to members so they"
+                    " get pinged on giveaway news.",
                     ephemeral=True,
                 )
             else:
@@ -706,7 +694,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             return
         await interaction.response.send_message(
             f"✅ {role.mention} will now be pinged on every giveaway (new, winners,"
-            " rerolls, cancellations). Members opt in with the **Notify me** button.",
+            " rerolls, cancellations).",
             ephemeral=True,
         )
 

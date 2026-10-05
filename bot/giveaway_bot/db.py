@@ -1,13 +1,17 @@
-"""Tiny DB layer: same SQL for local SQLite and hosted Turso (libsql)."""
+"""Tiny DB layer: Turso (libSQL) only.
+
+Deliberately no local/SQLite fallback: on a host like Render a local file is
+wiped on every redeploy, which silently "forgot" all giveaways. Refusing to
+start without TURSO_DATABASE_URL turns that into a loud one-line error instead
+of data loss.
+"""
 
 from __future__ import annotations
 
 import logging
-import sqlite3
 import threading
 import time
 from collections.abc import Sequence
-from pathlib import Path
 from typing import Any
 
 from .config import Settings, get_settings
@@ -89,27 +93,23 @@ class Database:
     def __init__(self, settings: Settings | None = None) -> None:
         self.settings = settings or get_settings()
         self._local = threading.local()
-        self._is_turso = self.settings.uses_turso
-        if self._is_turso:
-            try:
-                import libsql  # type: ignore[import-not-found]
-            except ImportError as exc:
-                raise RuntimeError(
-                    "TURSO_DATABASE_URL is set but libsql is missing. "
-                    'Install with: pip install -e ".[turso]"'
-                ) from exc
-            self._factory = lambda: libsql.connect(  # noqa: E731
-                self.settings.turso_url,
-                auth_token=self.settings.turso_token or None,
+        if not self.settings.turso_url:
+            raise RuntimeError(
+                "TURSO_DATABASE_URL is not set. This bot stores everything in Turso"
+                " so restarts never lose data — set TURSO_DATABASE_URL (and"
+                " TURSO_AUTH_TOKEN) and restart."
             )
-            self.backend = "turso"
-        else:
-            path = Path(self.settings.sqlite_path).expanduser()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            self._factory = lambda: sqlite3.connect(  # noqa: E731
-                str(path), timeout=30.0, isolation_level=None, check_same_thread=False
-            )
-            self.backend = "sqlite"
+        try:
+            import libsql  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise RuntimeError(
+                "The Turso driver is missing. Install it with: pip install -e \".[turso]\""
+            ) from exc
+        self._factory = lambda: libsql.connect(  # noqa: E731
+            self.settings.turso_url,
+            auth_token=self.settings.turso_token or None,
+        )
+        self.backend = "turso"
 
     def _conn(self) -> Any:
         conn = getattr(self._local, "conn", None)

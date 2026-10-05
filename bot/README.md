@@ -1,7 +1,8 @@
 # Giveaway bot (Python) — simple standalone v2
 
 No dashboard. Just Discord slash commands + Join/Leave buttons + auto-draw timer.
-Storage is Turso when `TURSO_DATABASE_URL` is set, otherwise a local SQLite file.
+Storage is **Turso only** — there is intentionally no local/SQLite fallback, so
+a redeploy or restart can never wipe giveaways, entries, or settings.
 
 ```bash
 python -m pip install -e ".[turso]"
@@ -14,9 +15,8 @@ python -m giveaway_bot run
 | Var | Required | What |
 | --- | --- | --- |
 | `DISCORD_BOT_TOKEN` | yes | Bot token |
-| `TURSO_DATABASE_URL` | no | `libsql://...` — without it, uses SQLite |
-| `TURSO_AUTH_TOKEN` | no | Turso auth token |
-| `SQLITE_PATH` | no | Default `./data/giveaways.db` |
+| `TURSO_DATABASE_URL` | yes | `libsql://...` — the only database. The bot refuses to start without it |
+| `TURSO_AUTH_TOKEN` | yes | Turso auth token |
 | `DISCORD_GIVEAWAY_CHANNEL_ID` | no | Force all giveaways into one channel |
 | `TICK_SECONDS` | no | Auto-draw poll (default 30) |
 
@@ -48,6 +48,10 @@ it lacks the permission the giveaway still runs, just without the role.
 - `/giveaway_ping giveaway_id [text]` — pings every entrant (Manage Server)
 - `/giveaway_end giveaway_id` — suggestions appear as you type; with one live
   giveaway any id falls back to it
+- `/giveaway_extend giveaway_id minutes` — add 1 minute to 60 days of time to
+  a running giveaway
+- `/giveaway_reroll giveaway_id [count]` — same suggestions + fallback; works
+  on ended giveaways, drawing fresh winners that exclude previous ones
 - `/giveaway_reroll giveaway_id [count]` — same suggestions + fallback
 - `/giveaway_cancel giveaway_id` — same suggestions + fallback
 

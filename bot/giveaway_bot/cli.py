@@ -20,6 +20,11 @@ def cmd_doctor(_: argparse.Namespace) -> int:
     problems: list[str] = []
     if not settings.bot_token:
         problems.append("DISCORD_BOT_TOKEN is not set.")
+    if not settings.turso_url:
+        problems.append(
+            "TURSO_DATABASE_URL is not set. This bot is Turso-only so restarts"
+            " never lose data — set it (plus TURSO_AUTH_TOKEN) and restart."
+        )
     try:
         db = Database(settings)
         db.init_schema()
