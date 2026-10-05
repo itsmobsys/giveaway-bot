@@ -196,24 +196,25 @@ class Database:
         """Run one statement, surviving dead Turso streams and brief contention.
 
         * Dead/idle Hrana stream: the connection is dropped and the statement
-          is replayed once on a fresh connection. Safe because a dead stream
-          never applied anything.
+          is replayed on a fresh connection, on *every* hit up to the attempt
+          cap (streams can flap repeatedly during a Turso wobble). Safe
+          because a dead stream never applied anything.
         * `locked`/`busy`/`conflict`: genuine writer contention, retried with a
           short backoff. Anything else raises untouched.
         """
         last_error: Exception | None = None
-        reconnected = False
         for attempt in range(6):
             try:
                 return self._conn().execute(sql, tuple(params))
             except Exception as exc:
                 message = str(exc).lower()
-                if not reconnected and _is_dead_stream(message):
+                if _is_dead_stream(message):
                     log.warning(
-                        "database stream went away (%s); reconnecting once", _brief(exc)
+                        "database stream went away (%s); reconnecting", _brief(exc)
                     )
                     self.close()
-                    reconnected = True
+                    last_error = exc
+                    time.sleep(0.15 * (attempt + 1))
                     continue
                 if any(word in message for word in ("locked", "busy", "conflict")):
                     last_error = exc
@@ -223,8 +224,26 @@ class Database:
         raise last_error  # type: ignore[misc]
 
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
-        cur = self.execute(sql, params)
-        rows = cur.fetchall()
+        # fetchall() pulls rows over the network on Turso, so the stream can
+        # die here too — after execute() already succeeded. Retry the whole
+        # read on a fresh connection instead of surfacing a phantom failure.
+        last_error: Exception | None = None
+        for _ in range(3):
+            try:
+                cur = self.execute(sql, params)
+                rows = cur.fetchall()
+                break
+            except Exception as exc:
+                if _is_dead_stream(str(exc).lower()):
+                    log.warning(
+                        "database stream died mid-read (%s); retrying", _brief(exc)
+                    )
+                    self.close()
+                    last_error = exc
+                    continue
+                raise
+        else:
+            raise last_error  # type: ignore[misc]
         desc = cur.description
         cols = [d[0] for d in desc] if desc else []
         try:

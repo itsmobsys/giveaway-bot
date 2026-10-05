@@ -253,7 +253,30 @@ class GiveawayBot(commands.Bot):
         try:
             gw = await asyncio.to_thread(self.service.get, giveaway_id)
         except ServiceError:
-            await self._safe_followup(interaction, "Giveaway not found.")
+            # Log the id plus what IS live: tells a stale button (id absent
+            # from the live list) apart from a phantom empty read (id present
+            # but the lookup missed it).
+            try:
+                live = await asyncio.to_thread(
+                    self.service.list_all_active, 50
+                )
+                live_ids = [g.id for g in live]
+            except Exception:
+                live_ids = []
+            log.warning(
+                "join for unknown giveaway %s (guild %s, live: %s)",
+                giveaway_id, interaction.guild.id if interaction.guild else "?",
+                ",".join(live_ids) or "none",
+            )
+            await self._safe_followup(
+                interaction, f"Giveaway not found (`{giveaway_id}`)."
+            )
+            return
+        except Exception:
+            log.exception("join lookup failed for %s", giveaway_id)
+            await self._safe_followup(
+                interaction, "⚠️ Could not load the giveaway. Try again."
+            )
             return
         try:
             count = await asyncio.to_thread(
@@ -275,6 +298,9 @@ class GiveawayBot(commands.Bot):
         try:
             fresh = await asyncio.to_thread(self.service.get, giveaway_id)
         except ServiceError:
+            return
+        except Exception:
+            log.exception("post-join refresh lookup failed for %s", giveaway_id)
             return
         await self._grant_entrants_role(fresh, member)
         await self._refresh_embed(fresh)
