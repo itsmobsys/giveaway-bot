@@ -5,8 +5,7 @@ Simple standalone Discord giveaway bot. MIT licensed.
 ```
 .
 ├── bot/            Python Discord bot (discord.py), Turso-backed
-├── api/            Vercel Node.js functions (live + previous giveaways)
-├── public/         Dashboard website (static, no framework)
+├── dashboard/      Website + Vercel Node.js API (live + previous giveaways)
 ├── app.py          Root entry point for panels that start a file
 ├── requirements.txt  Bot dependencies
 ├── render.yaml     Render blueprint: bot web service
@@ -61,12 +60,13 @@ Behaviour notes:
 Local preview (no Turso credentials needed — the API is mocked):
 
 ```bash
+cd dashboard
 npm i
 node serve.js      # http://localhost:4321
 node smoke.js      # helper + card-shape tests
 ```
 
-Deploy: import the repo on Vercel with **Root Directory empty (repo root)**,
+Deploy: import the repo on Vercel with **Root Directory = `dashboard`**,
 set env vars `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN` (same as the bot), deploy.
 
 ## Quick start
