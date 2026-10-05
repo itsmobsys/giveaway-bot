@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_GIVEAWAYS} (
   required_role_id TEXT,
   blocked_role_id TEXT,
   min_account_age_days INTEGER NOT NULL DEFAULT 0,
+  min_messages INTEGER NOT NULL DEFAULT 0,
+  image_url TEXT,
   created_by TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   ended_at INTEGER,
@@ -88,6 +90,34 @@ class Database:
         conn = self._conn()
         for stmt in [s.strip() for s in SCHEMA.split(";") if s.strip()]:
             conn.execute(stmt)
+        # Columns added after the v2 launch (image_url, min_messages). The
+        # table already exists on live databases, so add what's missing.
+        self._ensure_columns(
+            TABLE_GIVEAWAYS,
+            {"min_messages": "INTEGER NOT NULL DEFAULT 0", "image_url": "TEXT"},
+        )
+        self._ensure_columns(
+            TABLE_ENTRIES,
+            {"username": "TEXT NOT NULL DEFAULT ''", "entered_at": "INTEGER NOT NULL DEFAULT 0"},
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS simple_message_counts (
+  guild_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (guild_id, user_id)
+)"""
+        )
+
+    def _ensure_columns(self, table: str, desired: dict[str, str]) -> None:
+        try:
+            rows = self.query(f"PRAGMA table_info({table})")
+        except Exception:
+            return
+        existing = {str(r.get("name")) for r in rows}
+        for name, ddl in desired.items():
+            if name not in existing:
+                self.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> Any:
         return self._conn().execute(sql, tuple(params))

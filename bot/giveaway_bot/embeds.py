@@ -15,6 +15,8 @@ def _req_lines(gw: Giveaway) -> str:
         lines.append(f"• <@&{gw.blocked_role_id}> cannot enter")
     if gw.min_account_age_days > 0:
         lines.append(f"• Account {gw.min_account_age_days}+ days old")
+    if gw.min_messages > 0:
+        lines.append(f"• Send {gw.min_messages}+ messages in this server")
     return "\n".join(lines)
 
 
@@ -30,6 +32,8 @@ def giveaway_embed(gw: Giveaway, entries: int, color: int) -> discord.Embed:
         desc += f"\n**Requirements**\n{reqs}\n"
     desc += "\nClick **Join** to enter, **Leave** to withdraw."
     embed = discord.Embed(title="🎉 Giveaway", description=desc, colour=color)
+    if gw.image_url:
+        embed.set_image(url=gw.image_url)
     embed.set_footer(text=f"ID: {gw.id}")
     return embed
 

@@ -108,57 +108,110 @@ class GiveawayBot(commands.Bot):
         except discord.HTTPException:
             return
         try:
+            count = await asyncio.to_thread(self.service.entry_count, gw.id)
             await message.edit(
-                embed=embeds.giveaway_embed(gw, self.service.entry_count(gw.id), self.settings.embed_color),
+                embed=embeds.giveaway_embed(gw, count, self.settings.embed_color),
                 view=self._register_view(gw.id),
             )
         except discord.HTTPException:
             pass
 
+    # -- message counting (min-messages requirement) ----------------------
+    async def on_message(self, message: discord.Message) -> None:
+        if message.guild is None or message.author.bot or not message.guild:
+            return
+        gid, uid = str(message.guild.id), str(message.author.id)
+        asyncio.get_running_loop().run_in_executor(None, self.service.record_message, gid, uid)
+
     # -- button handlers ------------------------------------------------
+    async def _safe_defer(self, interaction: discord.Interaction) -> bool:
+        """Ack first, before any DB work. Returns False if the token is dead."""
+        try:
+            if interaction.response.is_done():
+                return True
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            return True
+        except (discord.NotFound, discord.HTTPException):
+            return False
+
     async def handle_join(self, interaction: discord.Interaction, giveaway_id: str) -> None:
-        try:
-            gw = self.service.get(giveaway_id)
-        except ServiceError:
-            await interaction.response.send_message("Giveaway not found.", ephemeral=True)
-            return
         if interaction.guild is None or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Use this button inside the server.", ephemeral=True)
+            try:
+                await interaction.response.send_message(
+                    "Use this button inside the server.", ephemeral=True
+                )
+            except (discord.NotFound, discord.HTTPException):
+                pass
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        roles, created_ts = self._member_info(interaction.user)
+        if not await self._safe_defer(interaction):
+            return
+        member = interaction.user
+        roles, created_ts = self._member_info(member)
+        uid, name = str(member.id), member.display_name
         try:
-            count = self.service.join(
+            gw = await asyncio.to_thread(self.service.get, giveaway_id)
+        except ServiceError:
+            await self._safe_followup(interaction, "Giveaway not found.")
+            return
+        try:
+            count = await asyncio.to_thread(
+                self.service.join,
                 gw,
-                user_id=str(interaction.user.id),
-                username=interaction.user.display_name,
+                user_id=uid,
+                username=name,
                 member_roles=roles,
                 account_created_ts=created_ts,
             )
         except ServiceError as exc:
-            await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
+            await self._safe_followup(interaction, f"⚠️ {exc.message}")
             return
-        await interaction.followup.send(f"🎟️ You're in! Entry #{count}.", ephemeral=True)
-        await self._refresh_embed(self.service.get(giveaway_id))
+        except Exception:
+            log.exception("join failed for %s", giveaway_id)
+            await self._safe_followup(interaction, "⚠️ Could not enter you. Try again.")
+            return
+        await self._safe_followup(interaction, f"🎟️ You're in! Entry #{count}.")
+        try:
+            fresh = await asyncio.to_thread(self.service.get, giveaway_id)
+        except ServiceError:
+            return
+        await self._refresh_embed(fresh)
+
+    async def _safe_followup(self, interaction: discord.Interaction, text: str) -> None:
+        try:
+            await interaction.followup.send(text, ephemeral=True)
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
     async def handle_leave(self, interaction: discord.Interaction, giveaway_id: str) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        removed = self.service.leave(giveaway_id, str(interaction.user.id))
-        await interaction.followup.send(
-            "You left the giveaway." if removed else "You were not entered.", ephemeral=True
+        if not await self._safe_defer(interaction):
+            return
+        removed = await asyncio.to_thread(
+            self.service.leave, giveaway_id, str(interaction.user.id)
+        )
+        await self._safe_followup(
+            interaction, "You left the giveaway." if removed else "You were not entered."
         )
         try:
-            await self._refresh_embed(self.service.get(giveaway_id))
+            fresh = await asyncio.to_thread(self.service.get, giveaway_id)
         except ServiceError:
-            pass
+            return
+        await self._refresh_embed(fresh)
 
     # -- auto-draw timer -------------------------------------------------
     @tasks.loop(seconds=30)
     async def tick(self) -> None:
-        for gw in self.service.due():
+        try:
+            due = await asyncio.to_thread(self.service.due)
+        except Exception:
+            log.exception("due check failed")
+            return
+        for gw in due:
             try:
-                ended, winners = self.service.end(gw.id)
+                ended, winners = await asyncio.to_thread(self.service.end, gw.id)
             except ServiceError:
+                continue
+            except Exception:
+                log.exception("end failed for %s", gw.id)
                 continue
             await self._announce(ended, winners)
 
@@ -202,6 +255,8 @@ def wire_commands(bot: GiveawayBot) -> None:
         required_role="Only this role can enter (optional)",
         blocked_role="This role cannot enter (optional)",
         min_account_age_days="Min Discord account age in days (optional)",
+        min_messages="Min messages sent in this server (optional)",
+        image="Prize photo URL, e.g. a gift-card picture (optional)",
     )
     async def giveaway_create(
         interaction: discord.Interaction,
@@ -211,6 +266,8 @@ def wire_commands(bot: GiveawayBot) -> None:
         required_role: discord.Role | None = None,
         blocked_role: discord.Role | None = None,
         min_account_age_days: int = 0,
+        min_messages: int = 0,
+        image: str | None = None,
     ) -> None:
         if interaction.guild is None or not _can_manage(interaction.user):
             await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
@@ -219,9 +276,13 @@ def wire_commands(bot: GiveawayBot) -> None:
         if channel is None:
             await interaction.response.send_message("No text channel available.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            gw = svc.create(
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        try:
+            gw = await asyncio.to_thread(
+                svc.create,
                 guild_id=str(interaction.guild.id),
                 channel_id=str(channel.id),
                 prize=prize,
@@ -231,46 +292,62 @@ def wire_commands(bot: GiveawayBot) -> None:
                 required_role_id=str(required_role.id) if required_role else None,
                 blocked_role_id=str(blocked_role.id) if blocked_role else None,
                 min_account_age_days=max(0, min_account_age_days),
+                min_messages=max(0, min_messages),
+                image_url=image,
             )
         except ServiceError as exc:
-            await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
+            try:
+                await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            return
+        except Exception:
+            log.exception("create failed")
+            try:
+                await interaction.followup.send("⚠️ Could not create. Try again.", ephemeral=True)
+            except (discord.NotFound, discord.HTTPException):
+                pass
             return
         msg = await channel.send(
             embed=embeds.giveaway_embed(gw, 0, bot.settings.embed_color),
             view=bot._register_view(gw.id),
         )
-        svc.set_message(gw.id, str(msg.id))
-        await interaction.followup.send(f"✅ Giveaway started: {msg.jump_url}", ephemeral=True)
+        await asyncio.to_thread(svc.set_message, gw.id, str(msg.id))
+        await bot._safe_followup(interaction, f"✅ Giveaway started: {msg.jump_url}")
 
     @bot.tree.command(name="giveaway_end", description="End a giveaway now and draw")
     async def giveaway_end(interaction: discord.Interaction, giveaway_id: str) -> None:
         if interaction.guild is None or not _can_manage(interaction.user):
             await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            gw, winners = svc.end(giveaway_id.strip())
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        try:
+            gw, winners = await asyncio.to_thread(svc.end, giveaway_id.strip())
         except ServiceError as exc:
-            await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
+            await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
         await bot._announce(gw, winners)
-        await interaction.followup.send(
-            f"Ended with {len(winners)} winner(s).", ephemeral=True
-        )
+        await bot._safe_followup(interaction, f"Ended with {len(winners)} winner(s).")
 
     @bot.tree.command(name="giveaway_reroll", description="Draw new winner(s)")
     async def giveaway_reroll(interaction: discord.Interaction, giveaway_id: str, count: int = 1) -> None:
         if interaction.guild is None or not _can_manage(interaction.user):
             await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            gw, fresh = svc.reroll(giveaway_id.strip(), max(1, count))
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        try:
+            gw, fresh = await asyncio.to_thread(svc.reroll, giveaway_id.strip(), max(1, count))
         except ServiceError as exc:
-            await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
+            await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
         await bot._announce(gw, fresh)
-        await interaction.followup.send("🔁 Rerolled.", ephemeral=True)
+        await bot._safe_followup(interaction, "🔁 Rerolled.")
 
     @bot.tree.command(name="giveaway_cancel", description="Cancel an active giveaway")
     async def giveaway_cancel(interaction: discord.Interaction, giveaway_id: str) -> None:
@@ -278,7 +355,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
             return
         try:
-            svc.cancel(giveaway_id.strip())
+            await asyncio.to_thread(svc.cancel, giveaway_id.strip())
         except ServiceError as exc:
             await interaction.response.send_message(f"⚠️ {exc.message}", ephemeral=True)
             return
@@ -289,15 +366,19 @@ def wire_commands(bot: GiveawayBot) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("Use this in a server.", ephemeral=True)
             return
-        active = svc.list_active(str(interaction.guild.id))
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        active = await asyncio.to_thread(svc.list_active, str(interaction.guild.id))
         if not active:
-            await interaction.response.send_message("No active giveaways.", ephemeral=True)
+            await bot._safe_followup(interaction, "No active giveaways.")
             return
         lines = []
         for gw in active[:10]:
-            n = svc.entry_count(gw.id)
+            n = await asyncio.to_thread(svc.entry_count, gw.id)
             lines.append(f"• **{gw.prize}** — {n} entries — `{gw.id}` — <t:{int(gw.ends_at/1000)}:R>")
-        await interaction.response.send_message("\n".join(lines), ephemeral=True)
+        await bot._safe_followup(interaction, "\n".join(lines))
 
 
 async def amain(settings: Settings) -> None:

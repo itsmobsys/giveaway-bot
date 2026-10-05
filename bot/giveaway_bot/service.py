@@ -36,6 +36,8 @@ class Giveaway:
     required_role_id: str | None
     blocked_role_id: str | None
     min_account_age_days: int
+    min_messages: int
+    image_url: str | None
     winners: list[str]
 
     @property
@@ -60,6 +62,8 @@ class Giveaway:
             required_role_id=str(row["required_role_id"]) if row.get("required_role_id") else None,
             blocked_role_id=str(row["blocked_role_id"]) if row.get("blocked_role_id") else None,
             min_account_age_days=int(row.get("min_account_age_days") or 0),
+            min_messages=int(row.get("min_messages") or 0),
+            image_url=str(row["image_url"]) if row.get("image_url") else None,
             winners=[str(w) for w in winners] if isinstance(winners, list) else [],
         )
 
@@ -82,6 +86,8 @@ class GiveawayService:
         required_role_id: str | None = None,
         blocked_role_id: str | None = None,
         min_account_age_days: int = 0,
+        min_messages: int = 0,
+        image_url: str | None = None,
     ) -> Giveaway:
         prize = prize.strip()
         if not prize or len(prize) > 256:
@@ -90,16 +96,22 @@ class GiveawayService:
             raise ServiceError("Winner count must be 1-25.")
         if duration_seconds < 30 or duration_seconds > 60 * 86400:
             raise ServiceError("Duration must be 30 seconds to 60 days.")
+        if min_messages < 0 or min_messages > 100000:
+            raise ServiceError("Minimum messages must be 0-100000.")
+        image_url = (image_url or "").strip() or None
+        if image_url and (len(image_url) > 512 or not image_url.startswith(("http://", "https://"))):
+            raise ServiceError("Image must be an http(s) URL.")
         gid = "gw_" + uuid.uuid4().hex[:12]
         created = now_ms()
         self.db.execute(
             "INSERT INTO simple_giveaways (id, guild_id, channel_id, prize, winner_count, ends_at,"
-            " status, required_role_id, blocked_role_id, min_account_age_days,"
-            " created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)",
+            " status, required_role_id, blocked_role_id, min_account_age_days, min_messages,"
+            " image_url, created_by, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)",
             (
                 gid, guild_id, channel_id, prize, winner_count, created + duration_seconds * 1000,
                 required_role_id or None, blocked_role_id or None, max(0, min_account_age_days),
-                created_by, created,
+                max(0, min_messages), image_url, created_by, created,
             ),
         )
         return self.get(gid)
@@ -142,6 +154,7 @@ class GiveawayService:
         *,
         member_roles: list[str],
         account_created_ts: float | None,
+        user_id: str = "",
     ) -> None:
         if not gw.active:
             raise ServiceError("This giveaway has ended.")
@@ -156,6 +169,26 @@ class GiveawayService:
             age_days = (datetime.now(UTC).timestamp() - account_created_ts) / 86400
             if age_days < gw.min_account_age_days:
                 raise ServiceError(f"Account must be {gw.min_account_age_days}+ days old.")
+        if gw.min_messages > 0:
+            sent = self.message_count(gw.guild_id, user_id)
+            if sent < gw.min_messages:
+                raise ServiceError(
+                    f"You need {gw.min_messages}+ messages in this server ({sent} counted)."
+                )
+
+    def message_count(self, guild_id: str, user_id: str) -> int:
+        row = self.db.query_one(
+            "SELECT count FROM simple_message_counts WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        return int(row["count"]) if row else 0
+
+    def record_message(self, guild_id: str, user_id: str) -> None:
+        self.db.execute(
+            "INSERT INTO simple_message_counts (guild_id, user_id, count) VALUES (?, ?, 1)"
+            " ON CONFLICT (guild_id, user_id) DO UPDATE SET count = count + 1",
+            (guild_id, user_id),
+        )
 
     def join(
         self,
@@ -166,7 +199,10 @@ class GiveawayService:
         member_roles: list[str],
         account_created_ts: float | None,
     ) -> int:
-        self.check_eligible(gw, member_roles=member_roles, account_created_ts=account_created_ts)
+        self.check_eligible(
+            gw, member_roles=member_roles, account_created_ts=account_created_ts,
+            user_id=user_id,
+        )
         try:
             self.db.execute(
                 "INSERT INTO simple_entries (giveaway_id, user_id, username, entered_at)"
