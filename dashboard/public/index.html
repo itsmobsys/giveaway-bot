@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Giveaways</title>
+    <meta name="description" content="Live and recent giveaways: prize, entrants, win chance, and countdown." />
+    <meta name="color-scheme" content="dark light" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=Russo+One&display=swap"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%237c3aed'/%3E%3Cpath d='M9 13h14v10a2 2 0 0 1-2 2H11a2 2 0 0 1-2-2V13Z' fill='%23fff'/%3E%3Cpath d='M9 13h14v3H9zM16 10v5M12 8h8v4h-8z' fill='none' stroke='%23fff' stroke-width='2' stroke-linejoin='round'/%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <div class="glow" aria-hidden="true"></div>
+
+    <header class="top">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 11h18v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-9Z" />
+            <path d="M3 11h18M12 7v15" />
+            <path d="M12 7H8.5A2.5 2.5 0 1 1 11 4.5V7ZM12 7h3.5A2.5 2.5 0 1 0 13 4.5V7Z" />
+          </svg>
+        </span>
+        <div>
+          <h1>Giveaways</h1>
+          <p class="sub">Live draws and recent results</p>
+        </div>
+      </div>
+      <div class="top-right">
+        <span class="status" id="status" data-state="loading" role="status">
+          <i class="dot" aria-hidden="true"></i><span id="status-text">Loading</span>
+        </span>
+        <button class="ghost" id="refresh" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12a9 9 0 1 1-2.64-6.36" />
+            <path d="M21 3v6h-6" />
+          </svg>
+          Refresh
+        </button>
+      </div>
+    </header>
+
+    <main>
+      <section aria-labelledby="live-h">
+        <div class="sec-head">
+          <h2 id="live-h"><span class="pulse" aria-hidden="true"></span> Live now</h2>
+          <span class="count" id="live-count"></span>
+        </div>
+        <div class="grid" id="live-grid"></div>
+        <p class="empty" id="live-empty" hidden>No giveaway running right now. Check back soon.</p>
+      </section>
+
+      <section aria-labelledby="prev-h">
+        <div class="sec-head">
+          <h2 id="prev-h">Previous</h2>
+          <span class="count" id="prev-count"></span>
+        </div>
+        <div class="grid" id="prev-grid"></div>
+        <p class="empty" id="prev-empty" hidden>Nothing here yet — the first giveaway will show up after it ends.</p>
+      </section>
+
+      <p class="err" id="err" hidden role="alert"></p>
+    </main>
+
+    <footer>
+      <span>Entry lists clear 5 hours after a giveaway ends.</span>
+      <span id="updated">—</span>
+    </footer>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
