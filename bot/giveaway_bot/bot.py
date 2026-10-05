@@ -47,6 +47,9 @@ class GiveawayBot(commands.Bot):
         #: Giveaway ids whose entrants-role delete is already scheduled.
         #: Stops end + cancel + tick racing to queue the same role twice.
         self._scheduled_role_deletes: set[str] = set()
+        #: Tick counter; the entry-wipe sweep runs every ~20 ticks so a
+        #: usually-empty DELETE doesn't cost a Turso write on every pass.
+        self._tick_count = 0
 
     # -- lifecycle ------------------------------------------------------
     async def setup_hook(self) -> None:
@@ -483,6 +486,18 @@ class GiveawayBot(commands.Bot):
                 await self._refresh_embed(gw)
             except Exception:
                 log.exception("embed refresh failed for %s", gw.id)
+        # Privacy sweep: join data (who entered) older than 5h past the end
+        # is wiped. Giveaway records + winner lists stay; message counts are
+        # already cleared at end-time.
+        self._tick_count += 1
+        if self._tick_count % 20 == 0:
+            try:
+                wiped = await asyncio.to_thread(self.service.wipe_stale_entries)
+            except Exception:
+                log.exception("entry wipe failed")
+            else:
+                if wiped:
+                    log.info("wiped %d stale entry row(s)", wiped)
 
     @tick.before_loop
     async def _before_tick(self) -> None:

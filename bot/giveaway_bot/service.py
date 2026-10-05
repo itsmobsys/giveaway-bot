@@ -387,6 +387,25 @@ class GiveawayService:
         )
         return [Giveaway.from_row(r) for r in rows]
 
+    #: How long join data (who entered) survives after a giveaway finishes.
+    #: The giveaway record itself (prize, winners, status) is kept; only the
+    #: per-user entry rows are wiped.
+    ENTRY_RETENTION_MS = 5 * 3600 * 1000
+
+    def wipe_stale_entries(self, now: int | None = None) -> int:
+        """Delete entry rows for giveaways finished over 5h ago. Returns count."""
+        cutoff = (now if now is not None else now_ms()) - self.ENTRY_RETENTION_MS
+        cur = self.db.execute(
+            "DELETE FROM simple_entries WHERE giveaway_id IN"
+            " (SELECT id FROM simple_giveaways WHERE status != 'active'"
+            " AND ended_at IS NOT NULL AND ended_at <= ?)",
+            (cutoff,),
+        )
+        try:
+            return int(cur.rowcount or 0)
+        except (TypeError, ValueError):
+            return 0
+
     def due(self, now: int | None = None) -> list[Giveaway]:
         ts = now if now is not None else now_ms()
         rows = self.db.query(
