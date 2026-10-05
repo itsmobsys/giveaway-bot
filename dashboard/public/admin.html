@@ -111,18 +111,20 @@
         </div>
 
         <div class="toolbar">
-          <div class="search">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
-              <circle cx="11" cy="11" r="7" />
-              <path d="m20 20-3.2-3.2" />
-            </svg>
-            <label class="sr-only" for="q">Search by prize or host</label>
-            <input class="input" id="q" type="search" placeholder="Search prize or host…" autocomplete="off" />
-          </div>
-          <div class="chips" role="group" aria-label="Filter by status">
-            <button class="chip" type="button" data-filter="all" aria-pressed="true">All</button>
-            <button class="chip" type="button" data-filter="ended" aria-pressed="false">Ended</button>
-            <button class="chip" type="button" data-filter="cancelled" aria-pressed="false">Cancelled</button>
+          <div class="filters" id="filters">
+            <div class="search">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+                <circle cx="11" cy="11" r="7" />
+                <path d="m20 20-3.2-3.2" />
+              </svg>
+              <label class="sr-only" for="q">Search by prize or host</label>
+              <input class="input" id="q" type="search" placeholder="Search prize or host…" autocomplete="off" />
+            </div>
+            <div class="chips" role="group" aria-label="Filter by status">
+              <button class="chip" type="button" data-filter="all" aria-pressed="true">All</button>
+              <button class="chip" type="button" data-filter="ended" aria-pressed="false">Ended</button>
+              <button class="chip" type="button" data-filter="cancelled" aria-pressed="false">Cancelled</button>
+            </div>
           </div>
           <button class="ghost" id="refresh" type="button">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

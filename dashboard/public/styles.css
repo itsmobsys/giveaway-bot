@@ -546,6 +546,9 @@ footer {
 /* toolbar: search + filter chips */
 .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 16px; }
 
+.filters { display: flex; flex: 1 1 320px; flex-wrap: wrap; gap: 10px; min-width: 0; }
+.filters[hidden] { display: none; }
+
 .search { position: relative; flex: 1 1 240px; min-width: 200px; }
 .search .input { padding-left: 40px; }
 .search svg {
@@ -716,6 +719,7 @@ dialog p { margin: 0 0 20px; color: var(--muted); font-size: .88rem; }
   main { gap: 28px; }
 
   .search { flex-basis: 100%; }
+  .filters { flex-basis: 100%; }
   .row { grid-template-columns: auto auto 1fr; row-gap: 12px; }
   .row-side { grid-column: 1 / -1; justify-content: space-between; }
   .selbar-actions { width: 100%; }

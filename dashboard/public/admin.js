@@ -193,6 +193,8 @@ function render() {
 
   const shown = list.length;
   $("shown-count").textContent = shown ? `${shown} shown` : "";
+  // With nothing to filter, the search box and chips are just clutter.
+  $("filters").hidden = state.items.length === 0;
   $("stat-total").textContent = state.total;
   $("stat-live").textContent = state.live;
   $("stat-entrants").textContent = state.items.reduce((a, g) => a + (Number(g.entrants?.count) || 0), 0);
