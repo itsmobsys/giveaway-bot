@@ -46,6 +46,7 @@ class GiveawayBot(commands.Bot):
         self.add_view(GiveawayView("placeholder"))
         await self.tree.sync()
         log.info("commands synced (%d)", len(self.tree.get_commands()))
+        self.tick.change_interval(seconds=max(5, self.settings.tick_seconds))
         self.tick.start()
 
     async def on_ready(self) -> None:
@@ -298,6 +299,18 @@ class GiveawayBot(commands.Bot):
                 continue
             await self._strip_entrants_role(ended)
             await self._announce(ended, winners)
+        # Live timer: re-render active embeds every tick so the countdown
+        # visibly ticks down (soonest deadline first, capped per tick).
+        try:
+            live = await asyncio.to_thread(self.service.list_all_active, 10)
+        except Exception:
+            log.exception("live list failed")
+            return
+        for gw in live:
+            try:
+                await self._refresh_embed(gw)
+            except Exception:
+                log.exception("embed refresh failed for %s", gw.id)
 
     @tick.before_loop
     async def _before_tick(self) -> None:
@@ -330,6 +343,24 @@ class GiveawayBot(commands.Bot):
 
 def wire_commands(bot: GiveawayBot) -> None:
     svc = bot.service
+
+    async def _gw_autocomplete(
+        interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Suggest running giveaways so ids never need typing."""
+        if interaction.guild is None:
+            return []
+        try:
+            active = await asyncio.to_thread(svc.list_active, str(interaction.guild.id))
+        except Exception:
+            return []
+        needle = (current or "").lower()
+        choices = [
+            app_commands.Choice(name=f"🏆 {gw.prize} ({gw.id})"[:100], value=gw.id)
+            for gw in active
+            if not needle or needle in gw.prize.lower() or needle in gw.id.lower()
+        ]
+        return choices[:25]
 
     @bot.tree.command(name="giveaway_create", description="Start a giveaway")
     @app_commands.describe(
@@ -412,6 +443,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         await bot._safe_followup(interaction, f"✅ Giveaway started: {msg.jump_url}{role_note}")
 
     @bot.tree.command(name="giveaway_end", description="End a giveaway now and draw")
+    @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
     async def giveaway_end(interaction: discord.Interaction, giveaway_id: str) -> None:
         if interaction.guild is None or not _can_manage(interaction.user):
             await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
@@ -421,15 +453,19 @@ def wire_commands(bot: GiveawayBot) -> None:
         except (discord.NotFound, discord.HTTPException):
             return
         try:
-            gw, winners = await asyncio.to_thread(svc.end, giveaway_id.strip())
+            gw = await asyncio.to_thread(
+                svc.resolve, str(interaction.guild.id), giveaway_id
+            )
+            ended, winners = await asyncio.to_thread(svc.end, gw.id)
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
-        await bot._strip_entrants_role(gw)
-        await bot._announce(gw, winners)
+        await bot._strip_entrants_role(ended)
+        await bot._announce(ended, winners)
         await bot._safe_followup(interaction, f"Ended with {len(winners)} winner(s).")
 
     @bot.tree.command(name="giveaway_reroll", description="Draw new winner(s)")
+    @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
     async def giveaway_reroll(interaction: discord.Interaction, giveaway_id: str, count: int = 1) -> None:
         if interaction.guild is None or not _can_manage(interaction.user):
             await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
@@ -439,24 +475,31 @@ def wire_commands(bot: GiveawayBot) -> None:
         except (discord.NotFound, discord.HTTPException):
             return
         try:
-            gw, fresh = await asyncio.to_thread(svc.reroll, giveaway_id.strip(), max(1, count))
+            gw = await asyncio.to_thread(
+                svc.resolve, str(interaction.guild.id), giveaway_id
+            )
+            ended, fresh = await asyncio.to_thread(svc.reroll, gw.id, max(1, count))
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
-        await bot._announce(gw, fresh)
+        await bot._announce(ended, fresh)
         await bot._safe_followup(interaction, "🔁 Rerolled.")
 
     @bot.tree.command(name="giveaway_cancel", description="Cancel an active giveaway")
+    @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
     async def giveaway_cancel(interaction: discord.Interaction, giveaway_id: str) -> None:
         if interaction.guild is None or not _can_manage(interaction.user):
             await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
             return
         try:
-            gw = await asyncio.to_thread(svc.cancel, giveaway_id.strip())
+            gw = await asyncio.to_thread(
+                svc.resolve, str(interaction.guild.id), giveaway_id
+            )
+            ended = await asyncio.to_thread(svc.cancel, gw.id)
         except ServiceError as exc:
             await interaction.response.send_message(f"⚠️ {exc.message}", ephemeral=True)
             return
-        await bot._strip_entrants_role(gw)
+        await bot._strip_entrants_role(ended)
         await interaction.response.send_message("Giveaway cancelled.", ephemeral=True)
 
     @bot.tree.command(name="giveaway_list", description="Show active giveaways")

@@ -136,6 +136,39 @@ class GiveawayService:
         )
         return [Giveaway.from_row(r) for r in rows]
 
+    def list_all_active(self, limit: int = 25) -> list[Giveaway]:
+        """Every active giveaway, soonest deadline first (embed refresher)."""
+        rows = self.db.query(
+            "SELECT * FROM simple_giveaways WHERE status = 'active'"
+            " ORDER BY ends_at ASC LIMIT ?",
+            (max(1, min(limit, 50)),),
+        )
+        return [Giveaway.from_row(r) for r in rows]
+
+    def resolve(self, guild_id: str, raw_id: str) -> Giveaway:
+        """Find a giveaway by id, falling back to the live one.
+
+        Operators keep mistyping ids, so when the id does not match and
+        exactly one giveaway is running in this server, that one is used
+        instead of failing. With zero or several running, a valid id is
+        required (the slash commands suggest them as you type).
+        """
+        raw_id = (raw_id or "").strip()
+        if raw_id:
+            try:
+                return self.get(raw_id)
+            except ServiceError:
+                pass
+        active = self.list_active(guild_id)
+        if len(active) == 1:
+            return active[0]
+        if not active:
+            raise ServiceError("No active giveaway in this server.")
+        raise ServiceError(
+            "That ID did not match. Pick one from the suggestions as you type,"
+            " or copy the ID from /giveaway_list."
+        )
+
     def entry_count(self, giveaway_id: str) -> int:
         row = self.db.query_one(
             "SELECT COUNT(*) AS n FROM simple_entries WHERE giveaway_id = ?", (giveaway_id,)

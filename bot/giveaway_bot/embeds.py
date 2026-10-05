@@ -2,9 +2,24 @@
 
 from __future__ import annotations
 
+import time
+
 import discord
 
 from .service import Giveaway
+
+
+def countdown(ends_at_ms: int) -> str:
+    """Human 'ends in' text, re-rendered every tick so it visibly ticks down."""
+    secs = max(0, int(ends_at_ms / 1000 - time.time()))
+    days, secs = divmod(secs, 86400)
+    hours, secs = divmod(secs, 3600)
+    minutes, secs = divmod(secs, 60)
+    if days:
+        return f"{days}d {hours}h {minutes}m"
+    if hours:
+        return f"{hours}h {minutes}m {secs:02d}s"
+    return f"{minutes}m {secs:02d}s"
 
 
 def _req_lines(gw: Giveaway) -> str:
@@ -24,7 +39,7 @@ def giveaway_embed(gw: Giveaway, entries: int, color: int) -> discord.Embed:
     ends = int(gw.ends_at / 1000)
     desc = (
         f"🏆 **{gw.prize}**\n\n"
-        f"Ends <t:{ends}:R> (<t:{ends}:f>)\n"
+        f"⏳ Ends in **{countdown(gw.ends_at)}** (<t:{ends}:R>)\n"
         f"Winners: **{gw.winner_count}**  •  Entries: **{entries}**\n"
     )
     reqs = _req_lines(gw)
