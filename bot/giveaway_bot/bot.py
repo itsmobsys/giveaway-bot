@@ -799,6 +799,9 @@ async def amain(settings: Settings) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     if not settings.bot_token:
         raise SystemExit("DISCORD_BOT_TOKEN is not set.")
+    from .health import start_health_server
+
+    start_health_server(max(1, settings.port))
     db = Database(settings)
     db.init_schema()
     bot = GiveawayBot(settings, db)
