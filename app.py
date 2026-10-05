@@ -27,10 +27,8 @@ worse than having no shim at all.
 
 Arguments are forwarded, so this doubles as a normal CLI::
 
-    python app.py                 # starts the bot (same as `run`)
-    python app.py migrate
-    python app.py selftest
-    python app.py draw gw_abc123
+    python app.py             # starts the bot (same as `run`)
+    python app.py doctor
 """
 
 from __future__ import annotations

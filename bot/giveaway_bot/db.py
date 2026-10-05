@@ -60,10 +60,9 @@ def _is_write(sql: str) -> bool:
 def _brief(exc: Exception, limit: int = 120) -> str:
     return " ".join(str(exc).split())[:limit]
 
-#: v2 table names. The v1 bot used `giveaways` / `giveaway_entries` with a
-#: different shape (NOT NULL title, status CHECK constraint, ...). Reusing
-#: those names would need a migration of live data; fresh names start clean
-#: and leave the old rows (and the dashboard reading them) untouched.
+#: v2 table names. The original v1 bot used `giveaways` / `giveaway_entries`
+#: with a different shape. Reusing those names would need a migration of live
+#: data; fresh names start clean and leave any old rows untouched.
 TABLE_GIVEAWAYS = "simple_giveaways"
 TABLE_ENTRIES = "simple_entries"
 

@@ -1,35 +1,5 @@
 # Python runtime dependencies for the Discord bot.
-#
-# The bot runs from the root Dockerfile (Render docker worker) or directly on a
-# Python runtime (`pip install -r requirements.txt`, `cd bot && python -m
-# giveaway_bot run`). `bot/pyproject.toml` remains the package
-# definition and holds the dev extras; `selftest` asserts the two agree, so a
-# dependency added there cannot silently go missing from a deploy.
-#
-# These versions are the ones the 49-check suite passes against, pinned exactly
-# so a redeploy cannot quietly pick up a new major. Transitive dependencies are
-# left unpinned.
-
-discord.py==2.7.1
-pydantic==2.13.5
-pydantic-settings==2.15.0
-python-dotenv==1.2.4
-httpx==0.28.1
-tenacity==9.1.4
-
-# Mandatory in production, and deliberately the only ranged entry.
-# db.py imports this lazily the moment TURSO_DATABASE_URL is set and raises at
-# startup if it is missing, so without it the bot only ever works against a
-# local SQLite file. It is an optional extra in pyproject because the suite runs
-# on SQLite with no network, which also means it is not covered by the pinning
-# above and is NOT exercised by `selftest`.
-#
-# 0.1.11 is the newest published release - there is no 0.2.x. The previous
-# `>=0.2.1` specifier resolved to nothing, so a Turso deploy could not install.
-#
-# A Rust extension. libsql 0.1.11 publishes wheels for cp38-cp314, cp314 included
-# on manylinux, so the earlier claim here that "there is no cp314 wheel" was wrong.
-# The image stays on 3.13 (Dockerfile FROM python:3.13-slim) because that is the
-# interpreter the suite is tested against, not because a wheel is missing. Note
-# there is no cp314 wheel for Windows, so 3.14 is a Linux-only option.
+# Installs the same set SillyDev / Render / local dev all use.
+discord.py>=2.4,<3
+python-dotenv>=1.0,<2
 libsql>=0.1.11,<2

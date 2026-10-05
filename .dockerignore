@@ -16,10 +16,6 @@
 *.key
 
 # Dependencies and build output
-node_modules
-dashboard/node_modules
-dashboard/.next
-dashboard/out
 .venv
 venv
 __pycache__
@@ -27,22 +23,16 @@ __pycache__
 *.py[cod]
 *.egg-info
 .ruff_cache
-.mypy_cache
-.pytest_cache
-next-env.d.ts
-*.tsbuildinfo
 
 # Local data
 data
 bot/data
-dashboard/data
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
 
 # Not needed to run the bot
-dashboard/
 docs/
 README.md
 LICENSE
