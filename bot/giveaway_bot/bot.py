@@ -454,6 +454,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         blocked_role="This role cannot enter (optional)",
         min_account_age_days="Min Discord account age in days (optional)",
         min_messages="Min messages sent in this server (optional)",
+        host="The hoster shown on the embed — e.g. the prize giver (defaults to you)",
         image="Prize photo URL, e.g. a gift-card picture (optional)",
     )
     async def giveaway_create(
@@ -467,6 +468,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         blocked_role: discord.Role | None = None,
         min_account_age_days: int = 0,
         min_messages: int = 0,
+        host: discord.Member | None = None,
         image: str | None = None,
     ) -> None:
         if interaction.guild is None or not _can_manage(interaction.user):
@@ -496,8 +498,8 @@ def wire_commands(bot: GiveawayBot) -> None:
                 min_account_age_days=max(0, min_account_age_days),
                 min_messages=max(0, min_messages),
                 image_url=image,
-                host_id=str(interaction.user.id),
-                host_name=interaction.user.display_name,
+                host_id=str(host.id) if host is not None else str(interaction.user.id),
+                host_name=host.display_name if host is not None else interaction.user.display_name,
             )
         except ServiceError as exc:
             try:
