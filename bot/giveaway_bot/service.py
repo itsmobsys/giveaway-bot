@@ -93,7 +93,7 @@ class GiveawayService:
         gid = "gw_" + uuid.uuid4().hex[:12]
         created = now_ms()
         self.db.execute(
-            "INSERT INTO giveaways (id, guild_id, channel_id, prize, winner_count, ends_at,"
+            "INSERT INTO simple_giveaways (id, guild_id, channel_id, prize, winner_count, ends_at,"
             " status, required_role_id, blocked_role_id, min_account_age_days,"
             " created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)",
             (
@@ -106,29 +106,32 @@ class GiveawayService:
 
     # -- read -----------------------------------------------------------
     def get(self, giveaway_id: str) -> Giveaway:
-        row = self.db.query_one("SELECT * FROM giveaways WHERE id = ?", (giveaway_id,))
+        row = self.db.query_one("SELECT * FROM simple_giveaways WHERE id = ?", (giveaway_id,))
         if row is None:
             raise ServiceError("Giveaway not found.")
         return Giveaway.from_row(row)
 
     def get_by_message(self, message_id: str) -> Giveaway | None:
-        row = self.db.query_one("SELECT * FROM giveaways WHERE message_id = ?", (message_id,))
+        row = self.db.query_one("SELECT * FROM simple_giveaways WHERE message_id = ?", (message_id,))
         return Giveaway.from_row(row) if row else None
 
     def list_active(self, guild_id: str) -> list[Giveaway]:
         rows = self.db.query(
-            "SELECT * FROM giveaways WHERE guild_id = ? AND status = 'active' ORDER BY ends_at ASC",
+            "SELECT * FROM simple_giveaways WHERE guild_id = ? AND status = 'active' ORDER BY ends_at ASC",
             (guild_id,),
         )
         return [Giveaway.from_row(r) for r in rows]
 
     def entry_count(self, giveaway_id: str) -> int:
-        row = self.db.query_one("SELECT COUNT(*) AS n FROM entries WHERE giveaway_id = ?", (giveaway_id,))
+        row = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM simple_entries WHERE giveaway_id = ?", (giveaway_id,)
+        )
         return int(row["n"]) if row else 0
 
     def entries(self, giveaway_id: str) -> list[dict]:
         return self.db.query(
-            "SELECT user_id, username, entered_at FROM entries WHERE giveaway_id = ? ORDER BY entered_at ASC",
+            "SELECT user_id, username, entered_at FROM simple_entries"
+            " WHERE giveaway_id = ? ORDER BY entered_at ASC",
             (giveaway_id,),
         )
 
@@ -166,7 +169,7 @@ class GiveawayService:
         self.check_eligible(gw, member_roles=member_roles, account_created_ts=account_created_ts)
         try:
             self.db.execute(
-                "INSERT INTO entries (giveaway_id, user_id, username, entered_at)"
+                "INSERT INTO simple_entries (giveaway_id, user_id, username, entered_at)"
                 " VALUES (?, ?, ?, ?)",
                 (gw.id, user_id, username[:64], now_ms()),
             )
@@ -179,7 +182,7 @@ class GiveawayService:
 
     def leave(self, giveaway_id: str, user_id: str) -> bool:
         cur = self.db.execute(
-            "DELETE FROM entries WHERE giveaway_id = ? AND user_id = ?", (giveaway_id, user_id)
+            "DELETE FROM simple_entries WHERE giveaway_id = ? AND user_id = ?", (giveaway_id, user_id)
         )
         try:
             return (cur.rowcount or 0) > 0
@@ -201,7 +204,7 @@ class GiveawayService:
             return gw, list(gw.winners)
         winners = self._pick(gw.id, gw.winner_count)
         self.db.execute(
-            "UPDATE giveaways SET status = 'ended', ended_at = ?, winners_json = ? WHERE id = ?",
+            "UPDATE simple_giveaways SET status = 'ended', ended_at = ?, winners_json = ? WHERE id = ?",
             (now_ms(), json.dumps(winners), gw.id),
         )
         return self.get(gw.id), winners
@@ -216,7 +219,7 @@ class GiveawayService:
             fresh = self._pick(gw.id, count or gw.winner_count)
         combined = prev + [w for w in fresh if w not in prev]
         self.db.execute(
-            "UPDATE giveaways SET winners_json = ? WHERE id = ?", (json.dumps(combined), gw.id)
+            "UPDATE simple_giveaways SET winners_json = ? WHERE id = ?", (json.dumps(combined), gw.id)
         )
         return self.get(gw.id), fresh
 
@@ -225,18 +228,21 @@ class GiveawayService:
         if not gw.active:
             raise ServiceError("Only an active giveaway can be cancelled.")
         self.db.execute(
-            "UPDATE giveaways SET status = 'cancelled', ended_at = ? WHERE id = ?",
+            "UPDATE simple_giveaways SET status = 'cancelled', ended_at = ? WHERE id = ?",
             (now_ms(), gw.id),
         )
         return self.get(gw.id)
 
     def set_message(self, giveaway_id: str, message_id: str) -> None:
-        self.db.execute("UPDATE giveaways SET message_id = ? WHERE id = ?", (message_id, giveaway_id))
+        self.db.execute(
+            "UPDATE simple_giveaways SET message_id = ? WHERE id = ?", (message_id, giveaway_id)
+        )
 
     def due(self, now: int | None = None) -> list[Giveaway]:
         ts = now if now is not None else now_ms()
         rows = self.db.query(
-            "SELECT * FROM giveaways WHERE status = 'active' AND ends_at <= ? ORDER BY ends_at ASC LIMIT 25",
+            "SELECT * FROM simple_giveaways WHERE status = 'active' AND ends_at <= ?"
+            " ORDER BY ends_at ASC LIMIT 25",
             (ts,),
         )
         return [Giveaway.from_row(r) for r in rows]

@@ -10,8 +10,15 @@ from typing import Any
 
 from .config import Settings, get_settings
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS giveaways (
+#: v2 table names. The v1 bot used `giveaways` / `giveaway_entries` with a
+#: different shape (NOT NULL title, status CHECK constraint, ...). Reusing
+#: those names would need a migration of live data; fresh names start clean
+#: and leave the old rows (and the dashboard reading them) untouched.
+TABLE_GIVEAWAYS = "simple_giveaways"
+TABLE_ENTRIES = "simple_entries"
+
+SCHEMA = f"""
+CREATE TABLE IF NOT EXISTS {TABLE_GIVEAWAYS} (
   id TEXT PRIMARY KEY,
   guild_id TEXT NOT NULL,
   channel_id TEXT NOT NULL,
@@ -28,15 +35,15 @@ CREATE TABLE IF NOT EXISTS giveaways (
   ended_at INTEGER,
   winners_json TEXT NOT NULL DEFAULT '[]'
 );
-CREATE TABLE IF NOT EXISTS entries (
+CREATE TABLE IF NOT EXISTS {TABLE_ENTRIES} (
   giveaway_id TEXT NOT NULL,
   user_id TEXT NOT NULL,
   username TEXT NOT NULL DEFAULT '',
   entered_at INTEGER NOT NULL,
   PRIMARY KEY (giveaway_id, user_id)
 );
-CREATE INDEX IF NOT EXISTS idx_giveaways_status_ends ON giveaways(status, ends_at);
-CREATE INDEX IF NOT EXISTS idx_entries_giveaway ON entries(giveaway_id);
+CREATE INDEX IF NOT EXISTS idx_simple_gw_status_ends ON {TABLE_GIVEAWAYS}(status, ends_at);
+CREATE INDEX IF NOT EXISTS idx_simple_entries_giveaway ON {TABLE_ENTRIES}(giveaway_id);
 """
 
 
