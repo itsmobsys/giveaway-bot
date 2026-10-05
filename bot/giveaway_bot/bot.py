@@ -14,7 +14,7 @@ from . import embeds
 from .config import Settings
 from .db import Database
 from .service import Giveaway, GiveawayService, ServiceError
-from .views import GiveawayView
+from .views import GiveawayView, ParticipantsPages
 
 log = logging.getLogger("giveaway_bot")
 _SNOWFLAKE = re.compile(r"^\d{15,25}$")
@@ -70,6 +70,7 @@ class GiveawayBot(commands.Bot):
             view = GiveawayView(giveaway_id)
             view._join_handler = self.handle_join
             view._leave_handler = self.handle_leave
+            view._participants_handler = self.handle_participants
             self._views[giveaway_id] = view
             self.add_view(view)
         return view
@@ -276,6 +277,50 @@ class GiveawayBot(commands.Bot):
     async def _safe_followup(self, interaction: discord.Interaction, text: str) -> None:
         try:
             await interaction.followup.send(text, ephemeral=True)
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+    async def handle_participants(
+        self, interaction: discord.Interaction, giveaway_id: str
+    ) -> None:
+        if not await self._safe_defer(interaction):
+            return
+        try:
+            gw = await asyncio.to_thread(self.service.get, giveaway_id)
+            entrants = await asyncio.to_thread(self.service.entries, gw.id)
+        except ServiceError as exc:
+            await self._safe_followup(interaction, f"⚠️ {exc.message}")
+            return
+        except Exception:
+            log.exception("participants lookup failed for %s", giveaway_id)
+            await self._safe_followup(interaction, "⚠️ Could not load the list. Try again.")
+            return
+        if not entrants:
+            await self._safe_followup(
+                interaction, f"🏆 **{gw.prize}** — no entrants yet."
+            )
+            return
+        mine = 1 if str(interaction.user.id) in {str(r["user_id"]) for r in entrants} else 0
+        total = len(entrants)
+        pages = max(1, (total + 9) // 10)
+        color = self.settings.embed_color
+
+        def render(page: int) -> discord.Embed:
+            start = page * 10
+            return embeds.participants_embed(
+                prize=gw.prize,
+                rows=entrants[start : start + 10],
+                page=page,
+                pages=pages,
+                total=total,
+                mine=mine,
+                winner_count=gw.winner_count,
+                color=color,
+            )
+
+        view = ParticipantsPages(render=render, pages=pages)
+        try:
+            await interaction.followup.send(embed=render(0), view=view, ephemeral=True)
         except (discord.NotFound, discord.HTTPException):
             pass
 

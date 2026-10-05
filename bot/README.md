@@ -1,6 +1,6 @@
 # Giveaway bot (Python) — simple standalone v2
 
-No dashboard. Just Discord slash commands + Join/Leave buttons + auto-draw timer.
+No dashboard. Just Discord slash commands + Join/Leave/Participants buttons + auto-draw timer.
 Storage is **Turso only** — there is intentionally no local/SQLite fallback, so
 a redeploy or restart can never wipe giveaways, entries, or settings.
 
@@ -56,7 +56,9 @@ it lacks the permission the giveaway still runs, just without the role.
 - `/giveaway_cancel giveaway_id` — same suggestions + fallback
 
 The embed shows a live **⏳ Ends in ...** countdown, re-rendered every tick
-(`TICK_SECONDS`, default 30).
+(`TICK_SECONDS`, default 30). The **👥 Participants** button opens a paged
+entrant list (10 per page, ◀ Previous | page | Next ▶) with totals and your
+personal odds. The prize photo is shown on both the giveaway and winner messages.
 
 ## Layout
 

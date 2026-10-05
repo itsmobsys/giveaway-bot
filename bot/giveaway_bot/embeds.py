@@ -57,6 +57,30 @@ def giveaway_embed(gw: Giveaway, entries: int, color: int) -> discord.Embed:
     return embed
 
 
+def participants_embed(
+    *,
+    prize: str,
+    rows: list[dict],
+    page: int,
+    pages: int,
+    total: int,
+    mine: int,
+    winner_count: int,
+    color: int,
+) -> discord.Embed:
+    lines = [f"<@{row['user_id']}> (1 entry)" for row in rows]
+    chance = (winner_count / total * 100) if mine and total else 0.0
+    desc = (
+        f"These are the members that have participated in the giveaway of {prize}:\n\n"
+        + "\n".join(lines)
+        + f"\n\nTotal Participants: {total}\nTotal Entries: {total}"
+        + f"\n\nYour Entries: {mine}\nYour Chance of Winning: {chance:g}%"
+    )
+    return discord.Embed(
+        title=f"👥 Participants — page {page + 1}/{pages}", description=desc, colour=color
+    )
+
+
 def winner_embed(gw: Giveaway, winners: list[str], entries: int, color: int) -> discord.Embed:
     if winners:
         mentions = ", ".join(f"<@{w}>" for w in winners)
