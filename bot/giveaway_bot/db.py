@@ -37,6 +37,8 @@ Migration = tuple[str, str]  # (filename, sql)
 #: driver raises a bare ``ValueError`` and exports no exception hierarchy to match.
 _DEAD_CONNECTION_MARKERS = (
     "stream not found",
+    "stream was idle for too long",
+    "no transaction is active",
     "connection closed",
     "channel closed",
     "not connected",
@@ -397,7 +399,25 @@ class Database:
             # BEGIN IMMEDIATE takes the write lock up front so two writers cannot
             # both read-then-write; busy_timeout (set on connect) is what makes
             # that wait instead of failing.
-            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+            except Exception as exc:  # noqa: BLE001 - inspected, then re-raised
+                # Turso drops an idle Hrana stream server-side ("stream was idle
+                # for too long", "stream not found"). The next BEGIN on that
+                # stream then fails even though the connection object looks fine.
+                # Nothing was applied, so retiring and retrying once on a fresh
+                # stream is safe; anything else propagates.
+                if _is_dead_connection(str(exc).lower()):
+                    log.warning(
+                        "database stream died before BEGIN (%s); reconnecting once",
+                        _brief(exc),
+                    )
+                    self._retire(conn, f"dead stream at BEGIN: {_brief(exc)}", broken=True)
+                    conn = self.connection()
+                    state = self._tx_state(conn)
+                    conn.execute("BEGIN IMMEDIATE")
+                else:
+                    raise
         else:
             conn.execute(f'SAVEPOINT "{savepoint}"')
 
@@ -407,18 +427,27 @@ class Database:
         except BaseException:
             self._close_out(conn, state, depth=depth, savepoint=savepoint, commit=False)
             raise
-        self._close_out(conn, state, depth=depth, savepoint=savepoint, commit=True)
+        if not self._close_out(conn, state, depth=depth, savepoint=savepoint, commit=True):
+            # A failed COMMIT means the server discarded the whole transaction
+            # (Turso rolls back idle interactive transactions), so reporting
+            # success would lie: join() would say "you're in" with no row saved.
+            # Raising lets the caller answer "try again", and the retry is safe
+            # because nothing from this block was applied.
+            raise RuntimeError("database commit failed; retry the operation")
 
     def _close_out(
         self, conn: Any, state: _TxState, *, depth: int, savepoint: str, commit: bool
-    ) -> None:
+    ) -> bool:
         """COMMIT or ROLLBACK, and restore the nesting depth.
 
-        Deliberately never raises. A COMMIT or ROLLBACK that fails leaves the
-        connection in a state nobody can reason about, so it is retired and the
-        failure logged at ERROR. Raising from here would replace the exception
-        the caller was already propagating, and that one is the one worth
-        reading.
+        Returns True when the close-out succeeded. A COMMIT that fails leaves
+        the connection in a state nobody can reason about, so it is retired and
+        the failure logged at ERROR, and False is returned so the caller can
+        raise instead of reporting uncommitted work as done. A failed ROLLBACK
+        only means "nothing was applied", which is already the safe state, so it
+        stays silent. Never raises: raising from here on the exception path
+        would replace the exception the caller was already propagating, and that
+        one is the one worth reading.
         """
         if state.retired:
             # The connection was already closed - by close(), close_all(), or an
@@ -430,7 +459,13 @@ class Database:
                 "not closing out a transaction: its connection was already retired (depth %d)", depth
             )
             state.depth = depth
-            return
+            if commit:
+                # The transaction never reached COMMIT on any live connection:
+                # either the connection died mid-block (later statements ran
+                # unprotected on a replacement) or it was closed outright. The
+                # caller must hear about it instead of assuming atomicity.
+                log.error("transaction lost its connection before COMMIT; reporting failure")
+            return not commit
 
         verb = "commit" if commit else "roll back"
         try:
@@ -444,8 +479,10 @@ class Database:
         except Exception:  # noqa: BLE001 - reported and the connection retired
             log.error("could not %s the database transaction", verb, exc_info=True)
             self._retire(conn, f"could not {verb} its transaction", broken=True)
+            return not commit
         finally:
             state.depth = depth
+        return True
 
     # -------------------------------------------------------------- migrations
     def pending_migrations(self) -> list[Migration]:

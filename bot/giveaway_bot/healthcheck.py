@@ -60,7 +60,10 @@ class DashboardHealth:
         except Exception as exc:  # noqa: BLE001 - any failure means unreachable
             self.consecutive_failures += 1
             if self.consecutive_failures == 1:
-                log.warning("dashboard health check failed: %s", exc)
+                # Some transport errors stringify to "" (connect timeouts,
+                # SSL EOF), which logged as "failed: " and hid the cause.
+                detail = str(exc).strip() or repr(exc)
+                log.warning("dashboard health check failed (%s): %s", type(exc).__name__, detail)
             return False
 
         if self.consecutive_failures:
