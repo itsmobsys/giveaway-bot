@@ -543,42 +543,42 @@ class GiveawayService:
                             "entry_limit_reached",
                             "This giveaway has reached its entry limit.",
                         )
-            if role_id:
-                # Journal the grant. The Discord call happens in the bot layer and
-                # is retried from this queue, so neither a Discord failure nor a
-                # crash can silently lose the role for a member who entered.
-                control.role_task(
-                    tx,
-                    giveaway_id=giveaway.id,
-                    user_id=user_id,
-                    role_id=role_id,
-                    action="add",
-                    status="pending",
-                )
+                if role_id:
+                    # Journal the grant. The Discord call happens in the bot layer and
+                    # is retried from this queue, so neither a Discord failure nor a
+                    # crash can silently lose the role for a member who entered.
+                    control.role_task(
+                        tx,
+                        giveaway_id=giveaway.id,
+                        user_id=user_id,
+                        role_id=role_id,
+                        action="add",
+                        status="pending",
+                    )
 
-            gw_repo.refresh_stats(tx, giveaway.id)
-            fresh_totals = entries_repo.active_entry_totals(tx, giveaway.id)
-            control.audit(
-                tx,
-                guild_id=giveaway.guild_id,
-                giveaway_id=giveaway.id,
-                action="entry.joined",
-                actor_id=user_id,
-                actor_name=member.get("username"),
-                source="discord",
-                target_id=user_id,
-                after={"entry_seq": next_seq, "entry_id": entry_id},
-            )
-            control.emit(
-                tx,
-                guild_id=giveaway.guild_id,
-                giveaway_id=giveaway.id,
-                event_type="entry.joined",
-                payload={
-                    "entry_count": fresh_totals[0],
-                    "participant_count": fresh_totals[1],
-                },
-            )
+                gw_repo.refresh_stats(tx, giveaway.id)
+                fresh_totals = entries_repo.active_entry_totals(tx, giveaway.id)
+                control.audit(
+                    tx,
+                    guild_id=giveaway.guild_id,
+                    giveaway_id=giveaway.id,
+                    action="entry.joined",
+                    actor_id=user_id,
+                    actor_name=member.get("username"),
+                    source="discord",
+                    target_id=user_id,
+                    after={"entry_seq": next_seq, "entry_id": entry_id},
+                )
+                control.emit(
+                    tx,
+                    guild_id=giveaway.guild_id,
+                    giveaway_id=giveaway.id,
+                    event_type="entry.joined",
+                    payload={
+                        "entry_count": fresh_totals[0],
+                        "participant_count": fresh_totals[1],
+                    },
+                )
         except ServiceError as exc:
             # Only the in-transaction cap re-checks raise these; anything else
             # is a genuine error and propagates. The insert was rolled back,

@@ -243,7 +243,13 @@ class GiveawayBot(commands.Bot):
             ),
             colour=0xEF4444,
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            else:
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+        except (discord.NotFound, discord.HTTPException):
+            log.info("interaction %s expired during permission check", interaction.id)
         return False
 
     def actor_for(self, user: discord.abc.GuildUser, *, source: str = "discord") -> Actor:
@@ -424,27 +430,84 @@ class GiveawayBot(commands.Bot):
     async def _on_leave(self, interaction: discord.Interaction, giveaway_id: str) -> None:
         await self._handle_entry(interaction, giveaway_id, join=False)
 
+    async def _defer_interaction(self, interaction: discord.Interaction) -> bool:
+        """Acknowledge an interaction, tolerating an already-dead token.
+
+        Discord requires the first response within ~3s; if the gateway just
+        reconnected or the loop was busy, the token may already be gone
+        (404/10062 Unknown interaction). That is not a bug in the handler —
+        there is simply nobody left to answer — so swallow it and return
+        False instead of crashing into the view error handler.
+        """
+        try:
+            if interaction.response.is_done():
+                return True
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            return True
+        except discord.NotFound:
+            log.info("interaction %s expired before defer; ignoring", interaction.id)
+            return False
+        except discord.HTTPException as exc:
+            log.warning("could not defer interaction %s: %s", interaction.id, exc)
+            return False
+
+    async def _reply(
+        self, interaction: discord.Interaction, *args: object, **kwargs: object
+    ) -> bool:
+        """Best-effort followup send. Returns False when the token is dead."""
+        try:
+            await interaction.followup.send(*args, **kwargs)  # type: ignore[arg-type]
+            return True
+        except discord.NotFound:
+            log.info("interaction %s expired before reply; ignoring", interaction.id)
+            return False
+        except discord.HTTPException as exc:
+            log.warning("could not reply to interaction %s: %s", interaction.id, exc)
+            return False
+
     async def _handle_entry(self, interaction: discord.Interaction, giveaway_id: str, *, join: bool) -> None:
         user = interaction.user
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("This button only works inside a server.", ephemeral=True)
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(
+                        "This button only works inside a server.", ephemeral=True
+                    )
+            except (discord.NotFound, discord.HTTPException):
+                log.info("interaction %s expired before guild check", interaction.id)
             return
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not await self._defer_interaction(interaction):
+            return
 
         giveaway = await asyncio.to_thread(gw_repo.get_giveaway, self.db, giveaway_id)
         if giveaway is None:
-            await interaction.followup.send("This giveaway no longer exists.", ephemeral=True)
+            await self._reply(interaction, "This giveaway no longer exists.", ephemeral=True)
             return
 
         channel = interaction.channel
-        member = guild.get_member(user.id) or user
+        # interaction.member is the authoritative member for this click. Falling
+        # back to guild.get_member() needs the members cache (privileged members
+        # intent); falling back to the bare user marks is_member=False and every
+        # default giveaway (entrants_require_membership=True) then refuses with
+        # "You must be a member of this server".
+        member = interaction.member or guild.get_member(user.id) or user
         context = views.member_context(member, guild)
         context["channel_id"] = str(channel.id) if channel else giveaway.channel_id
 
         if join:
-            outcome = await asyncio.to_thread(self.service.join, giveaway, context)
+            try:
+                outcome = await asyncio.to_thread(self.service.join, giveaway, context)
+            except ServiceError as exc:
+                await self._reply(interaction, f"⚠️ {exc.message}", ephemeral=True)
+                return
+            except Exception:  # noqa: BLE001 - never leave a deferred interaction hanging
+                log.exception("join failed for giveaway %s", giveaway_id)
+                await self._reply(
+                    interaction, "⚠️ Could not enter you right now. Try again.", ephemeral=True
+                )
+                return
             if not outcome.joined:
                 embed = views.eligibility_embed(outcome.eligibility)
                 if outcome.duplicate:
@@ -453,7 +516,7 @@ class GiveawayBot(commands.Bot):
                         colour=0xF59E0B,
                     )
                 if embed is not None:
-                    await interaction.followup.send(embed=embed, ephemeral=True)
+                    await self._reply(interaction, embed=embed, ephemeral=True)
                 await self._sync_live_embed(giveaway_id)
                 return
 
@@ -469,7 +532,8 @@ class GiveawayBot(commands.Bot):
                 except Exception:  # noqa: BLE001
                     log.exception("failed to grant the entrants role to %s", user.id)
 
-            await interaction.followup.send(
+            await self._reply(
+                interaction,
                 embed=views.joined_embed(
                     fresh,
                     entry_seq=outcome.entry_seq or 1,
@@ -482,10 +546,16 @@ class GiveawayBot(commands.Bot):
             try:
                 removed = await asyncio.to_thread(self.service.leave, giveaway, str(user.id))
             except ServiceError as exc:
-                await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
+                await self._reply(interaction, f"⚠️ {exc.message}", ephemeral=True)
+                return
+            except Exception:  # noqa: BLE001
+                log.exception("leave failed for giveaway %s", giveaway_id)
+                await self._reply(
+                    interaction, "⚠️ Could not leave right now. Try again.", ephemeral=True
+                )
                 return
             if not removed:
-                await interaction.followup.send("You were not entered in this giveaway.", ephemeral=True)
+                await self._reply(interaction, "You were not entered in this giveaway.", ephemeral=True)
                 return
             fresh = await asyncio.to_thread(self.service.get, giveaway_id)
             view = self._giveaway_view(fresh)
@@ -497,7 +567,7 @@ class GiveawayBot(commands.Bot):
                     await self.roles.drain(fresh.guild_id, limit=50)
                 except Exception:  # noqa: BLE001
                     log.exception("failed to release the entrants role for %s", user.id)
-            await interaction.followup.send(embed=views.left_embed(fresh), ephemeral=True)
+            await self._reply(interaction, embed=views.left_embed(fresh), ephemeral=True)
 
         await self._sync_live_embed(giveaway_id)
 
@@ -505,7 +575,8 @@ class GiveawayBot(commands.Bot):
         """Reroll button - visible to everyone, executed only for Manage Server."""
         if not await self._assert_manage(interaction):
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not await self._defer_interaction(interaction):
+            return
         # service.reroll() takes a Giveaway and reads giveaway.is_locked. It used
         # to be handed the id string instead, so every click raised AttributeError
         # - which `except ServiceError` does not catch - leaving the interaction
@@ -513,16 +584,21 @@ class GiveawayBot(commands.Bot):
         # test_lifecycle calls service.reroll directly, never through the button.
         record = await asyncio.to_thread(gw_repo.get_giveaway, self.db, giveaway_id)
         if record is None:
-            await interaction.followup.send("⚠️ Giveaway not found.", ephemeral=True)
+            await self._reply(interaction, "⚠️ Giveaway not found.", ephemeral=True)
             return
         try:
             outcome = await asyncio.to_thread(
                 self.service.reroll, self.actor_for(interaction.user), record
             )
         except ServiceError as exc:
-            await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
+            await self._reply(interaction, f"⚠️ {exc.message}", ephemeral=True)
             return
-        await interaction.followup.send(
+        except Exception:  # noqa: BLE001
+            log.exception("reroll failed for giveaway %s", giveaway_id)
+            await self._reply(interaction, "⚠️ Reroll failed. Try again.", ephemeral=True)
+            return
+        await self._reply(
+            interaction,
             f"🔁 Reroll complete — round {outcome.result.round_number}. "
             f"Winner(s): {', '.join('<@' + winner['user_id'] + '>' for winner in outcome.winners) or 'none'}",
             ephemeral=True,

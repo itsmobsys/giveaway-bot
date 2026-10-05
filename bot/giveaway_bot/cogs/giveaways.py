@@ -16,6 +16,7 @@ Command surface:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 from typing import Any
@@ -205,44 +206,75 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
     @giveawaway.command(name="join", description="Enter a giveaway with a command")
     @app_commands.describe(giveaway="Giveaway ID from the message footer")
     async def join(self, interaction: discord.Interaction, giveaway: str) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
         if interaction.guild is None:
-            await interaction.followup.send("⚠️ Use this command in a server, not in DMs.", ephemeral=True)
+            with contextlib.suppress(discord.NotFound, discord.HTTPException):
+                await interaction.followup.send("⚠️ Use this command in a server, not in DMs.", ephemeral=True)
             return
         record = await self._find_giveaway(str(interaction.guild_id), giveaway)
         if record is None:
-            await interaction.followup.send("⚠️ Giveaway not found.", ephemeral=True)
+            with contextlib.suppress(discord.NotFound, discord.HTTPException):
+                await interaction.followup.send("⚠️ Giveaway not found.", ephemeral=True)
             return
         from ..views import member_context
 
-        context = member_context(interaction.user, interaction.guild)
+        member = interaction.member or interaction.user
+        context = member_context(member, interaction.guild)
         context["channel_id"] = str(interaction.channel_id)
-        outcome = await asyncio.to_thread(self.bot.service.join, record, context)
+        try:
+            outcome = await asyncio.to_thread(self.bot.service.join, record, context)
+        except ServiceError as exc:
+            with contextlib.suppress(discord.NotFound, discord.HTTPException):
+                await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
+            return
+        except Exception:  # noqa: BLE001
+            log.exception("slash join failed")
+            with contextlib.suppress(discord.NotFound, discord.HTTPException):
+                await interaction.followup.send("⚠️ Could not enter you right now. Try again.", ephemeral=True)
+            return
         if not outcome.joined:
             message = outcome.eligibility.message if not outcome.duplicate else "You are already entered."
-            await interaction.followup.send(f"🎟️ {message}", ephemeral=True)
+            with contextlib.suppress(discord.NotFound, discord.HTTPException):
+                await interaction.followup.send(f"🎟️ {message}", ephemeral=True)
             return
-        await interaction.followup.send(
-            f"🎟️ Entered **{record.title}** (entry {outcome.entry_seq}).", ephemeral=True
-        )
+        with contextlib.suppress(discord.NotFound, discord.HTTPException):
+            await interaction.followup.send(
+                f"🎟️ Entered **{record.title}** (entry {outcome.entry_seq}).", ephemeral=True
+            )
         await self.bot._sync_live_embed(record.id)  # noqa: SLF001
 
     @giveawaway.command(name="leave", description="Leave a giveaway")
     @app_commands.describe(giveaway="Giveaway ID from the message footer")
     async def leave(self, interaction: discord.Interaction, giveaway: str) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            if not interaction.response.is_done():
+                await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
         record = await self._find_giveaway(str(interaction.guild_id), giveaway)
         if record is None:
-            await interaction.followup.send("⚠️ Giveaway not found.", ephemeral=True)
+            with contextlib.suppress(discord.NotFound, discord.HTTPException):
+                await interaction.followup.send("⚠️ Giveaway not found.", ephemeral=True)
             return
         try:
             removed = await asyncio.to_thread(self.bot.service.leave, record, str(interaction.user.id))
         except ServiceError as exc:
-            await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
+            with contextlib.suppress(discord.NotFound, discord.HTTPException):
+                await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
             return
-        await interaction.followup.send(
-            "↩️ Entry removed." if removed else "You were not entered.", ephemeral=True
-        )
+        except Exception:  # noqa: BLE001
+            log.exception("slash leave failed")
+            with contextlib.suppress(discord.NotFound, discord.HTTPException):
+                await interaction.followup.send("⚠️ Could not leave right now. Try again.", ephemeral=True)
+            return
+        with contextlib.suppress(discord.NotFound, discord.HTTPException):
+            await interaction.followup.send(
+                "↩️ Entry removed." if removed else "You were not entered.", ephemeral=True
+            )
         if removed:
             await self.bot._sync_live_embed(record.id)  # noqa: SLF001
 

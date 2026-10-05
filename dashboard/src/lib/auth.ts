@@ -227,6 +227,11 @@ export async function requireGuildAdmin(guildId: string): Promise<AdminCheck> {
 
 /** Guilds where this user is an administrator and the bot is present. */
 export async function listAdminGuilds(userId: string): Promise<AdminGuild[]> {
+  // The guild_admins table is only a cache populated by requireGuildAdmin, so a
+  // user who just signed in has zero rows and /admin shows "No servers found"
+  // even when they administer several bot guilds. Sync first so the listing
+  // reflects Discord reality instead of cache warmth.
+  await syncAdminGuilds(userId);
   return await all<AdminGuild>(
     `SELECT g.id, g.name, g.icon_url, g.member_count
        FROM guild_admins a
@@ -243,6 +248,64 @@ export async function listAdminGuilds(userId: string): Promise<AdminGuild[]> {
       ORDER BY g.name COLLATE NOCASE`,
     [userId],
   );
+}
+
+/**
+ * Reconcile the guild_admins cache for one user against Discord.
+ *
+ * Lists every guild where the bot is present, asks Discord (via the bot token)
+ * what this user's permissions are there, and upserts the result. Unknown users
+ * (not a member, or bot cannot see them) get a 0-permission row so the next
+ * listing does not re-hit Discord for them until the TTL expires.
+ */
+export async function syncAdminGuilds(userId: string): Promise<void> {
+  if (!/^\d{15,25}$/.test(userId)) return;
+  if (!botToken()) return;
+  let botGuilds: Array<{ id: string }>;
+  try {
+    botGuilds = await all<{ id: string }>(
+      "SELECT id FROM guilds WHERE bot_present = 1 LIMIT 100",
+    );
+  } catch {
+    return;
+  }
+  if (botGuilds.length === 0) return;
+
+  // Only re-check guilds whose cache entry is missing or stale.
+  const CACHE_TTL_MS = 5 * 60_000;
+  const now = nowMs();
+  for (const guild of botGuilds) {
+    const cached = await first<{ permissions: string; synced_at: number }>(
+      "SELECT permissions, synced_at FROM guild_admins WHERE guild_id = ? AND user_id = ?",
+      [guild.id, userId],
+    );
+    if (cached && now - Number(cached.synced_at) < CACHE_TTL_MS) continue;
+    let membership: GuildMembership | null = null;
+    try {
+      membership = await fetchGuildMembership(guild.id, userId);
+    } catch (error) {
+      // A transient Discord failure must not wipe a good cache entry: keep
+      // the old row and try again next time.
+      console.warn(`[auth] membership lookup failed for guild ${guild.id}:`, error);
+      continue;
+    }
+    const permissions = membership ? membership.permissions.toString() : "0";
+    const username = membership?.nickname ?? "";
+    try {
+      await run(
+        `INSERT INTO guild_admins (guild_id, user_id, username, permissions, source, synced_at)
+         VALUES (?, ?, ?, ?, 'rest', ?)
+         ON CONFLICT(guild_id, user_id) DO UPDATE SET
+           username = excluded.username,
+           permissions = excluded.permissions,
+           source = excluded.source,
+           synced_at = excluded.synced_at`,
+        [guild.id, userId, username, permissions, nowMs()],
+      );
+    } catch (error) {
+      console.warn(`[auth] could not cache membership for guild ${guild.id}:`, error);
+    }
+  }
 }
 
 export interface AdminGuild {
