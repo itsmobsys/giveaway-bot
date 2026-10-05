@@ -38,9 +38,13 @@ giveaway ends or is cancelled it is taken from everyone — winners and losers
 alike — and the role is deleted. The bot needs **Manage Roles** for this; if
 it lacks the permission the giveaway still runs, just without the role.
 - `/giveaway_list`
-- `/giveaway_end giveaway_id`
-- `/giveaway_reroll giveaway_id [count]`
-- `/giveaway_cancel giveaway_id`
+- `/giveaway_end giveaway_id` — suggestions appear as you type; with one live
+  giveaway any id falls back to it
+- `/giveaway_reroll giveaway_id [count]` — same suggestions + fallback
+- `/giveaway_cancel giveaway_id` — same suggestions + fallback
+
+The embed shows a live **⏳ Ends in ...** countdown, re-rendered every tick
+(`TICK_SECONDS`, default 30).
 
 ## Layout
 
