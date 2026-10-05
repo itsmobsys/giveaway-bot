@@ -46,6 +46,11 @@ it lacks the permission the giveaway still runs, just without the role.
 - `/giveaway_list [giveaway_id]` — without an id: active giveaways; with
   an id (suggestions as you type): the full entrant list
 - `/giveaway_ping giveaway_id [text]` — pings every entrant (Manage Server)
+- `/giveaway_blacklist_add user` — block a cheater/alt: Join button refuses
+  them, their entries are yanked from running giveaways, entrants roles
+  stripped (Manage Server)
+- `/giveaway_blacklist_remove user` — unblock (Manage Server)
+- `/giveaway_blacklist_list` — who is blocked (Manage Server)
 - `/giveaway_end giveaway_id` — suggestions appear as you type; with one live
   giveaway any id falls back to it
 - `/giveaway_extend giveaway_id minutes` — add 1 minute to 60 days of time to

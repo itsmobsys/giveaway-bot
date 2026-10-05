@@ -234,6 +234,8 @@ class GiveawayService:
     ) -> None:
         if not gw.active:
             raise ServiceError("This giveaway has ended.")
+        if user_id and self.is_blacklisted(gw.guild_id, user_id):
+            raise ServiceError("🚫 You are blocked from giveaways in this server.")
         if gw.ends_at <= now_ms():
             raise ServiceError("This giveaway has ended.")
         roles = set(member_roles)
@@ -405,6 +407,48 @@ class GiveawayService:
             return int(cur.rowcount or 0)
         except (TypeError, ValueError):
             return 0
+
+    # -- blacklist ------------------------------------------------------
+    def is_blacklisted(self, guild_id: str, user_id: str) -> bool:
+        if not guild_id or not user_id:
+            return False
+        return (
+            self.db.query_one(
+                "SELECT user_id FROM simple_blacklist WHERE guild_id = ? AND user_id = ?",
+                (guild_id, user_id),
+            )
+            is not None
+        )
+
+    def blacklist_add(self, guild_id: str, user_id: str) -> None:
+        """Block a user, and purge their entries from running giveaways."""
+        self.db.execute(
+            "INSERT OR IGNORE INTO simple_blacklist (guild_id, user_id) VALUES (?, ?)",
+            (guild_id, user_id),
+        )
+        self.db.execute(
+            "DELETE FROM simple_entries WHERE user_id = ? AND giveaway_id IN"
+            " (SELECT id FROM simple_giveaways WHERE guild_id = ? AND status = 'active')",
+            (user_id, guild_id),
+        )
+
+    def blacklist_remove(self, guild_id: str, user_id: str) -> bool:
+        cur = self.db.execute(
+            "DELETE FROM simple_blacklist WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        try:
+            return (cur.rowcount or 0) > 0
+        except Exception:
+            return True
+
+    def blacklist_list(self, guild_id: str, limit: int = 100) -> list[str]:
+        rows = self.db.query(
+            "SELECT user_id FROM simple_blacklist WHERE guild_id = ?"
+            " ORDER BY user_id ASC LIMIT ?",
+            (guild_id, limit),
+        )
+        return [str(r["user_id"]) for r in rows]
 
     def due(self, now: int | None = None) -> list[Giveaway]:
         ts = now if now is not None else now_ms()

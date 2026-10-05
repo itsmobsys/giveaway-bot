@@ -994,6 +994,87 @@ def wire_commands(bot: GiveawayBot) -> None:
             interaction, f"📢 Pinged {len(entrants)} entrant(s)."
         )
 
+    @bot.tree.command(name="giveaway_blacklist_add", description="Block a user from all giveaways")
+    @app_commands.describe(user="The member to block")
+    async def giveaway_blacklist_add(
+        interaction: discord.Interaction, user: discord.Member
+    ) -> None:
+        """Block + yank their entries from running giveaways + strip roles."""
+        if interaction.guild is None or not _can_manage(interaction.user):
+            await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
+            return
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        gid, uid = str(interaction.guild.id), str(user.id)
+        try:
+            await asyncio.to_thread(svc.blacklist_add, gid, uid)
+            active = await asyncio.to_thread(svc.list_active, gid)
+        except Exception:
+            log.exception("blacklist add failed for %s", uid)
+            await bot._safe_followup(interaction, "⚠️ Could not update the blacklist. Try again.")
+            return
+        for gw in active:
+            await bot._take_entrants_role(gw, uid)
+        log.info("blacklisted %s in guild %s", uid, gid)
+        await bot._safe_followup(
+            interaction,
+            f"🚫 {user.mention} is blocked from giveaways — entries removed"
+            f" from {len(active)} running giveaway(s).",
+        )
+
+    @bot.tree.command(name="giveaway_blacklist_remove", description="Unblock a user from giveaways")
+    @app_commands.describe(user="The member to unblock")
+    async def giveaway_blacklist_remove(
+        interaction: discord.Interaction, user: discord.Member
+    ) -> None:
+        if interaction.guild is None or not _can_manage(interaction.user):
+            await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
+            return
+        try:
+            removed = await asyncio.to_thread(
+                svc.blacklist_remove, str(interaction.guild.id), str(user.id)
+            )
+        except Exception:
+            log.exception("blacklist remove failed for %s", user.id)
+            await interaction.response.send_message(
+                "⚠️ Could not update the blacklist. Try again.", ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            f"✅ {user.mention} can join giveaways again."
+            if removed
+            else f"{user.mention} was not on the blacklist.",
+            ephemeral=True,
+        )
+
+    @bot.tree.command(name="giveaway_blacklist_list", description="Show blocked users")
+    async def giveaway_blacklist_list(interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not _can_manage(interaction.user):
+            await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
+            return
+        try:
+            ids = await asyncio.to_thread(
+                svc.blacklist_list, str(interaction.guild.id)
+            )
+        except Exception:
+            log.exception("blacklist list failed")
+            await interaction.response.send_message(
+                "⚠️ Could not load the blacklist. Try again.", ephemeral=True
+            )
+            return
+        if not ids:
+            await interaction.response.send_message(
+                "Blacklist is empty — nobody is blocked.", ephemeral=True
+            )
+            return
+        lines = "\n".join(f"<@{uid}>" for uid in ids[:100])
+        extra = f"\n…plus {len(ids) - 100} more." if len(ids) > 100 else ""
+        await interaction.response.send_message(
+            f"🚫 **Blocked ({len(ids)}):**\n{lines}{extra}", ephemeral=True
+        )
+
 
 async def amain(settings: Settings) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")

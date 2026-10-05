@@ -195,6 +195,15 @@ class Database:
   notify_role_id TEXT
 )"""
         )
+        # Users blocked from giveaways in a server. Permanent until removed —
+        # the entry-wipe sweep never touches this table.
+        self.execute(
+            """CREATE TABLE IF NOT EXISTS simple_blacklist (
+  guild_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  PRIMARY KEY (guild_id, user_id)
+)"""
+        )
         for stmt in [s.strip() for s in SCHEMA_INDEXES.split(";") if s.strip()]:
             self.execute(stmt)
 
