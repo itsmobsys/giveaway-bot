@@ -66,6 +66,16 @@ node serve.js      # http://localhost:4321
 node smoke.js      # helper + card-shape tests
 ```
 
+The page is served by `api/page.js`, which has the `public/` files baked in —
+after editing anything in `public/`, run `node build-page.js` (from
+`dashboard/`) before committing, or the live page won't pick up the change.
+
+`/admin` (linked in the page footer) is a password-gated panel for deleting
+previous giveaways. Live ones can't be deleted there — end them in Discord
+first. The password defaults to the one in `api/admin.js` and can be
+overridden with the `ADMIN_PASSWORD` env var; anyone with repo access can see
+it, so it only keeps casual visitors out.
+
 Deploy: import the repo on Vercel with **Root Directory = `dashboard`**,
 set env vars `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN` (same as the bot), deploy.
 

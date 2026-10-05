@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Admin — Giveaways</title>
+    <meta name="color-scheme" content="dark light" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;600;700&family=Russo+One&display=swap"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+    <style>
+      .login { max-width: 380px; margin: 8vh auto 0; display: grid; gap: 12px; }
+      .login input {
+        min-height: var(--tap);
+        padding: 0 14px;
+        font: inherit;
+        color: var(--text);
+        background: var(--surface-2);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+      }
+      .row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+      .row .prize { font-size: .95rem; }
+      .danger {
+        flex: none;
+        min-height: var(--tap);
+        padding: 0 16px;
+        font: inherit;
+        font-size: .82rem;
+        font-weight: 700;
+        color: #fff;
+        background: var(--danger, #b91c1c);
+        border: none;
+        border-radius: 999px;
+        cursor: pointer;
+      }
+      .danger:disabled { opacity: .5; cursor: default; }
+      .admin-list { display: grid; gap: 10px; }
+      .admin-item {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 14px;
+        background: var(--surface);
+        border: 1px solid var(--line);
+        border-radius: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="top">
+      <div class="brand">
+        <div>
+          <h1>Admin</h1>
+          <p class="sub"><a href="/" style="color:inherit">← back to giveaways</a></p>
+        </div>
+      </div>
+      <div class="top-right">
+        <button class="ghost" id="logout" type="button" hidden>Log out</button>
+      </div>
+    </header>
+
+    <main>
+      <form class="login" id="login">
+        <h2 style="margin:0">Password</h2>
+        <input id="pw" type="password" autocomplete="current-password" placeholder="Admin password" />
+        <button class="ghost" type="submit" style="justify-content:center">Unlock</button>
+        <p class="err" id="login-err" hidden role="alert"></p>
+      </form>
+
+      <section id="panel" hidden>
+        <div class="sec-head">
+          <h2>Previous giveaways</h2>
+          <span class="count" id="prev-count"></span>
+        </div>
+        <div class="admin-list" id="prev-list"></div>
+        <p class="empty" id="prev-empty" hidden>Nothing to delete.</p>
+        <p class="err" id="err" hidden role="alert"></p>
+      </section>
+    </main>
+
+    <script type="module" src="/admin.js"></script>
+  </body>
+</html>

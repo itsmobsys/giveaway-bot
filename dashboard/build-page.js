@@ -6,7 +6,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const dir = dirname(fileURLToPath(import.meta.url));
-const FILES = ["index.html", "styles.css", "app.js", "format.js"];
+const FILES = ["index.html", "styles.css", "app.js", "format.js", "admin.html", "admin.js"];
 const MIME = {
   ".html": "text/html; charset=utf-8",
   ".css": "text/css; charset=utf-8",
@@ -27,8 +27,10 @@ ${Object.entries(embedded)
 };
 const CACHE = {
   "index.html": "public, s-maxage=30, stale-while-revalidate=60",
+  "admin.html": "private, no-store",
   "styles.css": "public, s-maxage=86400, immutable",
   "app.js": "public, s-maxage=86400, immutable",
+  "admin.js": "public, s-maxage=86400, immutable",
   "format.js": "public, s-maxage=86400, immutable",
 };
 // Only these 4 names are ever servable — anything else 404s.
@@ -38,6 +40,9 @@ const BY_PATH = {
   "/styles.css": "styles.css",
   "/app.js": "app.js",
   "/format.js": "format.js",
+  "/admin": "admin.html",
+  "/admin.html": "admin.html",
+  "/admin.js": "admin.js",
 };
 function pick(req) {
   try {

@@ -5,6 +5,8 @@
     { "source": "/", "destination": "/api/page?f=index.html" },
     { "source": "/styles.css", "destination": "/api/page?f=styles.css" },
     { "source": "/app.js", "destination": "/api/page?f=app.js" },
-    { "source": "/format.js", "destination": "/api/page?f=format.js" }
+    { "source": "/format.js", "destination": "/api/page?f=format.js" },
+    { "source": "/admin", "destination": "/api/page?f=admin.html" },
+    { "source": "/admin.js", "destination": "/api/page?f=admin.js" }
   ]
 }
