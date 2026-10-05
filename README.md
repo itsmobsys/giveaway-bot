@@ -5,6 +5,7 @@ Simple standalone Discord giveaway bot. MIT licensed.
 ```
 .
 ├── bot/            Python Discord bot (discord.py), Turso-backed
+├── dashboard/      Vercel Node.js read-only API (live + previous giveaways)
 ├── app.py          Root entry point for panels that start a file
 ├── requirements.txt  Bot dependencies
 ├── render.yaml     Render blueprint: bot web service
