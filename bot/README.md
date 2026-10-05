@@ -25,7 +25,7 @@ Needs **Server Members Intent** on (Bot tab in the Developer Portal) for role ch
 ## Commands
 
 - `/giveaway_create prize winners minutes [required_role_1] [required_role_2] [required_role_3] [blocked_role] ...`
-  - up to 3 required roles (member needs **any one**); all are pinged on create
+  - up to 5 required roles (member needs **any one**); all are pinged on create
   so eligible people see it
 - `/giveaway_notifyer [role]` — **one-time setup** (Manage Server): the role
   pinged on every giveaway event (new, winners, rerolls, cancellations).

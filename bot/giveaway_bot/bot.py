@@ -612,6 +612,8 @@ def wire_commands(bot: GiveawayBot) -> None:
         required_role_1="Role that can enter, pinged on create (optional)",
         required_role_2="Another role that can enter (optional)",
         required_role_3="Another role that can enter (optional)",
+        required_role_4="Another role that can enter (optional)",
+        required_role_5="Another role that can enter (optional)",
         blocked_role="This role cannot enter (optional)",
         min_account_age_days="Min Discord account age in days (optional)",
         min_messages="Min messages sent in this server (optional)",
@@ -626,6 +628,8 @@ def wire_commands(bot: GiveawayBot) -> None:
         required_role_1: discord.Role | None = None,
         required_role_2: discord.Role | None = None,
         required_role_3: discord.Role | None = None,
+        required_role_4: discord.Role | None = None,
+        required_role_5: discord.Role | None = None,
         blocked_role: discord.Role | None = None,
         min_account_age_days: int = 0,
         min_messages: int = 0,
@@ -643,7 +647,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             await interaction.response.defer(ephemeral=True, thinking=True)
         except (discord.NotFound, discord.HTTPException):
             return
-        role_slots = [required_role_1, required_role_2, required_role_3]
+        role_slots = [required_role_1, required_role_2, required_role_3, required_role_4, required_role_5]
         need_roles = [str(r.id) for r in role_slots if r is not None]
         try:
             gw = await asyncio.to_thread(
