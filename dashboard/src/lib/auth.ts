@@ -53,6 +53,8 @@ export interface AuthConfigStatus {
   sessionSecretLength: number;
   sessionSecretOk: boolean;
   clientId: boolean;
+  /** Numeric snowflake like the Application ID. A pasted secret fails this. */
+  clientIdValid: boolean;
   clientSecret: boolean;
   redirectUri: boolean;
   redirectIsLocalhost: boolean;
@@ -61,10 +63,12 @@ export interface AuthConfigStatus {
 export function authConfigStatus(): AuthConfigStatus {
   const secretLength = sessionSecretLength();
   const redirectUri = process.env.DISCORD_REDIRECT_URI ?? "";
+  const clientId = process.env.DISCORD_CLIENT_ID ?? "";
   return {
     sessionSecretLength: secretLength,
     sessionSecretOk: secretLength >= 32,
-    clientId: Boolean(process.env.DISCORD_CLIENT_ID),
+    clientId: Boolean(clientId),
+    clientIdValid: /^\d{15,25}$/.test(clientId),
     clientSecret: Boolean(process.env.DISCORD_CLIENT_SECRET),
     redirectUri: Boolean(redirectUri),
     redirectIsLocalhost: /localhost|127\.0\.0\.1/i.test(redirectUri),

@@ -31,6 +31,15 @@ export async function GET(request: Request): Promise<NextResponse> {
     );
   }
 
+  // Fail here with a readable error instead of bouncing the user to a
+  // Discord "Invalid Form Body" page: a non-numeric client_id (usually the
+  // client *secret* pasted into the wrong variable) can never succeed.
+  if (!/^\d{15,25}$/.test(process.env.DISCORD_CLIENT_ID ?? "")) {
+    const back = new URL("/login?error=oauth_misconfigured", url.origin);
+    if (redirectTo !== "/admin") back.searchParams.set("redirect_to", redirectTo);
+    return NextResponse.redirect(back);
+  }
+
   const state = randomBytes(32).toString("base64url");
   const expiresAt = nowMs() + 10 * 60_000;
 

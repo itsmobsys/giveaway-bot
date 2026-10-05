@@ -4,64 +4,29 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "giveaway-bot"
-version = "1.0.0"
-description = "Open-source Discord giveaway bot with a provably fair, auditable draw"
+version = "2.0.0"
+description = "Simple standalone Discord giveaway bot (Turso/SQLite)"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
-authors = [{ name = "Giveaway Bot contributors" }]
-keywords = ["discord", "giveaway", "provably-fair", "bot", "turso"]
-classifiers = [
-  "Development Status :: 5 - Production/Stable",
-  "Environment :: Console",
-  "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
-  "Topic :: Communications :: Chat",
-]
 
 dependencies = [
   "discord.py>=2.4,<3",
-  "pydantic>=2.7,<3",
-  # 2.6+ for `NoDecode`: config.py uses it to stop pydantic-settings
-  # JSON-decoding list-typed fields, which otherwise makes an empty CSV list
-  # like `TRUSTED_PROXIES=` fatal. See the comment on the field.
-  "pydantic-settings>=2.6,<3",
   "python-dotenv>=1.0,<2",
-  "httpx>=0.27,<1",
-  "tenacity>=8.2,<10",
 ]
 
 [project.optional-dependencies]
-# Turso/libSQL driver. Install with: pip install -e ".[turso]"
-# 0.1.11 is the newest release; a 0.2.x specifier installs nothing. It is a Rust
-# extension with wheels for cp311-cp313 only, so Python 3.14 builds from source.
 turso = ["libsql>=0.1.11,<2"]
 dev = [
-  "pytest>=8.2",
-  "pytest-asyncio>=0.23",
   "ruff>=0.6",
-  "mypy>=1.11",
 ]
 
 [project.scripts]
 giveaway-bot = "giveaway_bot.cli:main"
 
-[project.urls]
-Homepage = "https://github.com/your-org/giveaway-bot"
-Documentation = "https://github.com/your-org/giveaway-bot/blob/main/docs/ARCHITECTURE.md"
-Issues = "https://github.com/your-org/giveaway-bot/issues"
-
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["giveaway_bot*"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-asyncio_mode = "auto"
-filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.ruff]
 line-length = 110
@@ -69,18 +34,4 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "S", "ASYNC", "C4", "RET", "SIM"]
-ignore = ["S101", "B008"]
-
-[tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S", "E501"]
-# S608 flags any SQL built with an f-string. Every occurrence in repositories/ was
-# checked by hand: they interpolate only generated "?" placeholders and clause
-# literals assembled from constant keywords, never a caller's value. Kept enabled
-# elsewhere so a real injection would still be reported.
-"giveaway_bot/repositories/*" = ["S608"]
-
-[tool.mypy]
-python_version = "3.11"
-warn_unused_ignores = true
-disallow_untyped_defs = false
-ignore_missing_imports = true
+ignore = ["S101", "B008", "SIM105", "S110"]

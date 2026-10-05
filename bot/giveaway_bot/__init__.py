@@ -1,7 +1,3 @@
-"""Open-source giveaway bot with a provably fair draw."""
+"""Simple standalone Discord giveaway bot (no dashboard)."""
 
-from __future__ import annotations
-
-__version__ = "1.0.0"
-
-__all__ = ["__version__"]
+__version__ = "2.0.0"

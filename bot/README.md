@@ -1,34 +1,42 @@
-# Giveaway bot (Python)
+# Giveaway bot (Python) — simple standalone v2
 
-Discord giveaway bot with a **provably fair** winner draw. See the
-[repository README](../README.md) for the full picture and
-[`shared/FAIRNESS_SPEC.md`](../shared/FAIRNESS_SPEC.md) for the draw algorithm.
+No dashboard. Just Discord slash commands + Join/Leave buttons + auto-draw timer.
+Storage is Turso when `TURSO_DATABASE_URL` is set, otherwise a local SQLite file.
 
 ```bash
-python -m pip install -e ".[dev]"
-python -m giveaway_bot migrate
-python -m giveaway_bot selftest     # 20+ checks, no token or network required
+python -m pip install -e ".[turso]"
 python -m giveaway_bot doctor
 python -m giveaway_bot run
 ```
 
+## Env
+
+| Var | Required | What |
+| --- | --- | --- |
+| `DISCORD_BOT_TOKEN` | yes | Bot token |
+| `TURSO_DATABASE_URL` | no | `libsql://...` — without it, uses SQLite |
+| `TURSO_AUTH_TOKEN` | no | Turso auth token |
+| `SQLITE_PATH` | no | Default `./data/giveaways.db` |
+| `DISCORD_GIVEAWAY_CHANNEL_ID` | no | Force all giveaways into one channel |
+| `TICK_SECONDS` | no | Auto-draw poll (default 30) |
+
+Needs **Server Members Intent** on (Bot tab in the Developer Portal) for role checks.
+
+## Commands
+
+- `/giveaway_create prize winners minutes [required_role] [blocked_role] [min_account_age_days]`
+- `/giveaway_list`
+- `/giveaway_end giveaway_id`
+- `/giveaway_reroll giveaway_id [count]`
+- `/giveaway_cancel giveaway_id`
+
 ## Layout
 
-| Path | Responsibility |
+| File | Does |
 | --- | --- |
-| `giveaway_bot/fairness.py` | The entire randomness surface. Auditable in isolation. |
-| `giveaway_bot/eligibility.py` | Pure eligibility rules (roles, age, channel, limits). |
-| `giveaway_bot/service.py` | Business logic, state machine, three-phase draw. |
-| `giveaway_bot/validation.py` | Strict validation of every untrusted input. |
-| `giveaway_bot/repositories/` | Explicit SQL. No ORM. |
-| `giveaway_bot/queue.py` | Executes dashboard-originated commands. |
-| `giveaway_bot/bot.py` | discord.py plumbing and rendering only. |
-| `giveaway_bot/selftest.py` | Verification suite + cross-language test vectors. |
-
-## Design rules
-
-1. No randomness outside `fairness.py`. No `random`/`Math.random` in selection.
-2. No place accepts a winner id, weight or priority.
-3. Every mutation writes an audit row in the same transaction.
-4. The bot re-validates everything the dashboard sends (defence in depth).
-5. The commit–reveal seed is sealed *before* entries open.
+| `config.py` | Env settings |
+| `db.py` | SQLite/Turso wrapper + schema |
+| `service.py` | Create/join/leave/end/reroll rules |
+| `bot.py` | Discord wiring, buttons, timer |
+| `embeds.py` / `views.py` | Messages + Join/Leave buttons |
+| `cli.py` | `run` / `doctor` |

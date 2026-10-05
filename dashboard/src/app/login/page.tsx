@@ -10,6 +10,8 @@ const ERROR_MESSAGES: Record<string, string> = {
   missing_code: "Discord did not return an authorization code.",
   invalid_state: "That sign-in link expired or was already used. Please try again.",
   oauth_not_configured: "Discord OAuth2 is not configured on this deployment.",
+  oauth_misconfigured:
+    "DISCORD_CLIENT_ID is not a Discord application ID (it must be numeric). You probably pasted the client secret into it.",
   server_misconfigured: "This deployment is missing its SESSION_SECRET.",
   exchange_failed: "Could not complete sign-in with Discord. Please try again.",
 };
@@ -21,8 +23,9 @@ export default async function LoginPage({
 }) {
   const { error, redirect_to } = await searchParams;
   const message = error ? (ERROR_MESSAGES[error] ?? "Sign-in failed.") : null;
-  const ready = sessionsAvailable() && discordConfigured();
   const status = authConfigStatus();
+  const ready =
+    sessionsAvailable() && discordConfigured() && status.clientIdValid;
   const checks = [
     {
       label: "SESSION_SECRET",
@@ -34,7 +37,7 @@ export default async function LoginPage({
             ? `${status.sessionSecretLength} chars`
             : `only ${status.sessionSecretLength} chars — needs 32+`,
     },
-    { label: "DISCORD_CLIENT_ID", ok: status.clientId, hint: status.clientId ? "set" : "missing" },
+    { label: "DISCORD_CLIENT_ID", ok: status.clientId && status.clientIdValid, hint: !status.clientId ? "missing" : status.clientIdValid ? "set" : "not numeric — looks like the secret, not the ID" },
     { label: "DISCORD_CLIENT_SECRET", ok: status.clientSecret, hint: status.clientSecret ? "set" : "missing" },
     { label: "DISCORD_REDIRECT_URI", ok: status.redirectUri, hint: status.redirectUri ? "set" : "missing" },
   ];
@@ -84,13 +87,27 @@ export default async function LoginPage({
             </p>
           </div>
         ) : (
-          <a
+          <>
+            {status.redirectIsLocalhost && (
+              <p
+                role="alert"
+                className="mt-4 rounded-lg bg-[var(--warning)]/12 px-3 py-2 text-left text-xs text-[var(--warning)]"
+              >
+                ⚠️ The redirect URI still points at localhost, so Discord will send you
+                back to your own machine instead of here. Set{" "}
+                <code className="font-mono">DISCORD_REDIRECT_URI</code> to{" "}
+                <code className="font-mono">https://&lt;your-domain&gt;/api/auth/callback</code>{" "}
+                (and add the same URL in the Discord Developer Portal), then redeploy.
+              </p>
+            )}
+            <a
             href={redirect_to ? `/api/auth/login?redirect_to=${encodeURIComponent(redirect_to)}` : "/api/auth/login"}
             className="mt-6 flex items-center justify-center gap-2 rounded-lg bg-[#5865F2] px-5 py-2.5 font-medium text-white transition-transform hover:scale-[1.02]"
           >
             <span aria-hidden="true">💬</span>
             Continue with Discord
           </a>
+          </>
         )}
 
         <p className="mt-6 text-xs text-[var(--muted-foreground)]">
