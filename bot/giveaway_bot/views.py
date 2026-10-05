@@ -133,7 +133,7 @@ class GiveawayView(discord.ui.View):
                     label="Details & proof",
                     style=discord.ButtonStyle.link,
                     emoji="🌐",
-                    url=f"{dashboard_url}/g/{giveaway_id}",
+                    url=f"{dashboard_url}/giveaways/{giveaway_id}",
                 )
             )
 
@@ -175,7 +175,7 @@ class WinnerView(discord.ui.View):
                     label="Winner proof",
                     style=discord.ButtonStyle.link,
                     emoji="🔐",
-                    url=f"{dashboard_url}/g/{giveaway_id}#verification",
+                    url=f"{dashboard_url}/giveaways/{giveaway_id}#verification",
                 )
             )
 
@@ -191,7 +191,7 @@ class VerifyView(discord.ui.View):
                     label="Verify this draw",
                     style=discord.ButtonStyle.link,
                     emoji="🔐",
-                    url=f"{dashboard_url}/g/{giveaway_id}#verification",
+                    url=f"{dashboard_url}/giveaways/{giveaway_id}#verification",
                 )
             )
 

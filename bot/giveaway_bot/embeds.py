@@ -222,7 +222,7 @@ def build_giveaway_embed(
         )
 
     if dashboard_url:
-        embed.url = f"{dashboard_url}/g/{giveaway.id}"
+        embed.url = f"{dashboard_url}/giveaways/{giveaway.id}"
     return embed
 
 
