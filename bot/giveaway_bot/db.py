@@ -2,13 +2,43 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import threading
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 from .config import Settings, get_settings
+
+log = logging.getLogger("giveaway_bot.db")
+
+#: Substrings meaning the Turso Hrana stream behind this connection is gone
+#: (server-side idle timeout, restart, network blip). The driver raises a bare
+#: ValueError with no exception hierarchy, so the message text is the signal.
+#: A dead stream means the statement never reached the server, so dropping the
+#: connection and replaying the statement once cannot double-apply anything.
+_DEAD_STREAM_MARKERS = (
+    "stream not found",
+    "stream was idle for too long",
+    "no transaction is active",
+    "connection closed",
+    "not connected",
+    "broken pipe",
+    "connection reset",
+    "connection aborted",
+    "server closed",
+    "unexpected eof",
+)
+
+
+def _is_dead_stream(message: str) -> bool:
+    return any(marker in message for marker in _DEAD_STREAM_MARKERS)
+
+
+def _brief(exc: Exception, limit: int = 120) -> str:
+    return " ".join(str(exc).split())[:limit]
 
 #: v2 table names. The v1 bot used `giveaways` / `giveaway_entries` with a
 #: different shape (NOT NULL title, status CHECK constraint, ...). Reusing
@@ -120,10 +150,37 @@ class Database:
                 self.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> Any:
-        return self._conn().execute(sql, tuple(params))
+        """Run one statement, surviving dead Turso streams and brief contention.
+
+        * Dead/idle Hrana stream: the connection is dropped and the statement
+          is replayed once on a fresh connection. Safe because a dead stream
+          never applied anything.
+        * `locked`/`busy`/`conflict`: genuine writer contention, retried with a
+          short backoff. Anything else raises untouched.
+        """
+        last_error: Exception | None = None
+        reconnected = False
+        for attempt in range(6):
+            try:
+                return self._conn().execute(sql, tuple(params))
+            except Exception as exc:
+                message = str(exc).lower()
+                if not reconnected and _is_dead_stream(message):
+                    log.warning(
+                        "database stream went away (%s); reconnecting once", _brief(exc)
+                    )
+                    self.close()
+                    reconnected = True
+                    continue
+                if any(word in message for word in ("locked", "busy", "conflict")):
+                    last_error = exc
+                    time.sleep(0.15 * (attempt + 1))
+                    continue
+                raise
+        raise last_error  # type: ignore[misc]
 
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict[str, Any]]:
-        cur = self._conn().execute(sql, tuple(params))
+        cur = self.execute(sql, params)
         rows = cur.fetchall()
         desc = cur.description
         cols = [d[0] for d in desc] if desc else []
