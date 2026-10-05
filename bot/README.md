@@ -19,6 +19,7 @@ python -m giveaway_bot run
 | `TURSO_AUTH_TOKEN` | yes | Turso auth token |
 | `DISCORD_GIVEAWAY_CHANNEL_ID` | no | Force all giveaways into one channel |
 | `TICK_SECONDS` | no | Auto-draw poll (default 30) |
+| `DASHBOARD_URL` | no | Blue "Dashboard" button link on every giveaway message (default `https://giveaway-bot-duggal.vercel.app/`) |
 
 Needs **Server Members Intent** on (Bot tab in the Developer Portal) for role checks.
 

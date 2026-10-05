@@ -30,6 +30,13 @@ class Settings:
     turso_url: str = field(default_factory=lambda: os.getenv("TURSO_DATABASE_URL", "").strip())
     turso_token: str = field(default_factory=lambda: os.getenv("TURSO_AUTH_TOKEN", "").strip())
     tick_seconds: int = field(default_factory=lambda: _int("TICK_SECONDS", 30))
+    #: Public dashboard URL (the Vercel frontend). Every giveaway message
+    #: gets a blue "Dashboard" link button pointing at it; empty = no button.
+    dashboard_url: str = field(
+        default_factory=lambda: (
+            os.getenv("DASHBOARD_URL", "") or "https://giveaway-bot-duggal.vercel.app/"
+        ).strip()
+    )
     #: Port for the built-in health server. Render sets PORT itself; this lets
     #: the bot run as a Web Service (free tier has no background workers).
     port: int = field(default_factory=lambda: _int("PORT", 10000))

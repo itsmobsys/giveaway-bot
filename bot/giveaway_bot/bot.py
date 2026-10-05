@@ -53,7 +53,7 @@ class GiveawayBot(commands.Bot):
 
     # -- lifecycle ------------------------------------------------------
     async def setup_hook(self) -> None:
-        self.add_view(GiveawayView("placeholder"))
+        self.add_view(GiveawayView("placeholder", self.settings.dashboard_url))
         await self.tree.sync()
         log.info("commands synced (%d)", len(self.tree.get_commands()))
         self.tick.change_interval(seconds=max(5, self.settings.tick_seconds))
@@ -100,7 +100,7 @@ class GiveawayBot(commands.Bot):
     def _register_view(self, giveaway_id: str) -> GiveawayView:
         view = self._views.get(giveaway_id)
         if view is None:
-            view = GiveawayView(giveaway_id)
+            view = GiveawayView(giveaway_id, self.settings.dashboard_url)
             view._join_handler = self.handle_join
             view._leave_handler = self.handle_leave
             view._participants_handler = self.handle_participants

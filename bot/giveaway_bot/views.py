@@ -6,7 +6,7 @@ import discord
 
 
 class GiveawayView(discord.ui.View):
-    def __init__(self, giveaway_id: str) -> None:
+    def __init__(self, giveaway_id: str, dashboard_url: str = "") -> None:
         super().__init__(timeout=None)
         self.giveaway_id = giveaway_id
         join = discord.ui.Button(
@@ -33,6 +33,18 @@ class GiveawayView(discord.ui.View):
         self.add_item(join)
         self.add_item(leave)
         self.add_item(participants)
+        # Link buttons must use style=link + url (no custom_id, no callback).
+        # They render blue and survive restarts without any handler. Omit the
+        # button entirely when no dashboard URL is configured.
+        if dashboard_url:
+            self.add_item(
+                discord.ui.Button(
+                    label="Dashboard",
+                    style=discord.ButtonStyle.link,
+                    emoji="💙",
+                    url=dashboard_url,
+                )
+            )
         self._join_handler = None  # set by bot.py
         self._leave_handler = None
         self._participants_handler = None
