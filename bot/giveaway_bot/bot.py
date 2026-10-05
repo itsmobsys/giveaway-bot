@@ -123,6 +123,86 @@ class GiveawayBot(commands.Bot):
         gid, uid = str(message.guild.id), str(message.author.id)
         asyncio.get_running_loop().run_in_executor(None, self.service.record_message, gid, uid)
 
+    # -- entrants role (ping everyone in the giveaway) --------------------
+    async def _member_for(
+        self, guild: discord.Guild, user_id: str
+    ) -> discord.Member | None:
+        try:
+            member = guild.get_member(int(user_id))
+        except (TypeError, ValueError):
+            return None
+        if member is not None:
+            return member
+        try:
+            return await guild.fetch_member(int(user_id))
+        except (discord.NotFound, discord.HTTPException, ValueError):
+            return None
+
+    def _role_for(self, gw: Giveaway) -> discord.Role | None:
+        if not gw.entrants_role_id or not gw.guild_id:
+            return None
+        try:
+            guild = self.get_guild(int(gw.guild_id))
+            role_id = int(gw.entrants_role_id)
+        except (TypeError, ValueError):
+            return None
+        return guild.get_role(role_id) if guild else None
+
+    async def _grant_entrants_role(self, gw: Giveaway, member: discord.Member) -> None:
+        role = self._role_for(gw)
+        if role is None:
+            return
+        try:
+            await member.add_roles(role, reason=f"Joined giveaway {gw.id}")
+        except (discord.Forbidden, discord.HTTPException):
+            log.warning("could not grant entrants role for %s", gw.id)
+
+    async def _take_entrants_role(self, gw: Giveaway, user_id: str) -> None:
+        role = self._role_for(gw)
+        if role is None:
+            return
+        try:
+            guild = self.get_guild(int(gw.guild_id))
+        except (TypeError, ValueError):
+            return
+        if guild is None:
+            return
+        member = await self._member_for(guild, user_id)
+        if member is None:
+            return
+        try:
+            await member.remove_roles(role, reason=f"Left giveaway {gw.id}")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+    async def _strip_entrants_role(self, gw: Giveaway) -> None:
+        """Take the role from every entrant, then delete it. Win or lose."""
+        role = self._role_for(gw)
+        if role is None:
+            return
+        try:
+            entrants = await asyncio.to_thread(self.service.entries, gw.id)
+        except Exception:
+            log.exception("could not list entrants for role strip (%s)", gw.id)
+            entrants = []
+        try:
+            guild = self.get_guild(int(gw.guild_id))
+        except (TypeError, ValueError):
+            guild = None
+        if guild is not None:
+            for row in entrants:
+                member = await self._member_for(guild, str(row["user_id"]))
+                if member is None:
+                    continue
+                try:
+                    await member.remove_roles(role, reason=f"Giveaway {gw.id} ended")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+        try:
+            await role.delete(reason=f"Giveaway {gw.id} ended")
+        except (discord.Forbidden, discord.HTTPException, discord.NotFound):
+            pass
+
     # -- button handlers ------------------------------------------------
     async def _safe_defer(self, interaction: discord.Interaction) -> bool:
         """Ack first, before any DB work. Returns False if the token is dead."""
@@ -174,6 +254,7 @@ class GiveawayBot(commands.Bot):
             fresh = await asyncio.to_thread(self.service.get, giveaway_id)
         except ServiceError:
             return
+        await self._grant_entrants_role(fresh, member)
         await self._refresh_embed(fresh)
 
     async def _safe_followup(self, interaction: discord.Interaction, text: str) -> None:
@@ -195,6 +276,8 @@ class GiveawayBot(commands.Bot):
             fresh = await asyncio.to_thread(self.service.get, giveaway_id)
         except ServiceError:
             return
+        if removed:
+            await self._take_entrants_role(fresh, str(interaction.user.id))
         await self._refresh_embed(fresh)
 
     # -- auto-draw timer -------------------------------------------------
@@ -213,6 +296,7 @@ class GiveawayBot(commands.Bot):
             except Exception:
                 log.exception("end failed for %s", gw.id)
                 continue
+            await self._strip_entrants_role(ended)
             await self._announce(ended, winners)
 
     @tick.before_loop
@@ -313,7 +397,19 @@ def wire_commands(bot: GiveawayBot) -> None:
             view=bot._register_view(gw.id),
         )
         await asyncio.to_thread(svc.set_message, gw.id, str(msg.id))
-        await bot._safe_followup(interaction, f"✅ Giveaway started: {msg.jump_url}")
+        role_note = ""
+        if interaction.guild is not None:
+            try:
+                role = await interaction.guild.create_role(
+                    name=f"🎉 {prize[:60]}",
+                    mentionable=True,
+                    reason=f"Entrants role for giveaway {gw.id}",
+                )
+                await asyncio.to_thread(svc.set_entrants_role, gw.id, str(role.id))
+            except (discord.Forbidden, discord.HTTPException):
+                role_note = " (no entrants role — I need **Manage Roles**)"
+                log.warning("could not create entrants role in %s", interaction.guild.id)
+        await bot._safe_followup(interaction, f"✅ Giveaway started: {msg.jump_url}{role_note}")
 
     @bot.tree.command(name="giveaway_end", description="End a giveaway now and draw")
     async def giveaway_end(interaction: discord.Interaction, giveaway_id: str) -> None:
@@ -329,6 +425,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
+        await bot._strip_entrants_role(gw)
         await bot._announce(gw, winners)
         await bot._safe_followup(interaction, f"Ended with {len(winners)} winner(s).")
 
@@ -355,10 +452,11 @@ def wire_commands(bot: GiveawayBot) -> None:
             await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
             return
         try:
-            await asyncio.to_thread(svc.cancel, giveaway_id.strip())
+            gw = await asyncio.to_thread(svc.cancel, giveaway_id.strip())
         except ServiceError as exc:
             await interaction.response.send_message(f"⚠️ {exc.message}", ephemeral=True)
             return
+        await bot._strip_entrants_role(gw)
         await interaction.response.send_message("Giveaway cancelled.", ephemeral=True)
 
     @bot.tree.command(name="giveaway_list", description="Show active giveaways")

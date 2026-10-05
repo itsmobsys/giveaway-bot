@@ -31,6 +31,12 @@ Needs **Server Members Intent** on (Bot tab in the Developer Portal) for role ch
 Message counts start accumulating the moment the bot logs in (even with no
 giveaway running), and **reset to 0 for everybody when a giveaway ends** —
 so each giveaway measures fresh activity since the last one ended.
+
+Joining grants a mentionable **🎉 \<prize\> entrants role** (created per
+giveaway, so you can ping everyone in it). Leaving removes it; when the
+giveaway ends or is cancelled it is taken from everyone — winners and losers
+alike — and the role is deleted. The bot needs **Manage Roles** for this; if
+it lacks the permission the giveaway still runs, just without the role.
 - `/giveaway_list`
 - `/giveaway_end giveaway_id`
 - `/giveaway_reroll giveaway_id [count]`

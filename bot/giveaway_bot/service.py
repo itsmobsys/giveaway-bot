@@ -38,6 +38,7 @@ class Giveaway:
     min_account_age_days: int
     min_messages: int
     image_url: str | None
+    entrants_role_id: str | None
     winners: list[str]
 
     @property
@@ -64,6 +65,7 @@ class Giveaway:
             min_account_age_days=int(row.get("min_account_age_days") or 0),
             min_messages=int(row.get("min_messages") or 0),
             image_url=str(row["image_url"]) if row.get("image_url") else None,
+            entrants_role_id=str(row["entrants_role_id"]) if row.get("entrants_role_id") else None,
             winners=[str(w) for w in winners] if isinstance(winners, list) else [],
         )
 
@@ -276,6 +278,12 @@ class GiveawayService:
     def set_message(self, giveaway_id: str, message_id: str) -> None:
         self.db.execute(
             "UPDATE simple_giveaways SET message_id = ? WHERE id = ?", (message_id, giveaway_id)
+        )
+
+    def set_entrants_role(self, giveaway_id: str, role_id: str | None) -> None:
+        self.db.execute(
+            "UPDATE simple_giveaways SET entrants_role_id = ? WHERE id = ?",
+            (role_id, giveaway_id),
         )
 
     def due(self, now: int | None = None) -> list[Giveaway]:

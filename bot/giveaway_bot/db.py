@@ -47,7 +47,7 @@ def _brief(exc: Exception, limit: int = 120) -> str:
 TABLE_GIVEAWAYS = "simple_giveaways"
 TABLE_ENTRIES = "simple_entries"
 
-SCHEMA = f"""
+SCHEMA_TABLES = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_GIVEAWAYS} (
   id TEXT PRIMARY KEY,
   guild_id TEXT NOT NULL,
@@ -62,6 +62,7 @@ CREATE TABLE IF NOT EXISTS {TABLE_GIVEAWAYS} (
   min_account_age_days INTEGER NOT NULL DEFAULT 0,
   min_messages INTEGER NOT NULL DEFAULT 0,
   image_url TEXT,
+  entrants_role_id TEXT,
   created_by TEXT NOT NULL,
   created_at INTEGER NOT NULL,
   ended_at INTEGER,
@@ -74,6 +75,9 @@ CREATE TABLE IF NOT EXISTS {TABLE_ENTRIES} (
   entered_at INTEGER NOT NULL,
   PRIMARY KEY (giveaway_id, user_id)
 );
+"""
+
+SCHEMA_INDEXES = f"""
 CREATE INDEX IF NOT EXISTS idx_simple_gw_status_ends ON {TABLE_GIVEAWAYS}(status, ends_at);
 CREATE INDEX IF NOT EXISTS idx_simple_entries_giveaway ON {TABLE_ENTRIES}(giveaway_id);
 """
@@ -118,17 +122,42 @@ class Database:
 
     def init_schema(self) -> None:
         conn = self._conn()
-        for stmt in [s.strip() for s in SCHEMA.split(";") if s.strip()]:
+        for stmt in [s.strip() for s in SCHEMA_TABLES.split(";") if s.strip()]:
             conn.execute(stmt)
-        # Columns added after the v2 launch (image_url, min_messages). The
-        # table already exists on live databases, so add what's missing.
+        # Full column set, so a table created by any earlier v2 revision
+        # gains whatever it is missing (live databases are never rebuilt).
+        # Indexes come last: they reference columns that may only just have
+        # been added above.
         self._ensure_columns(
             TABLE_GIVEAWAYS,
-            {"min_messages": "INTEGER NOT NULL DEFAULT 0", "image_url": "TEXT"},
+            {
+                "guild_id": "TEXT NOT NULL DEFAULT ''",
+                "channel_id": "TEXT NOT NULL DEFAULT ''",
+                "message_id": "TEXT",
+                "prize": "TEXT NOT NULL DEFAULT ''",
+                "winner_count": "INTEGER NOT NULL DEFAULT 1",
+                "ends_at": "INTEGER NOT NULL DEFAULT 0",
+                "status": "TEXT NOT NULL DEFAULT 'active'",
+                "required_role_id": "TEXT",
+                "blocked_role_id": "TEXT",
+                "min_account_age_days": "INTEGER NOT NULL DEFAULT 0",
+                "min_messages": "INTEGER NOT NULL DEFAULT 0",
+                "image_url": "TEXT",
+                "entrants_role_id": "TEXT",
+                "created_by": "TEXT NOT NULL DEFAULT ''",
+                "created_at": "INTEGER NOT NULL DEFAULT 0",
+                "ended_at": "INTEGER",
+                "winners_json": "TEXT NOT NULL DEFAULT '[]'",
+            },
         )
         self._ensure_columns(
             TABLE_ENTRIES,
-            {"username": "TEXT NOT NULL DEFAULT ''", "entered_at": "INTEGER NOT NULL DEFAULT 0"},
+            {
+                "giveaway_id": "TEXT NOT NULL DEFAULT ''",
+                "user_id": "TEXT NOT NULL DEFAULT ''",
+                "username": "TEXT NOT NULL DEFAULT ''",
+                "entered_at": "INTEGER NOT NULL DEFAULT 0",
+            },
         )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS simple_message_counts (
@@ -138,6 +167,8 @@ class Database:
   PRIMARY KEY (guild_id, user_id)
 )"""
         )
+        for stmt in [s.strip() for s in SCHEMA_INDEXES.split(";") if s.strip()]:
+            conn.execute(stmt)
 
     def _ensure_columns(self, table: str, desired: dict[str, str]) -> None:
         try:
