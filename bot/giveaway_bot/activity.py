@@ -18,6 +18,7 @@ unit tested without a Discord connection.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -267,9 +268,10 @@ class MessageActivityTracker:
                     state.buffer = events + state.buffer
             return 0
 
-        self.stats["counted"] += written
-        self.stats["flushed"] += written
-        self.stats["batches"] += 1
+        with self._lock:
+            self.stats["counted"] += written
+            self.stats["flushed"] += written
+            self.stats["batches"] += 1
         return written
 
     def shutdown(self) -> None:
@@ -295,12 +297,18 @@ class MessageActivityTracker:
         Fetches recent history and applies it idempotently, so overlapping or
         repeated calls cannot inflate anyone's count.
         """
-        channel = bot.get_channel(int(channel_id))
+        try:
+            channel = bot.get_channel(int(channel_id))
+        except (TypeError, ValueError):
+            return {"added": 0, "skipped": 0, "bots_skipped": 0, "window_skipped": 0}
         if channel is None or not hasattr(channel, "history"):
             return {"added": 0, "skipped": 0, "bots_skipped": 0, "window_skipped": 0}
 
-        state = activity_repo.channel_state(self.db, guild_id, channel_id)
-        high_water = int(state["last_message_id"]) if state else 0
+        state = await asyncio.to_thread(activity_repo.channel_state, self.db, guild_id, channel_id)
+        try:
+            high_water = int(state["last_message_id"]) if state else 0
+        except (TypeError, ValueError):
+            high_water = 0
 
         messages: list[dict[str, Any]] = []
         try:
@@ -318,7 +326,8 @@ class MessageActivityTracker:
             return {"added": 0, "skipped": 0, "bots_skipped": 0, "window_skipped": 0}
 
         tracked = set(self._states.get(guild_id, _GuildState()).tracked_channels)
-        result = activity_repo.backfill_messages(
+        result = await asyncio.to_thread(
+            activity_repo.backfill_messages,
             self.db,
             guild_id=guild_id,
             channel_id=channel_id,
@@ -326,17 +335,20 @@ class MessageActivityTracker:
             ignore_bots=True,
         )
         if tracked:
-            for message in messages:
-                if message["author"]["bot"]:
-                    continue
-                activity_repo.record_channel_count(
-                    self.db,
-                    guild_id=guild_id,
-                    user_id=str(message["author"]["id"]),
-                    channel_id=channel_id,
-                    message_at=int(message["timestamp_ms"]),
-                    tracked_channels=tracked,
-                )
+            def _apply_tracked() -> None:
+                for message in messages:
+                    if message["author"]["bot"]:
+                        continue
+                    activity_repo.record_channel_count(
+                        self.db,
+                        guild_id=guild_id,
+                        user_id=str(message["author"]["id"]),
+                        channel_id=channel_id,
+                        message_at=int(message["timestamp_ms"]),
+                        tracked_channels=tracked,
+                    )
+
+            await asyncio.to_thread(_apply_tracked)
         log.info(
             "backfilled channel %s: +%d counted (%d already known, %d bots)",
             channel_id,

@@ -6,7 +6,7 @@
 # definition and holds the dev extras; `selftest` asserts the two agree, so a
 # dependency added there cannot silently go missing from a deploy.
 #
-# These versions are the ones the 27-check suite passes against, pinned exactly
+# These versions are the ones the 49-check suite passes against, pinned exactly
 # so a redeploy cannot quietly pick up a new major. Transitive dependencies are
 # left unpinned.
 

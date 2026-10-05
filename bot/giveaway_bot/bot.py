@@ -125,7 +125,7 @@ class GiveawayBot(commands.Bot):
     async def on_ready(self) -> None:
         log.info("logged in as %s (%d guilds)", self.user, len(self.guilds))
         for guild in self.guilds:
-            self._sync_guild(guild)
+            await self._sync_guild(guild)
         # Finish any draw that a crash interrupted.
         recovered = await asyncio.to_thread(self.service.recover_locked_draws)
         if recovered:
@@ -190,26 +190,29 @@ class GiveawayBot(commands.Bot):
         # gaps from the REST API instead of leaving counts quietly low.
         resumed_guilds = sorted(guild.id for guild in self.guilds)
         log.warning("gateway resumed for %d guild(s); scheduling activity backfill", len(resumed_guilds))
-        control.set_state(self.db, "activity_backfill_pending", ",".join(map(str, resumed_guilds)))
+        await asyncio.to_thread(
+            control.set_state, self.db, "activity_backfill_pending", ",".join(map(str, resumed_guilds))
+        )
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         if not self.settings.guild_allowed(str(guild.id)):
             log.warning("ignoring guild %s (not in allowlist)", guild.id)
             return
-        self._sync_guild(guild)
+        await self._sync_guild(guild)
 
     async def on_guild_remove(self, guild: discord.Guild) -> None:
-        guilds_repo.touch_guild(self.db, str(guild.id), bot_present=False)
+        await asyncio.to_thread(guilds_repo.touch_guild, self.db, str(guild.id), bot_present=False)
         log.info("left guild %s", guild.id)
 
-    def _sync_guild(self, guild: discord.Guild) -> None:
+    async def _sync_guild(self, guild: discord.Guild) -> None:
         if not self.settings.guild_allowed(str(guild.id)):
             log.warning("guild %s is blocked by configuration", guild.id)
             return
         icon = None
         if guild.icon:
             icon = str(guild.icon.url)
-        guilds_repo.upsert_guild(
+        await asyncio.to_thread(
+            guilds_repo.upsert_guild,
             self.db,
             str(guild.id),
             name=guild.name,
@@ -302,7 +305,7 @@ class GiveawayBot(commands.Bot):
             log.warning("failed to post giveaway %s: %s", giveaway.id, exc)
             return None
 
-        gw_repo.set_message_id(self.db, giveaway.id, str(message.id))
+        await asyncio.to_thread(gw_repo.set_message_id, self.db, giveaway.id, str(message.id))
         log.info("posted giveaway %s as message %s", giveaway.id, message.id)
         return message
 
@@ -362,10 +365,12 @@ class GiveawayBot(commands.Bot):
             display = member.display_name if member else f"User {winner.user_id}"
             winners.append((winner.user_id, str(display)))
 
-        previous = [record["user_id"] for record in self.db.query(
+        previous_rows = await asyncio.to_thread(
+            self.db.query,
             "SELECT DISTINCT user_id FROM giveaway_winners WHERE giveaway_id = ? AND round < ?",
             (giveaway.id, outcome.result.round_number),
-        )]
+        )
+        previous = [record["user_id"] for record in previous_rows]
         embed = embeds.build_winner_embed(
             giveaway,
             winners,
@@ -408,7 +413,7 @@ class GiveawayBot(commands.Bot):
 
     async def restore_views(self) -> None:
         """Re-register button handlers for every live giveaway after a restart."""
-        for giveaway in gw_repo.list_live(self.db, limit=400):
+        for giveaway in await asyncio.to_thread(gw_repo.list_live, self.db, limit=400):
             self._giveaway_view(giveaway)
         log.info("restored %d live giveaway view(s)", len(self._views))
 
@@ -428,7 +433,7 @@ class GiveawayBot(commands.Bot):
 
         await interaction.response.defer(ephemeral=True, thinking=True)
 
-        giveaway = gw_repo.get_giveaway(self.db, giveaway_id)
+        giveaway = await asyncio.to_thread(gw_repo.get_giveaway, self.db, giveaway_id)
         if giveaway is None:
             await interaction.followup.send("This giveaway no longer exists.", ephemeral=True)
             return
@@ -439,7 +444,7 @@ class GiveawayBot(commands.Bot):
         context["channel_id"] = str(channel.id) if channel else giveaway.channel_id
 
         if join:
-            outcome = self.service.join(giveaway, context)
+            outcome = await asyncio.to_thread(self.service.join, giveaway, context)
             if not outcome.joined:
                 embed = views.eligibility_embed(outcome.eligibility)
                 if outcome.duplicate:
@@ -452,7 +457,7 @@ class GiveawayBot(commands.Bot):
                 await self._sync_live_embed(giveaway_id)
                 return
 
-            fresh = self.service.get(giveaway_id)
+            fresh = await asyncio.to_thread(self.service.get, giveaway_id)
             view = self._giveaway_view(fresh)
             view.mark_entered(str(user.id), True)
 
@@ -475,14 +480,14 @@ class GiveawayBot(commands.Bot):
             )
         else:
             try:
-                removed = self.service.leave(giveaway, str(user.id))
+                removed = await asyncio.to_thread(self.service.leave, giveaway, str(user.id))
             except ServiceError as exc:
                 await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
                 return
             if not removed:
                 await interaction.followup.send("You were not entered in this giveaway.", ephemeral=True)
                 return
-            fresh = self.service.get(giveaway_id)
+            fresh = await asyncio.to_thread(self.service.get, giveaway_id)
             view = self._giveaway_view(fresh)
             view.mark_entered(str(user.id), False)
             # Leaving also releases the temporary role for this member.
@@ -525,7 +530,7 @@ class GiveawayBot(commands.Bot):
         await self.announce_winners(outcome)
 
     async def _sync_live_embed(self, giveaway_id: str) -> None:
-        giveaway = gw_repo.get_giveaway(self.db, giveaway_id)
+        giveaway = await asyncio.to_thread(gw_repo.get_giveaway, self.db, giveaway_id)
         if giveaway is None or not giveaway.message_id:
             return
         if giveaway.status is GiveawayStatus.ENDED:
@@ -543,7 +548,8 @@ class GiveawayBot(commands.Bot):
                 )
             except ServiceError as exc:
                 log.warning("could not end giveaway %s: %s", giveaway.id, exc.message)
-                control.audit(
+                await asyncio.to_thread(
+                    control.audit,
                     self.db,
                     guild_id=giveaway.guild_id,
                     giveaway_id=giveaway.id,
@@ -599,7 +605,7 @@ class GiveawayBot(commands.Bot):
 
     async def _job_maintenance(self) -> None:
         await asyncio.to_thread(self.service.housekeeping)
-        self.activity_tracker.refresh_requirements()
+        await asyncio.to_thread(self.activity_tracker.refresh_requirements)
 
     async def _job_flush_activity(self) -> None:
         if self.activity_tracker.pending():
@@ -623,8 +629,9 @@ class GiveawayBot(commands.Bot):
                 giveaway.id,
             )
             return giveaway
-        gw_repo.set_participant_role(self.db, giveaway.id, str(role.id))
-        control.audit(
+        await asyncio.to_thread(gw_repo.set_participant_role, self.db, giveaway.id, str(role.id))
+        await asyncio.to_thread(
+            control.audit,
             self.db,
             guild_id=giveaway.guild_id,
             giveaway_id=giveaway.id,
@@ -633,7 +640,7 @@ class GiveawayBot(commands.Bot):
             source="bot",
             after={"participant_role_id": str(role.id), "role_name": role.name},
         )
-        return self.service.get(giveaway.id)
+        return await asyncio.to_thread(self.service.get, giveaway.id)
 
     async def release_entrants_role(self, giveaway: Giveaway, *, reason: str) -> int:
         """Remove the temporary entrants role from everyone it was granted to.
@@ -644,7 +651,8 @@ class GiveawayBot(commands.Bot):
             return 0
         queued = await self.roles.release_for_giveaway(giveaway)
         await self.roles.drain(giveaway.guild_id, limit=200)
-        control.audit(
+        await asyncio.to_thread(
+            control.audit,
             self.db,
             guild_id=giveaway.guild_id,
             giveaway_id=giveaway.id,
@@ -663,8 +671,9 @@ class GiveawayBot(commands.Bot):
 
     async def _job_role_tasks(self) -> None:
         """Retry any entrants-role grant/revoke that has not landed yet."""
-        pending = self.db.scalar(
-            "SELECT COUNT(*) FROM giveaway_role_tasks WHERE status = 'pending'"
+        pending = await asyncio.to_thread(
+            self.db.scalar,
+            "SELECT COUNT(*) FROM giveaway_role_tasks WHERE status = 'pending'",
         )
         if not pending:
             return
@@ -674,7 +683,7 @@ class GiveawayBot(commands.Bot):
 
     async def _reconcile_roles(self) -> None:
         """Repair role state after a restart or a missed grant/revoke."""
-        for giveaway in gw_repo.list_public(self.db, limit=200):
+        for giveaway in await asyncio.to_thread(gw_repo.list_public, self.db, limit=200):
             if giveaway.status is GiveawayStatus.ENDED:
                 continue
             try:
@@ -691,7 +700,8 @@ class GiveawayBot(commands.Bot):
             return
         guild_ids = [part for part in pending.split(",") if part]
         for guild_id in guild_ids:
-            for channel_id in activity_repo.watched_channels(self.db, guild_id)[:10]:
+            channels = await asyncio.to_thread(activity_repo.watched_channels, self.db, guild_id)
+            for channel_id in channels[:10]:
                 try:
                     await self.activity_tracker.backfill_channel(self, guild_id, channel_id)
                 except Exception:  # noqa: BLE001 - backfill must never crash the bot

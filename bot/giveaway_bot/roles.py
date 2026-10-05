@@ -119,7 +119,8 @@ class RoleManager:
         if not giveaway.participant_role_id:
             return False
         try:
-            control.role_task(
+            await asyncio.to_thread(
+                control.role_task,
                 self.db,
                 giveaway_id=giveaway.id,
                 user_id=user_id,
@@ -156,7 +157,8 @@ class RoleManager:
                 user_id, giveaway.id,
             )
             return False
-        control.role_task(
+        await asyncio.to_thread(
+            control.role_task,
             self.db,
             giveaway_id=giveaway.id,
             user_id=user_id,
@@ -175,9 +177,10 @@ class RoleManager:
         """
         from .repositories import entries as entries_repo
 
-        members = entries_repo.users_with_bot_role(self.db, giveaway.id)
+        members = await asyncio.to_thread(entries_repo.users_with_bot_role, self.db, giveaway.id)
         for user_id in members:
-            control.role_task(
+            await asyncio.to_thread(
+                control.role_task,
                 self.db,
                 giveaway_id=giveaway.id,
                 user_id=user_id,
@@ -196,20 +199,30 @@ class RoleManager:
     # ----------------------------------------------------------------- draining
     async def drain(self, guild_id: str, *, limit: int = 25) -> int:
         """Apply pending role tasks for one guild. Returns successes."""
-        guild = self.bot.get_guild(int(guild_id))
+        try:
+            guild = self.bot.get_guild(int(guild_id))
+        except (TypeError, ValueError):
+            return 0
         if guild is None:
             return 0
         applied = 0
-        for task in control.claim_role_tasks(self.db, limit=limit, guild_id=str(guild_id)):
+        tasks = await asyncio.to_thread(
+            control.claim_role_tasks, self.db, limit=limit, guild_id=str(guild_id)
+        )
+        for task in tasks:
             ok, error = await self._apply(guild, task)
             if ok:
-                control.complete_role_task(self.db, int(task["id"]), ok=True)
+                await asyncio.to_thread(control.complete_role_task, self.db, int(task["id"]), ok=True)
                 if task["action"] == "remove":
                     # Clear provenance so a second end() cannot queue a duplicate.
-                    self.forget_grant(str(task["giveaway_id"]), str(task["user_id"]))
+                    await asyncio.to_thread(
+                        self.forget_grant, str(task["giveaway_id"]), str(task["user_id"])
+                    )
                 applied += 1
             else:
-                status = control.complete_role_task(self.db, int(task["id"]), ok=False, error=error)
+                status = await asyncio.to_thread(
+                    control.complete_role_task, self.db, int(task["id"]), ok=False, error=error
+                )
                 if status == "failed":
                     log.error(
                         "role task %s (%s %s in guild %s) failed permanently: %s",
@@ -226,21 +239,33 @@ class RoleManager:
 
     async def _apply(self, guild: discord.Guild, task: dict[str, Any]) -> tuple[bool, str | None]:
         """Perform one add/remove. Never raises."""
-        user_id = int(task["user_id"])
+        try:
+            user_id = int(task["user_id"])
+        except (TypeError, ValueError):
+            return True, None
         member = guild.get_member(user_id)
         if member is None:
             # The member left the server: there is nothing to grant or revoke.
             # Treat as complete so the task does not retry forever.
             return True, None
 
-        role = guild.get_role(int(task.get("role_id") or 0)) if task.get("role_id") else None
+        try:
+            wanted_role = int(task.get("role_id") or 0) if task.get("role_id") else 0
+        except (TypeError, ValueError):
+            wanted_role = 0
+        role = guild.get_role(wanted_role) if wanted_role else None
         if role is None:
             from .repositories import giveaways as gw_repo
 
-            giveaway = gw_repo.get_giveaway(self.db, str(task["giveaway_id"]))
+            giveaway = await asyncio.to_thread(
+                gw_repo.get_giveaway, self.db, str(task["giveaway_id"])
+            )
             if giveaway is None or not giveaway.participant_role_id:
                 return True, None
-            role = guild.get_role(int(giveaway.participant_role_id))
+            try:
+                role = guild.get_role(int(giveaway.participant_role_id))
+            except (TypeError, ValueError):
+                return True, None
         if role is None:
             # Role was deleted by staff. Nothing to do; do not retry forever.
             log.info("guild %s: entrants role missing, skipping task", guild.id)
@@ -277,15 +302,23 @@ class RoleManager:
         """
         from .repositories import entries as entries_repo
 
-        guild = self.bot.get_guild(int(giveaway.guild_id))
+        try:
+            guild = self.bot.get_guild(int(giveaway.guild_id))
+        except (TypeError, ValueError):
+            return {"granted": 0, "revoked": 0}
         if guild is None or not giveaway.participant_role_id:
             return {"granted": 0, "revoked": 0}
 
-        role = guild.get_role(int(giveaway.participant_role_id))
+        try:
+            role = guild.get_role(int(giveaway.participant_role_id))
+        except (TypeError, ValueError):
+            return {"granted": 0, "revoked": 0}
         if role is None:
             return {"granted": 0, "revoked": 0}
 
-        expected = set(entries_repo.users_with_bot_role(self.db, giveaway.id))
+        expected = set(
+            await asyncio.to_thread(entries_repo.users_with_bot_role, self.db, giveaway.id)
+        )
         granted = revoked = 0
 
         for member in guild.members:
@@ -301,7 +334,9 @@ class RoleManager:
                 has_role
                 and not should_have
                 # Only strip from members we granted it to.
-                and entries_repo.has_bot_grant(self.db, giveaway.id, str(member.id))
+                and await asyncio.to_thread(
+                    entries_repo.has_bot_grant, self.db, giveaway.id, str(member.id)
+                )
             ):
                     try:
                         await member.remove_roles(role, reason="Giveaway Bot: reconcile entrants")

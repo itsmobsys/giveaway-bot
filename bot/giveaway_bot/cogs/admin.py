@@ -40,12 +40,14 @@ class AdminCommands(commands.Cog, name="admin"):
         # the guild the command was typed in.
         identifier = identifier.strip()
         if identifier.startswith("gw_"):
-            record = gw_repo.get_giveaway(self.bot.db, identifier)
+            record = await asyncio.to_thread(gw_repo.get_giveaway, self.bot.db, identifier)
             if record is not None and record.guild_id != str(interaction.guild_id):
                 return None
             return record
         if identifier.isdigit():
-            return gw_repo.get_by_message(self.bot.db, str(interaction.guild_id), identifier)
+            return await asyncio.to_thread(
+                gw_repo.get_by_message, self.bot.db, str(interaction.guild_id), identifier
+            )
         return None
 
     async def _run(
@@ -62,7 +64,7 @@ class AdminCommands(commands.Cog, name="admin"):
             return None
         actor = self.bot.actor_for(interaction.user)
         try:
-            updated = await operation(actor, record, **kwargs)
+            updated = await asyncio.to_thread(operation, actor, record, **kwargs)
         except ServiceError as exc:
             await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
             return None
@@ -165,9 +167,10 @@ class AdminCommands(commands.Cog, name="admin"):
             await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
             return
         if outcome is None:
-            await self.bot.render_giveaway(self.bot.service.get(record.id), announce=True)
+            ended = await asyncio.to_thread(self.bot.service.get, record.id)
+            await self.bot.render_giveaway(ended, announce=True)
             await self.bot.release_entrants_role(
-                self.bot.service.get(record.id), reason="slash_command_cancel"
+                ended, reason="slash_command_cancel"
             )
             await interaction.followup.send("🚫 Ended without a draw.", ephemeral=True)
             return
@@ -341,7 +344,9 @@ class AdminCommands(commands.Cog, name="admin"):
         }
         actor = self.bot.actor_for(interaction.user)
         try:
-            updated = self.bot.service.set_message_requirement(actor, record, payload=payload)
+            updated = await asyncio.to_thread(
+                self.bot.service.set_message_requirement, actor, record, payload=payload
+            )
         except ServiceError as exc:
             await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
             return
@@ -349,13 +354,13 @@ class AdminCommands(commands.Cog, name="admin"):
             await interaction.followup.send("⚠️ " + "; ".join(exc.errors.values()), ephemeral=True)
             return
 
-        self.bot.activity_tracker.refresh_requirements()
+        await asyncio.to_thread(self.bot.activity_tracker.refresh_requirements)
         await self.bot.render_giveaway(updated)
 
         report: dict[str, Any] = {"checked": 0, "flagged": 0, "restored": 0}
         if revalidate and updated.min_messages > 0:
-            report = self.bot.service.revalidate_message_activity(actor, updated)
-            await self.bot.render_giveaway(self.bot.service.get(updated.id))
+            report = await asyncio.to_thread(self.bot.service.revalidate_message_activity, actor, updated)
+            await self.bot.render_giveaway(await asyncio.to_thread(self.bot.service.get, updated.id))
 
         if updated.min_messages == 0:
             message = "💬 Message requirement **disabled**."
@@ -387,7 +392,7 @@ class AdminCommands(commands.Cog, name="admin"):
                 f"**{record.title}** has no message requirement.", ephemeral=True
             )
             return
-        stats = self.bot.service.message_progress(record, str(interaction.user.id))
+        stats = await asyncio.to_thread(self.bot.service.message_progress, record, str(interaction.user.id))
         bar = _progress_bar(stats["current"], stats["required"])
         verdict = (
             "✅ You can enter now." if stats["eligible"]
@@ -412,14 +417,14 @@ class AdminCommands(commands.Cog, name="admin"):
         await interaction.response.defer(ephemeral=True, thinking=True)
         from ..repositories import giveaways as gw_repo
 
-        active = gw_repo.find_active(self.bot.db, str(interaction.guild_id))
+        active = await asyncio.to_thread(gw_repo.find_active, self.bot.db, str(interaction.guild_id))
         if active is None:
             await interaction.followup.send(
                 "No active giveaway in this server right now.", ephemeral=True
             )
             return
 
-        giveaway = gw_repo.get_giveaway(self.bot.db, str(active["id"]))
+        giveaway = await asyncio.to_thread(gw_repo.get_giveaway, self.bot.db, str(active["id"]))
         role_id = active.get("participant_role_id")
         if role_id:
             role_line = (
@@ -451,7 +456,9 @@ class AdminCommands(commands.Cog, name="admin"):
         from ..repositories import control
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-        rows = control.list_audit(self.bot.db, guild_id=str(interaction.guild_id), limit=10)
+        rows = await asyncio.to_thread(
+            control.list_audit, self.bot.db, guild_id=str(interaction.guild_id), limit=10
+        )
         if not rows:
             await interaction.followup.send("No audit entries yet.", ephemeral=True)
             return

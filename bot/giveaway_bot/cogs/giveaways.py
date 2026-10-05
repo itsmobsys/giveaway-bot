@@ -51,12 +51,12 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
             # builds the member context from `interaction.guild`. Without the check
             # guild B's rules (min_guild_join_days and the rest) would be applied
             # to a member of guild A and admitted into B's prize pool.
-            record = gw_repo.get_giveaway(self.bot.db, identifier)
+            record = await asyncio.to_thread(gw_repo.get_giveaway, self.bot.db, identifier)
             if record is not None and record.guild_id != str(guild_id):
                 return None
             return record
         if identifier.isdigit():
-            return gw_repo.get_by_message(self.bot.db, guild_id, identifier)
+            return await asyncio.to_thread(gw_repo.get_by_message, self.bot.db, guild_id, identifier)
         return None
 
     # --------------------------------------------------------------- commands
@@ -152,7 +152,8 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
             return
 
         try:
-            giveaway = self.bot.service.create(
+            giveaway = await asyncio.to_thread(
+                self.bot.service.create,
                 self.bot.actor_for(interaction.user),
                 guild_id=str(interaction.guild_id),
                 channel_id=str(target.id),
@@ -168,10 +169,10 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
         # Temporary entrants role, created lazily and reused across giveaways.
         giveaway = await self.bot.attach_entrants_role(giveaway)
         await self.bot.render_giveaway(giveaway, announce=True)
-        fresh = self.bot.service.get(giveaway.id)
+        fresh = await asyncio.to_thread(self.bot.service.get, giveaway.id)
         # A new requirement means this guild now needs counting; recompute the
         # watched set so no message is missed from here on.
-        self.bot.activity_tracker.refresh_requirements()
+        await asyncio.to_thread(self.bot.activity_tracker.refresh_requirements)
         role_line = ""
         if fresh.participant_role_id:
             role_line = (
@@ -216,7 +217,7 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
 
         context = member_context(interaction.user, interaction.guild)
         context["channel_id"] = str(interaction.channel_id)
-        outcome = self.bot.service.join(record, context)
+        outcome = await asyncio.to_thread(self.bot.service.join, record, context)
         if not outcome.joined:
             message = outcome.eligibility.message if not outcome.duplicate else "You are already entered."
             await interaction.followup.send(f"🎟️ {message}", ephemeral=True)
@@ -235,7 +236,7 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
             await interaction.followup.send("⚠️ Giveaway not found.", ephemeral=True)
             return
         try:
-            removed = self.bot.service.leave(record, str(interaction.user.id))
+            removed = await asyncio.to_thread(self.bot.service.leave, record, str(interaction.user.id))
         except ServiceError as exc:
             await interaction.followup.send(f"⚠️ {exc.message}", ephemeral=True)
             return
@@ -249,7 +250,9 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
     @app_commands.checks.has_permissions(manage_guild=True)
     async def list_giveaways(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
-        records = gw_repo.list_for_guild(self.bot.db, str(interaction.guild_id), limit=15)
+        records = await asyncio.to_thread(
+            gw_repo.list_for_guild, self.bot.db, str(interaction.guild_id), limit=15
+        )
         if not records:
             await interaction.followup.send("No giveaways yet.", ephemeral=True)
             return
@@ -279,7 +282,9 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
         if record is None:
             await interaction.followup.send("⚠️ Giveaway not found.", ephemeral=True)
             return
-        entries, participants = entries_repo.active_entry_totals(self.bot.db, record.id)
+        entries, participants = await asyncio.to_thread(
+            entries_repo.active_entry_totals, self.bot.db, record.id
+        )
         await interaction.response.send_message(
             embed=discord.Embed(
                 title=f"🎟️ {record.title}",
@@ -303,8 +308,8 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
         if record is None:
             await interaction.followup.send("⚠️ Giveaway not found.", ephemeral=True)
             return
-        draws = draws_repo.list_draws(self.bot.db, record.id)
-        winners = draws_repo.list_winners(self.bot.db, record.id)
+        draws = await asyncio.to_thread(draws_repo.list_draws, self.bot.db, record.id)
+        winners = await asyncio.to_thread(draws_repo.list_winners, self.bot.db, record.id)
         if not draws:
             await interaction.followup.send("This giveaway has not been drawn yet.", ephemeral=True)
             return
@@ -338,7 +343,7 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
         if record is None:
             await interaction.followup.send("⚠️ Giveaway not found.", ephemeral=True)
             return
-        verification = self.bot.service.verification_for(record.id)
+        verification = await asyncio.to_thread(self.bot.service.verification_for, record.id)
         if verification is None:
             await interaction.followup.send("This giveaway has not been drawn yet.", ephemeral=True)
             return
@@ -361,7 +366,8 @@ class GiveawayCommands(commands.Cog, name="giveaway"):
         if record.seed_revealed_at is None:
             await interaction.followup.send("This giveaway has not been drawn yet.", ephemeral=True)
             return
-        await self.bot.post_verify(record, self.bot.service.verification_for(record.id))
+        verification = await asyncio.to_thread(self.bot.service.verification_for, record.id)
+        await self.bot.post_verify(record, verification)
         await interaction.followup.send("🔐 Seed revealed in this channel.", ephemeral=True)
 
     # ------------------------------------------------------------ autocomplete

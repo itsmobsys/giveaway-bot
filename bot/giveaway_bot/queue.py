@@ -42,7 +42,8 @@ async def execute_command(bot: Any, command: Any) -> dict[str, Any]:
         raise
     except Exception as exc:  # noqa: BLE001
         log.exception("command %s (%s) crashed", command.kind, command.id)
-        control.audit(
+        await asyncio.to_thread(
+            control.audit,
             bot.db,
             guild_id=command.guild_id,
             giveaway_id=command.giveaway_id,
@@ -60,7 +61,10 @@ async def execute_command(bot: Any, command: Any) -> dict[str, Any]:
 # Helpers
 # --------------------------------------------------------------------------- #
 def _guild_or_fail(bot: Any, guild_id: str) -> Any:
-    guild = bot.get_guild(int(guild_id))
+    try:
+        guild = bot.get_guild(int(guild_id))
+    except (TypeError, ValueError):
+        guild = None
     if guild is None:
         raise ServiceError("bot_not_in_guild", "The bot is not in this server any more.")
     return guild
@@ -91,9 +95,14 @@ def _resolve_giveaway_channel(bot: Any, guild: Any) -> Any:
     channel = None
     configured = getattr(bot.settings, "giveaway_channel_id", "")
     if configured:
-        channel = bot.get_channel(int(configured))
-        if channel is None:
-            channel = guild.get_channel(int(configured))
+        try:
+            wanted = int(configured)
+        except (TypeError, ValueError):
+            wanted = None
+        if wanted is not None:
+            channel = bot.get_channel(wanted)
+            if channel is None:
+                channel = guild.get_channel(wanted)
 
     if channel is None:
         raise ServiceError(
@@ -131,9 +140,13 @@ def _resolve_giveaway_channel(bot: Any, guild: Any) -> Any:
 
 def _validate_channel(bot: Any, guild: Any, channel_id: str) -> Any:
     """Check a channel referenced by a *rule* (e.g. an entry channel filter)."""
-    channel = bot.get_channel(int(channel_id))
+    try:
+        wanted = int(channel_id)
+    except (TypeError, ValueError):
+        raise ServiceError("unknown_channel", "That channel no longer exists.") from None
+    channel = bot.get_channel(wanted)
     if channel is None:
-        channel = guild.get_channel(int(channel_id))
+        channel = guild.get_channel(wanted)
     if channel is None:
         raise ServiceError("unknown_channel", "That channel no longer exists.")
     return channel
@@ -141,7 +154,7 @@ def _validate_channel(bot: Any, guild: Any, channel_id: str) -> Any:
 
 async def _refresh(bot: Any, giveaway_id: str) -> None:
     """Re-render a giveaway message after a mutation."""
-    giveaway = bot.service.get(giveaway_id)
+    giveaway = await asyncio.to_thread(bot.service.get, giveaway_id)
     if not giveaway.message_id:
         return
     await bot.render_giveaway(giveaway, announce=giveaway.status is GiveawayStatus.ENDED)
@@ -161,7 +174,7 @@ async def _handle_create(bot: Any, command: Any, actor: Actor) -> dict[str, Any]
     # concurrent giveaway in a guild - exactly what this invariant exists to
     # prevent, and what the temporary entrants role depends on. It was also never
     # audited.
-    existing = gw_repo.find_active(bot.db, str(guild.id))
+    existing = await asyncio.to_thread(gw_repo.find_active, bot.db, str(guild.id))
     if existing is not None:
         raise ServiceError(
             "giveaway_already_running",
@@ -184,7 +197,7 @@ async def _handle_create(bot: Any, command: Any, actor: Actor) -> dict[str, Any]
     # from the very first second gets it.
     giveaway = await bot.attach_entrants_role(giveaway)
     await bot.render_giveaway(giveaway)
-    fresh = bot.service.get(giveaway.id)
+    fresh = await asyncio.to_thread(bot.service.get, giveaway.id)
     return {
         "ok": True,
         "giveaway_id": fresh.id,
@@ -197,7 +210,7 @@ async def _handle_create(bot: Any, command: Any, actor: Actor) -> dict[str, Any]
 
 async def _handle_update(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
     guild = _guild_or_fail(bot, command.guild_id)
-    giveaway = bot.service.get(str(command.giveaway_id))
+    giveaway = await asyncio.to_thread(bot.service.get, str(command.giveaway_id))
     _validate_roles_exist(bot, guild, list(command.payload.get("required_role_ids") or []))
     _validate_roles_exist(bot, guild, list(command.payload.get("blacklist_role_ids") or []))
 
@@ -213,7 +226,7 @@ async def _handle_update(bot: Any, command: Any, actor: Actor) -> dict[str, Any]
 
 
 async def _handle_pause(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
-    giveaway = bot.service.get(str(command.giveaway_id))
+    giveaway = await asyncio.to_thread(bot.service.get, str(command.giveaway_id))
     updated = await asyncio.to_thread(
         bot.service.pause, actor, giveaway, reason=command.payload.get("reason")
     )
@@ -222,7 +235,7 @@ async def _handle_pause(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
 
 
 async def _handle_resume(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
-    giveaway = bot.service.get(str(command.giveaway_id))
+    giveaway = await asyncio.to_thread(bot.service.get, str(command.giveaway_id))
     updated = await asyncio.to_thread(bot.service.resume, actor, giveaway)
     await _refresh(bot, updated.id)
     return {"ok": True, "status": updated.status.value, "ends_at": updated.ends_at}
@@ -230,7 +243,7 @@ async def _handle_resume(bot: Any, command: Any, actor: Actor) -> dict[str, Any]
 
 async def _handle_extend(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
     args = validate_mutation_action(command.kind, command.payload)
-    giveaway = bot.service.get(str(command.giveaway_id))
+    giveaway = await asyncio.to_thread(bot.service.get, str(command.giveaway_id))
     updated = await asyncio.to_thread(
         bot.service.extend, actor, giveaway, duration_ms=args["duration_ms"]
     )
@@ -240,7 +253,7 @@ async def _handle_extend(bot: Any, command: Any, actor: Actor) -> dict[str, Any]
 
 async def _handle_shorten(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
     args = validate_mutation_action(command.kind, command.payload)
-    giveaway = bot.service.get(str(command.giveaway_id))
+    giveaway = await asyncio.to_thread(bot.service.get, str(command.giveaway_id))
     updated = await asyncio.to_thread(
         bot.service.shorten, actor, giveaway, duration_ms=args["duration_ms"]
     )
@@ -249,7 +262,7 @@ async def _handle_shorten(bot: Any, command: Any, actor: Actor) -> dict[str, Any
 
 
 async def _handle_end(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
-    giveaway = bot.service.get(str(command.giveaway_id))
+    giveaway = await asyncio.to_thread(bot.service.get, str(command.giveaway_id))
     reason = command.payload.get("reason") or "ended_from_dashboard"
 
     # If the giveaway carries a message-activity rule, re-check it immediately
@@ -259,7 +272,7 @@ async def _handle_end(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
         activity_report = await asyncio.to_thread(
             bot.service.revalidate_message_activity, actor, giveaway
         )
-        giveaway = bot.service.get(giveaway.id)
+        giveaway = await asyncio.to_thread(bot.service.get, giveaway.id)
 
     outcome = await asyncio.to_thread(bot.service.end, actor, giveaway, reason=reason, draw=True)
     if outcome is not None:
@@ -280,20 +293,21 @@ async def _handle_end(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
 
 async def _handle_cancel(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
     """End a giveaway *without* selecting any winner."""
-    giveaway = bot.service.get(str(command.giveaway_id))
+    giveaway = await asyncio.to_thread(bot.service.get, str(command.giveaway_id))
     reason = command.payload.get("reason") or "cancelled_from_dashboard"
     outcome = await asyncio.to_thread(bot.service.end, actor, giveaway, reason=reason, draw=False)
     if outcome is None:
-        await bot.render_giveaway(bot.service.get(giveaway.id), announce=True)
+        ended = await asyncio.to_thread(bot.service.get, giveaway.id)
+        await bot.render_giveaway(ended, announce=True)
     # A cancelled giveaway still releases the entrants role.
     released = await bot.release_entrants_role(
-        bot.service.get(giveaway.id), reason="cancelled"
+        await asyncio.to_thread(bot.service.get, giveaway.id), reason="cancelled"
     )
     return {"ok": True, "drawn": False, "reason": reason, "role_released": released}
 
 
 async def _handle_reroll(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
-    giveaway = bot.service.get(str(command.giveaway_id))
+    giveaway = await asyncio.to_thread(bot.service.get, str(command.giveaway_id))
     reason = command.payload.get("reason") or "reroll_from_dashboard"
     outcome = await asyncio.to_thread(bot.service.reroll, actor, giveaway, reason=reason)
     await bot.announce_winners(outcome)
@@ -308,7 +322,7 @@ async def _handle_reroll(bot: Any, command: Any, actor: Actor) -> dict[str, Any]
 
 async def _handle_reveal(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
     """Post the revealed seed + verification into the Discord channel."""
-    giveaway = bot.service.get(str(command.giveaway_id))
+    giveaway = await asyncio.to_thread(bot.service.get, str(command.giveaway_id))
     if giveaway.seed_revealed_at is None:
         raise ServiceError("not_revealed", "This giveaway has not been drawn yet.")
     verification = await asyncio.to_thread(bot.service.verification_for, giveaway.id)
@@ -318,20 +332,19 @@ async def _handle_reveal(bot: Any, command: Any, actor: Actor) -> dict[str, Any]
 
 async def _handle_announce(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
     """Repost the last winner announcement (used after manual DMs etc.)."""
-    giveaway = bot.service.get(str(command.giveaway_id))
+    giveaway = await asyncio.to_thread(bot.service.get, str(command.giveaway_id))
     record = await asyncio.to_thread(draws_repo.latest_draw, bot.db, giveaway.id)
     if record is None:
         raise ServiceError("no_draw", "There is no draw to announce.")
-    channel = bot.get_channel(int(giveaway.channel_id))
+    channel = bot._text_channel(giveaway.channel_id)
     if channel is None:
         raise ServiceError("unknown_channel", "The announcement channel is unavailable.")
-    winners = [
-        str(row["user_id"])
-        for row in bot.db.query(
-            "SELECT user_id FROM giveaway_winners WHERE draw_id = ? ORDER BY rank",
-            (record.id,),
-        )
-    ]
+    winner_rows = await asyncio.to_thread(
+        bot.db.query,
+        "SELECT user_id FROM giveaway_winners WHERE draw_id = ? ORDER BY rank",
+        (record.id,),
+    )
+    winners = [str(row["user_id"]) for row in winner_rows]
     await channel.send(
         content=" ".join(f"<@{user_id}>" for user_id in winners) or "No winners this round.",
         allowed_mentions=discord.AllowedMentions(
@@ -344,7 +357,7 @@ async def _handle_announce(bot: Any, command: Any, actor: Actor) -> dict[str, An
 async def _handle_message_requirement(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
     """Set or clear the per-giveaway message-activity requirement."""
     guild = _guild_or_fail(bot, command.guild_id)
-    giveaway = bot.service.get(str(command.giveaway_id))
+    giveaway = await asyncio.to_thread(bot.service.get, str(command.giveaway_id))
 
     channels = list(command.payload.get("message_count_channel_ids") or [])
     if channels:
@@ -354,7 +367,7 @@ async def _handle_message_requirement(bot: Any, command: Any, actor: Actor) -> d
         bot.service.set_message_requirement, actor, giveaway, payload=command.payload
     )
     # Recompute which guilds/channels need counting right away.
-    bot.activity_tracker.refresh_requirements()
+    await asyncio.to_thread(bot.activity_tracker.refresh_requirements)
     await _refresh(bot, updated.id)
     return {
         "ok": True,
@@ -368,15 +381,22 @@ async def _handle_message_requirement(bot: Any, command: Any, actor: Actor) -> d
 
 async def _handle_activity_revalidate(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
     """Re-check every participant against the current message requirement."""
-    giveaway = bot.service.get(str(command.giveaway_id))
+    giveaway = await asyncio.to_thread(bot.service.get, str(command.giveaway_id))
     report = await asyncio.to_thread(bot.service.revalidate_message_activity, actor, giveaway)
     await _refresh(bot, giveaway.id)
     return {"ok": True, **report}
 
 
 def _validate_channel_ids_exist(bot: Any, guild: Any, channel_ids: list[str]) -> None:
-    missing = [cid for cid in channel_ids if bot.get_channel(int(cid)) is None
-               and guild.get_channel(int(cid)) is None]
+    missing = []
+    for cid in channel_ids:
+        try:
+            wanted = int(cid)
+        except (TypeError, ValueError):
+            missing.append(cid)
+            continue
+        if bot.get_channel(wanted) is None and guild.get_channel(wanted) is None:
+            missing.append(cid)
     if missing:
         raise ServiceError(
             "unknown_channels",
@@ -386,7 +406,7 @@ def _validate_channel_ids_exist(bot: Any, guild: Any, channel_ids: list[str]) ->
 
 
 async def _handle_disqualify(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
-    giveaway = bot.service.get(str(command.giveaway_id))
+    giveaway = await asyncio.to_thread(bot.service.get, str(command.giveaway_id))
     user_id = str(command.payload.get("user_id") or "")
     reason = str(command.payload.get("reason") or "flagged by a server administrator")
     if not user_id.isdigit():
@@ -406,7 +426,7 @@ async def _handle_disqualify(bot: Any, command: Any, actor: Actor) -> dict[str, 
 
 
 async def _handle_restore(bot: Any, command: Any, actor: Actor) -> dict[str, Any]:
-    giveaway = bot.service.get(str(command.giveaway_id))
+    giveaway = await asyncio.to_thread(bot.service.get, str(command.giveaway_id))
     user_id = str(command.payload.get("user_id") or "")
     reason = str(command.payload.get("reason") or "restored by a server administrator")
     if not user_id.isdigit():
