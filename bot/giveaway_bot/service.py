@@ -34,6 +34,7 @@ class Giveaway:
     ends_at: int
     status: str
     required_role_id: str | None
+    required_role_ids: list[str]
     blocked_role_id: str | None
     min_account_age_days: int
     min_messages: int
@@ -53,6 +54,18 @@ class Giveaway:
             winners = json.loads(row.get("winners_json") or "[]")
         except (ValueError, TypeError):
             winners = []
+        required: list[str] = []
+        raw_ids = row.get("required_role_ids")
+        if raw_ids:
+            try:
+                parsed = json.loads(raw_ids)
+                if isinstance(parsed, list):
+                    required = [str(r) for r in parsed if str(r).strip()]
+            except (ValueError, TypeError):
+                pass
+        legacy = str(row.get("required_role_id") or "").strip()
+        if legacy and legacy not in required:
+            required.append(legacy)
         return cls(
             id=str(row["id"]),
             guild_id=str(row["guild_id"]),
@@ -63,6 +76,7 @@ class Giveaway:
             ends_at=int(row["ends_at"]),
             status=str(row["status"]),
             required_role_id=str(row["required_role_id"]) if row.get("required_role_id") else None,
+            required_role_ids=required,
             blocked_role_id=str(row["blocked_role_id"]) if row.get("blocked_role_id") else None,
             min_account_age_days=int(row.get("min_account_age_days") or 0),
             min_messages=int(row.get("min_messages") or 0),
@@ -90,6 +104,7 @@ class GiveawayService:
         duration_seconds: int,
         created_by: str,
         required_role_id: str | None = None,
+        required_role_ids: list[str] | None = None,
         blocked_role_id: str | None = None,
         min_account_age_days: int = 0,
         min_messages: int = 0,
@@ -109,21 +124,40 @@ class GiveawayService:
         image_url = (image_url or "").strip() or None
         if image_url and (len(image_url) > 512 or not image_url.startswith(("http://", "https://"))):
             raise ServiceError("Image must be an http(s) URL.")
+        role_ids = [str(r).strip() for r in (required_role_ids or []) if str(r).strip()]
+        if required_role_id and str(required_role_id).strip() not in role_ids:
+            role_ids.append(str(required_role_id).strip())
+        role_ids = role_ids[:5]
         gid = "gw_" + uuid.uuid4().hex[:12]
         created = now_ms()
         self.db.execute(
             "INSERT INTO simple_giveaways (id, guild_id, channel_id, prize, winner_count, ends_at,"
-            " status, required_role_id, blocked_role_id, min_account_age_days, min_messages,"
-            " image_url, created_by, created_at, host_id, host_name)"
-            " VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " status, required_role_id, required_role_ids, blocked_role_id, min_account_age_days,"
+            " min_messages, image_url, created_by, created_at, host_id, host_name)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 gid, guild_id, channel_id, prize, winner_count, created + duration_seconds * 1000,
-                required_role_id or None, blocked_role_id or None, max(0, min_account_age_days),
+                role_ids[0] if role_ids else None, json.dumps(role_ids),
+                blocked_role_id or None, max(0, min_account_age_days),
                 max(0, min_messages), image_url, created_by, created,
                 host_id or created_by, (host_name or "")[:64] or None,
             ),
         )
         return self.get(gid)
+
+    # -- guild settings (one-time notify-role setup) ----------------------
+    def get_notify_role(self, guild_id: str) -> str | None:
+        row = self.db.query_one(
+            "SELECT notify_role_id FROM simple_guild_settings WHERE guild_id = ?", (guild_id,)
+        )
+        return str(row["notify_role_id"]) if row and row.get("notify_role_id") else None
+
+    def set_notify_role(self, guild_id: str, role_id: str | None) -> None:
+        self.db.execute(
+            "INSERT INTO simple_guild_settings (guild_id, notify_role_id) VALUES (?, ?)"
+            " ON CONFLICT (guild_id) DO UPDATE SET notify_role_id = excluded.notify_role_id",
+            (guild_id, role_id),
+        )
 
     # -- read -----------------------------------------------------------
     def get(self, giveaway_id: str) -> Giveaway:
@@ -203,8 +237,8 @@ class GiveawayService:
         if gw.ends_at <= now_ms():
             raise ServiceError("This giveaway has ended.")
         roles = set(member_roles)
-        if gw.required_role_id and gw.required_role_id not in roles:
-            raise ServiceError("You need the required role to enter.")
+        if gw.required_role_ids and not (set(gw.required_role_ids) & roles):
+            raise ServiceError("You need one of the required roles to enter.")
         if gw.blocked_role_id and gw.blocked_role_id in roles:
             raise ServiceError("Your role is not allowed to enter.")
         if gw.min_account_age_days > 0 and account_created_ts:

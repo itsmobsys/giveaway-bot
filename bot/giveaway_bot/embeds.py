@@ -24,8 +24,9 @@ def countdown(ends_at_ms: int) -> str:
 
 def _req_lines(gw: Giveaway) -> str:
     lines: list[str] = []
-    if gw.required_role_id:
-        lines.append(f"• Requires <@&{gw.required_role_id}>")
+    if gw.required_role_ids:
+        mentions = " ".join(f"<@&{r}>" for r in gw.required_role_ids)
+        lines.append(f"• Requires one of: {mentions}")
     if gw.blocked_role_id:
         lines.append(f"• <@&{gw.blocked_role_id}> cannot enter")
     if gw.min_account_age_days > 0:

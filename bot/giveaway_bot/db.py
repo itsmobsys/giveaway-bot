@@ -141,6 +141,7 @@ class Database:
                 "ends_at": "INTEGER NOT NULL DEFAULT 0",
                 "status": "TEXT NOT NULL DEFAULT 'active'",
                 "required_role_id": "TEXT",
+                "required_role_ids": "TEXT NOT NULL DEFAULT '[]'",
                 "blocked_role_id": "TEXT",
                 "min_account_age_days": "INTEGER NOT NULL DEFAULT 0",
                 "min_messages": "INTEGER NOT NULL DEFAULT 0",
@@ -169,6 +170,13 @@ class Database:
   user_id TEXT NOT NULL,
   count INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (guild_id, user_id)
+)"""
+        )
+        # One-time per-server setup: the role pinged on every giveaway event.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS simple_guild_settings (
+  guild_id TEXT PRIMARY KEY,
+  notify_role_id TEXT
 )"""
         )
         for stmt in [s.strip() for s in SCHEMA_INDEXES.split(";") if s.strip()]:

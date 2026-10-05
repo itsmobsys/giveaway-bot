@@ -70,6 +70,7 @@ class GiveawayBot(commands.Bot):
             view = GiveawayView(giveaway_id)
             view._join_handler = self.handle_join
             view._leave_handler = self.handle_leave
+            view._notify_handler = self.handle_notify
             self._views[giveaway_id] = view
             self.add_view(view)
         return view
@@ -148,6 +149,21 @@ class GiveawayBot(commands.Bot):
         except (TypeError, ValueError):
             return None
         return guild.get_role(role_id) if guild else None
+
+    async def _notify_mention(self, guild_id: str) -> str:
+        """`<@&...>` for this server's notify role, or empty when unset/gone."""
+        try:
+            role_id = await asyncio.to_thread(self.service.get_notify_role, guild_id)
+        except Exception:
+            return ""
+        if not role_id:
+            return ""
+        try:
+            guild = self.get_guild(int(guild_id))
+            role = guild.get_role(int(role_id)) if guild else None
+        except (TypeError, ValueError):
+            return ""
+        return role.mention if role is not None else ""
 
     async def _grant_entrants_role(self, gw: Giveaway, member: discord.Member) -> None:
         role = self._role_for(gw)
@@ -264,6 +280,54 @@ class GiveawayBot(commands.Bot):
         except (discord.NotFound, discord.HTTPException):
             pass
 
+    async def handle_notify(self, interaction: discord.Interaction, giveaway_id: str) -> None:
+        """🔔 toggle: give/remove the server notify role for this member."""
+        del giveaway_id  # the role is per-server, not per-giveaway
+        if interaction.guild is None or not isinstance(interaction.user, discord.Member):
+            try:
+                await interaction.response.send_message(
+                    "Use this button inside the server.", ephemeral=True
+                )
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            return
+        if not await self._safe_defer(interaction):
+            return
+        try:
+            role_id = await asyncio.to_thread(
+                self.service.get_notify_role, str(interaction.guild.id)
+            )
+        except Exception:
+            role_id = None
+        if not role_id:
+            await self._safe_followup(
+                interaction,
+                "No notify role is set up yet — staff, run `/giveaway_notifyer` once.",
+            )
+            return
+        role = interaction.guild.get_role(int(role_id)) if role_id.isdigit() else None
+        if role is None:
+            await self._safe_followup(
+                interaction, "The notify role no longer exists — staff, re-run `/giveaway_notifyer`."
+            )
+            return
+        member = interaction.user
+        try:
+            if role in member.roles:
+                await member.remove_roles(role, reason="Notify-me toggled off")
+                await self._safe_followup(
+                    interaction, f"🔕 You will no longer be pinged ({role.name})."
+                )
+            else:
+                await member.add_roles(role, reason="Notify-me toggled on")
+                await self._safe_followup(
+                    interaction, f"🔔 You will be pinged for giveaways ({role.name})."
+                )
+        except (discord.Forbidden, discord.HTTPException):
+            await self._safe_followup(
+                interaction, "⚠️ I cannot manage that role (need Manage Roles)."
+            )
+
     async def handle_leave(self, interaction: discord.Interaction, giveaway_id: str) -> None:
         if not await self._safe_defer(interaction):
             return
@@ -333,6 +397,9 @@ class GiveawayBot(commands.Bot):
         parts: list[str] = []
         if winners:
             parts.append("🎉 " + " ".join(f"<@{w}>" for w in winners))
+        notify = await self._notify_mention(gw.guild_id)
+        if notify:
+            parts.append(f"{notify} — results are in!")
         role = self._role_for(gw)
         if role is not None:
             parts.append(f"{role.mention} — thanks to everyone who entered!")
@@ -381,7 +448,9 @@ def wire_commands(bot: GiveawayBot) -> None:
         prize="What the winner gets",
         winners="Number of winners (1-25)",
         minutes="How long it runs (minutes)",
-        required_role="Only this role can enter (optional)",
+        required_role_1="Role that can enter, pinged on create (optional)",
+        required_role_2="Another role that can enter (optional)",
+        required_role_3="Another role that can enter (optional)",
         blocked_role="This role cannot enter (optional)",
         min_account_age_days="Min Discord account age in days (optional)",
         min_messages="Min messages sent in this server (optional)",
@@ -392,7 +461,9 @@ def wire_commands(bot: GiveawayBot) -> None:
         prize: str,
         winners: int = 1,
         minutes: int = 60,
-        required_role: discord.Role | None = None,
+        required_role_1: discord.Role | None = None,
+        required_role_2: discord.Role | None = None,
+        required_role_3: discord.Role | None = None,
         blocked_role: discord.Role | None = None,
         min_account_age_days: int = 0,
         min_messages: int = 0,
@@ -409,6 +480,8 @@ def wire_commands(bot: GiveawayBot) -> None:
             await interaction.response.defer(ephemeral=True, thinking=True)
         except (discord.NotFound, discord.HTTPException):
             return
+        role_slots = [required_role_1, required_role_2, required_role_3]
+        need_roles = [str(r.id) for r in role_slots if r is not None]
         try:
             gw = await asyncio.to_thread(
                 svc.create,
@@ -418,7 +491,7 @@ def wire_commands(bot: GiveawayBot) -> None:
                 winner_count=winners,
                 duration_seconds=max(30, minutes * 60),
                 created_by=str(interaction.user.id),
-                required_role_id=str(required_role.id) if required_role else None,
+                required_role_ids=need_roles,
                 blocked_role_id=str(blocked_role.id) if blocked_role else None,
                 min_account_age_days=max(0, min_account_age_days),
                 min_messages=max(0, min_messages),
@@ -439,9 +512,19 @@ def wire_commands(bot: GiveawayBot) -> None:
             except (discord.NotFound, discord.HTTPException):
                 pass
             return
+        # Ping everyone who should know: the server notify role (one-time
+        # setup) plus each required role (the people allowed to join).
+        pings: list[str] = []
+        notify = await bot._notify_mention(str(interaction.guild.id))
+        if notify:
+            pings.append(notify)
+        pings.extend(f"<@&{rid}>" for rid in need_roles)
+        create_content = f"📢 New giveaway! {' '.join(pings)}" if pings else None
         msg = await channel.send(
+            content=create_content,
             embed=embeds.giveaway_embed(gw, 0, bot.settings.embed_color),
             view=bot._register_view(gw.id),
+            allowed_mentions=discord.AllowedMentions(roles=True),
         )
         await asyncio.to_thread(svc.set_message, gw.id, str(msg.id))
         role_note = ""
@@ -517,6 +600,21 @@ def wire_commands(bot: GiveawayBot) -> None:
             return
         await bot._strip_entrants_role(ended)
         await interaction.response.send_message("Giveaway cancelled.", ephemeral=True)
+        try:
+            channel = bot.get_channel(int(ended.channel_id))
+        except (TypeError, ValueError):
+            channel = None
+        if isinstance(channel, discord.TextChannel):
+            notify = await bot._notify_mention(str(interaction.guild.id))
+            text = f"🚫 Giveaway **{ended.prize}** was cancelled."
+            if notify:
+                text += f" {notify}"
+            try:
+                await channel.send(
+                    text, allowed_mentions=discord.AllowedMentions(roles=True)
+                )
+            except (discord.Forbidden, discord.HTTPException):
+                pass
 
     @bot.tree.command(name="giveaway_list", description="Show entrants, or active giveaways")
     @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
@@ -565,6 +663,50 @@ def wire_commands(bot: GiveawayBot) -> None:
             lines.append(f"• **{gw.prize}** — {n} entries — `{gw.id}` — <t:{int(gw.ends_at/1000)}:R>")
         lines.append("\nTip: run `/giveaway_list` with an id to see who entered.")
         await bot._safe_followup(interaction, "\n".join(lines))
+
+    @bot.tree.command(
+        name="giveaway_notifyer", description="One-time setup: role pinged on giveaway news"
+    )
+    @app_commands.describe(role="Role pinged on every giveaway (omit to view current)")
+    async def giveaway_notifyer(
+        interaction: discord.Interaction, role: discord.Role | None = None
+    ) -> None:
+        if interaction.guild is None or not _can_manage(interaction.user):
+            await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
+            return
+        gid = str(interaction.guild.id)
+        if role is None:
+            try:
+                current = await asyncio.to_thread(svc.get_notify_role, gid)
+            except Exception:
+                current = None
+            if current and interaction.guild.get_role(int(current)) is not None:
+                await interaction.response.send_message(
+                    f"🔔 Notify role: <@&{current}> — members grab it with the"
+                    " **Notify me** button.",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "No notify role set. Run `/giveaway_notifyer role:@YourRole` once.",
+                    ephemeral=True,
+                )
+            return
+        try:
+            await role.edit(mentionable=True, reason="Giveaway notify role setup")
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+        try:
+            await asyncio.to_thread(svc.set_notify_role, gid, str(role.id))
+        except Exception:
+            log.exception("notify role save failed")
+            await interaction.response.send_message("⚠️ Could not save. Try again.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"✅ {role.mention} will now be pinged on every giveaway (new, winners,"
+            " rerolls, cancellations). Members opt in with the **Notify me** button.",
+            ephemeral=True,
+        )
 
     @bot.tree.command(name="giveaway_ping", description="Ping everyone who joined a giveaway")
     @app_commands.autocomplete(giveaway_id=_gw_autocomplete)

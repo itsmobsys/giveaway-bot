@@ -24,7 +24,13 @@ Needs **Server Members Intent** on (Bot tab in the Developer Portal) for role ch
 
 ## Commands
 
-- `/giveaway_create prize winners minutes [required_role] [blocked_role] [min_account_age_days] [min_messages] [image]`
+- `/giveaway_create prize winners minutes [required_role_1] [required_role_2] [required_role_3] [blocked_role] ...`
+  - up to 3 required roles (member needs **any one**); all are pinged on create
+  so eligible people see it
+- `/giveaway_notifyer [role]` — **one-time setup** (Manage Server): the role
+  pinged on every giveaway event (new, winners, rerolls, cancellations).
+  Members opt in/out themselves with the **🔔 Notify me** button on any
+  giveaway message. Run without a role to view the current one.
   - `min_messages`: members must have sent that many messages in the server (counted from when the bot is online)
   - `image`: http(s) photo URL shown on the embed — e.g. a Steam gift-card picture
 

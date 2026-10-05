@@ -1,4 +1,4 @@
-"""Persistent Join/Leave buttons. One view class, custom_id carries the giveaway id."""
+"""Persistent Join/Leave/Notify buttons. custom_id carries the giveaway id."""
 
 from __future__ import annotations
 
@@ -23,10 +23,19 @@ class GiveawayView(discord.ui.View):
             custom_id=f"gw_leave:{giveaway_id}",
         )
         leave.callback = self._leave  # type: ignore[method-assign]
+        notify = discord.ui.Button(
+            label="Notify me",
+            style=discord.ButtonStyle.primary,
+            emoji="🔔",
+            custom_id=f"gw_notify:{giveaway_id}",
+        )
+        notify.callback = self._notify  # type: ignore[method-assign]
         self.add_item(join)
         self.add_item(leave)
+        self.add_item(notify)
         self._join_handler = None  # set by bot.py
         self._leave_handler = None
+        self._notify_handler = None
 
     async def _join(self, interaction: discord.Interaction) -> None:
         if self._join_handler is not None:
@@ -35,3 +44,7 @@ class GiveawayView(discord.ui.View):
     async def _leave(self, interaction: discord.Interaction) -> None:
         if self._leave_handler is not None:
             await self._leave_handler(interaction, self.giveaway_id)
+
+    async def _notify(self, interaction: discord.Interaction) -> None:
+        if self._notify_handler is not None:
+            await self._notify_handler(interaction, self.giveaway_id)
