@@ -43,6 +43,14 @@ export function sessionsAvailable(): boolean {
   return secretKey() !== null;
 }
 
+/**
+ * Length of the configured session secret (0 when unset). Reported so the
+ * login page can tell "too short" apart from "missing" without leaking it.
+ */
+export function sessionSecretLength(): number {
+  return process.env.SESSION_SECRET?.length ?? 0;
+}
+
 export async function createSession(user: SessionUser): Promise<void> {
   const key = secretKey();
   if (!key) {

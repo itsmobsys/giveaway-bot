@@ -1,6 +1,6 @@
 import Link from "next/link";
 
-import { discordConfigured } from "@/lib/auth";
+import { authConfigStatus, discordConfigured } from "@/lib/auth";
 import { sessionsAvailable } from "@/lib/session";
 
 export const dynamic = "force-dynamic";
@@ -22,6 +22,22 @@ export default async function LoginPage({
   const { error, redirect_to } = await searchParams;
   const message = error ? (ERROR_MESSAGES[error] ?? "Sign-in failed.") : null;
   const ready = sessionsAvailable() && discordConfigured();
+  const status = authConfigStatus();
+  const checks = [
+    {
+      label: "SESSION_SECRET",
+      ok: status.sessionSecretOk,
+      hint:
+        status.sessionSecretLength === 0
+          ? "missing"
+          : status.sessionSecretOk
+            ? `${status.sessionSecretLength} chars`
+            : `only ${status.sessionSecretLength} chars — needs 32+`,
+    },
+    { label: "DISCORD_CLIENT_ID", ok: status.clientId, hint: status.clientId ? "set" : "missing" },
+    { label: "DISCORD_CLIENT_SECRET", ok: status.clientSecret, hint: status.clientSecret ? "set" : "missing" },
+    { label: "DISCORD_REDIRECT_URI", ok: status.redirectUri, hint: status.redirectUri ? "set" : "missing" },
+  ];
 
   return (
     <div className="mx-auto flex min-h-[60vh] max-w-md flex-col justify-center">
@@ -45,11 +61,26 @@ export default async function LoginPage({
         {!ready ? (
           <div className="mt-6 rounded-lg bg-[var(--warning)]/12 px-3 py-2 text-left text-xs text-[var(--warning)]">
             <p className="font-medium">This deployment is not fully configured.</p>
-            <p className="mt-1">
-              Set <code className="font-mono">SESSION_SECRET</code> (32+ characters),{" "}
-              <code className="font-mono">DISCORD_CLIENT_ID</code>,{" "}
-              <code className="font-mono">DISCORD_CLIENT_SECRET</code> and{" "}
-              <code className="font-mono">DISCORD_REDIRECT_URI</code>, then redeploy.
+            <ul className="mt-2 space-y-1 font-mono">
+              {checks.map((check) => (
+                <li key={check.label}>
+                  <span aria-hidden="true">{check.ok ? "✅" : "❌"}</span> {check.label}{" "}
+                  <span className="opacity-80">({check.hint})</span>
+                </li>
+              ))}
+            </ul>
+            {status.redirectIsLocalhost && (
+              <p className="mt-2">
+                ⚠️ The redirect URI points at localhost but this page is served from a public
+                host — Discord will reject the sign-in. Use{" "}
+                <code className="font-mono">https://&lt;your-domain&gt;/api/auth/callback</code>{" "}
+                in both Vercel and the Discord Developer Portal.
+              </p>
+            )}
+            <p className="mt-2">
+              Fix the ❌ rows in Vercel → Settings → Environment Variables (tick{" "}
+              <strong>Production</strong>), then Deployments → Redeploy — values are baked in
+              at build time, so saving alone changes nothing.
             </p>
           </div>
         ) : (

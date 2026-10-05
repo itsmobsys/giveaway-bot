@@ -10,7 +10,7 @@
  */
 
 import { all, first, nowMs, run } from "./db";
-import { readSession, type SessionUser } from "./session";
+import { readSession, sessionSecretLength, type SessionUser } from "./session";
 
 /** Discord permission bits. */
 export const PERM_ADMINISTRATOR = 0x00000008n;
@@ -38,6 +38,37 @@ export function discordConfigured(): boolean {
   return Boolean(
     process.env.DISCORD_CLIENT_ID && process.env.DISCORD_CLIENT_SECRET && process.env.DISCORD_REDIRECT_URI,
   );
+}
+
+/**
+ * Per-key configuration presence for the login page's setup checklist.
+ *
+ * Only booleans and the secret *length* leave this function — never values —
+ * so it is safe to render to an unauthenticated visitor. The blanket "not
+ * fully configured" message sent operators in circles ("but I set them!") when
+ * exactly one key was at fault, usually a <32-char secret or a variable saved
+ * to Preview while visiting Production.
+ */
+export interface AuthConfigStatus {
+  sessionSecretLength: number;
+  sessionSecretOk: boolean;
+  clientId: boolean;
+  clientSecret: boolean;
+  redirectUri: boolean;
+  redirectIsLocalhost: boolean;
+}
+
+export function authConfigStatus(): AuthConfigStatus {
+  const secretLength = sessionSecretLength();
+  const redirectUri = process.env.DISCORD_REDIRECT_URI ?? "";
+  return {
+    sessionSecretLength: secretLength,
+    sessionSecretOk: secretLength >= 32,
+    clientId: Boolean(process.env.DISCORD_CLIENT_ID),
+    clientSecret: Boolean(process.env.DISCORD_CLIENT_SECRET),
+    redirectUri: Boolean(redirectUri),
+    redirectIsLocalhost: /localhost|127\.0\.0\.1/i.test(redirectUri),
+  };
 }
 
 export function botToken(): string | null {
