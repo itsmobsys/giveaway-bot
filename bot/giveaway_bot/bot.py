@@ -52,9 +52,11 @@ class GiveawayBot(commands.Bot):
 
     async def on_ready(self) -> None:
         log.info("logged in as %s (%d guilds)", self.user, len(self.guilds))
-        for gw in self.db.query(
+        live = self.db.query(
             "SELECT * FROM simple_giveaways WHERE status = 'active' LIMIT 200",
-        ):
+        )
+        log.info("tracking %d active giveaway(s) from the database", len(live))
+        for gw in live:
             self._register_view(gw["id"])
 
     async def close(self) -> None:
