@@ -27,6 +27,10 @@ Needs **Server Members Intent** on (Bot tab in the Developer Portal) for role ch
 - `/giveaway_create prize winners minutes [required_role] [blocked_role] [min_account_age_days] [min_messages] [image]`
   - `min_messages`: members must have sent that many messages in the server (counted from when the bot is online)
   - `image`: http(s) photo URL shown on the embed — e.g. a Steam gift-card picture
+
+Message counts start accumulating the moment the bot logs in (even with no
+giveaway running), and **reset to 0 for everybody when a giveaway ends** —
+so each giveaway measures fresh activity since the last one ended.
 - `/giveaway_list`
 - `/giveaway_end giveaway_id`
 - `/giveaway_reroll giveaway_id [count]`

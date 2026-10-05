@@ -243,6 +243,10 @@ class GiveawayService:
             "UPDATE simple_giveaways SET status = 'ended', ended_at = ?, winners_json = ? WHERE id = ?",
             (now_ms(), json.dumps(winners), gw.id),
         )
+        # Fresh grind for the next giveaway: everybody's message count goes
+        # back to zero, so the next min-messages requirement measures activity
+        # *after* this giveaway, not lifetime activity.
+        self.db.execute("DELETE FROM simple_message_counts")
         return self.get(gw.id), winners
 
     def reroll(self, giveaway_id: str, count: int = 1) -> tuple[Giveaway, list[str]]:
