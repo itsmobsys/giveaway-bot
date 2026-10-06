@@ -54,6 +54,8 @@ it lacks the permission the giveaway still runs, just without the role.
   stripped (Manage Server)
 - `/giveaway_blacklist_remove user` — unblock (Manage Server)
 - `/giveaway_blacklist_list` — who is blocked (Manage Server)
+- `/giveaway_timeout_bans` — who is sitting out a timed-out penalty, with
+  how many giveaways they have left (Manage Server)
 - `/giveaway_end giveaway_id` — suggestions appear as you type; with one live
   giveaway any id falls back to it
 - `/giveaway_extend giveaway_id minutes` — add 1 minute to 60 days of time to
@@ -61,6 +63,15 @@ it lacks the permission the giveaway still runs, just without the role.
 - `/giveaway_reroll giveaway_id [count]` — same suggestions + fallback; works
   on ended giveaways, drawing fresh winners that exclude previous ones
 - `/giveaway_cancel giveaway_id` — same suggestions + fallback
+
+**Timed-out members** (Discord's native `/mute` — read with
+`Member.is_timed_out()`, never a role called "Muted"): clicking Join while
+timed out is refused, any entry they already had is removed, and they must sit
+out the **next 3 giveaways**. Each giveaway they are then blocked from spends
+one, and the restriction lifts with the third. Re-clicking the same giveaway
+neither stacks a second penalty nor spends two at once, and merely being muted
+in the past never counts — only the state at the moment they click. The penalty
+lives in Turso, so a restart does not forgive it.
 
 The embed shows a live **⏳ Ends in ...** countdown, re-rendered every tick
 (`TICK_SECONDS`, default 30). The **👥 Participants** button opens a paged
@@ -83,7 +94,7 @@ account and no network.
 | --- | --- |
 | `config.py` | Env settings |
 | `db.py` | SQLite/Turso wrapper + schema |
-| `service.py` | Create/join/leave/end/reroll rules |
+| `service.py` | Create/join/leave/end/reroll rules + timeout penalties |
 | `bot.py` | Discord wiring, buttons, timer |
 | `embeds.py` / `views.py` | Messages + Join/Leave buttons |
 | `cli.py` | `run` / `doctor` |

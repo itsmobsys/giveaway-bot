@@ -21,6 +21,9 @@ Simple standalone Discord giveaway bot. MIT licensed.
   (autocomplete + live-one fallback, no id typing)
 - `/giveaway_list` (entrants + win odds), `/giveaway_ping`, `/giveaway_notifyer`
   (one-time notify-role setup, pinged on every event)
+- Members Discord has timed out (native `/mute`) cannot join: the attempt is
+  refused, their entry is removed, and they sit out the next 3 giveaways.
+  `/giveaway_timeout_bans` lists who is currently sitting out
 - Per-giveaway mentionable entrants role, granted on join, stripped on end
 - Message counts reset for everyone when a giveaway ends. They are kept in
   memory and written in one batched statement every 10s, so a busy server does

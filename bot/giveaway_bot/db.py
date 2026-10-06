@@ -226,6 +226,22 @@ class Database:
   PRIMARY KEY (guild_id, user_id)
 )"""
         )
+        # Members sitting out a fixed number of giveaways because Discord had
+        # them timed out (native /mute) when they tried to join. Persisted like
+        # everything else, so a restart never forgives a penalty, and — like the
+        # blacklist — the entry-wipe sweep never touches it. A row is deleted
+        # the moment its counter reaches zero, so nothing needs to expire it.
+        self.execute(
+            """CREATE TABLE IF NOT EXISTS simple_giveaway_bans (
+  guild_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  giveaways_remaining INTEGER NOT NULL DEFAULT 0,
+  last_blocked_giveaway_id TEXT,
+  created_at INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (guild_id, user_id)
+)"""
+        )
         for stmt in [s.strip() for s in SCHEMA_INDEXES.split(";") if s.strip()]:
             self.execute(stmt)
 

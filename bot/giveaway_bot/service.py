@@ -246,6 +246,7 @@ class GiveawayService:
         account_created_ts: float | None,
         user_id: str = "",
         pending_messages: int = 0,
+        timed_out: bool = False,
     ) -> None:
         if not gw.active:
             raise ServiceError("This giveaway has ended.")
@@ -253,6 +254,12 @@ class GiveawayService:
             raise ServiceError("🚫 You are blocked from giveaways in this server.")
         if gw.ends_at <= now_ms():
             raise ServiceError("This giveaway has ended.")
+        # Discord's native timeout (/mute), and anyone still sitting out the
+        # penalty that started from it. Deliberately placed after the "is this
+        # giveaway still joinable" checks, so a stale button on an ended one
+        # cannot hand out a penalty. This is the only check here that writes:
+        # it also drops an entry the blocked member already had.
+        self.check_timeout_ban(gw, user_id=user_id, timed_out=timed_out)
         roles = set(member_roles)
         if gw.required_role_ids and not (set(gw.required_role_ids) & roles):
             raise ServiceError("You need one of the required roles to enter.")
@@ -326,10 +333,11 @@ class GiveawayService:
         member_roles: list[str],
         account_created_ts: float | None,
         pending_messages: int = 0,
+        timed_out: bool = False,
     ) -> int:
         self.check_eligible(
             gw, member_roles=member_roles, account_created_ts=account_created_ts,
-            user_id=user_id, pending_messages=pending_messages,
+            user_id=user_id, pending_messages=pending_messages, timed_out=timed_out,
         )
         # The giveaway is re-checked inside the statement itself. check_eligible
         # above reads a row that was fetched moments earlier, so an end() landing
@@ -526,6 +534,167 @@ class GiveawayService:
             (guild_id, limit),
         )
         return [str(r["user_id"]) for r in rows]
+
+    # -- timed-out penalty (Discord's native /mute) ----------------------
+    #: Giveaways a member sits out after being caught timed out while joining.
+    #: Small on purpose: this is a cooldown, not a blacklist.
+    TIMEOUT_PENALTY = 3
+
+    def timeout_ban_remaining(self, guild_id: str, user_id: str) -> int:
+        """Giveaways this member still has to sit out. 0 means they may enter."""
+        if not guild_id or not user_id:
+            return 0
+        row = self.db.query_one(
+            "SELECT giveaways_remaining FROM simple_giveaway_bans"
+            " WHERE guild_id = ? AND user_id = ?",
+            (guild_id, user_id),
+        )
+        if row is None:
+            return 0
+        try:
+            return max(0, int(row["giveaways_remaining"]))
+        except (TypeError, ValueError):
+            return 0
+
+    def apply_timeout_penalty(
+        self,
+        guild_id: str,
+        user_id: str,
+        *,
+        giveaways: int = TIMEOUT_PENALTY,
+        giveaway_id: str | None = None,
+    ) -> int:
+        """Start the penalty for a member caught timed out. Returns what is left.
+
+        MAX() rather than a plain overwrite is the "never stack" rule made
+        durable: somebody already sitting out three giveaways stays at three no
+        matter how often they are caught timed out in the meantime. The
+        giveaway they were caught in is remembered as the one already counted,
+        so hammering the same Join button cannot burn the penalty down.
+        """
+        count = max(1, int(giveaways))
+        ts = now_ms()
+        self.db.execute(
+            "INSERT INTO simple_giveaway_bans"
+            " (guild_id, user_id, giveaways_remaining, last_blocked_giveaway_id, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT (guild_id, user_id) DO UPDATE SET"
+            " giveaways_remaining = MAX(giveaways_remaining, excluded.giveaways_remaining),"
+            " last_blocked_giveaway_id = excluded.last_blocked_giveaway_id,"
+            " updated_at = excluded.updated_at",
+            (guild_id, user_id, count, giveaway_id, ts, ts),
+        )
+        return self.timeout_ban_remaining(guild_id, user_id)
+
+    def consume_timeout_ban(self, guild_id: str, user_id: str, giveaway_id: str) -> int:
+        """Spend one giveaway of the penalty. Returns what is left (0 = lifted).
+
+        Guarded on the giveaway id so a repeated click counts once, and the row
+        is deleted as soon as the counter reaches zero: the restriction ends
+        with the last blocked giveaway, and no sweeper has to expire it later.
+        """
+        self.db.execute(
+            "UPDATE simple_giveaway_bans SET giveaways_remaining = giveaways_remaining - 1,"
+            " last_blocked_giveaway_id = ?, updated_at = ?"
+            " WHERE guild_id = ? AND user_id = ? AND giveaways_remaining > 0"
+            " AND (last_blocked_giveaway_id IS NULL OR last_blocked_giveaway_id != ?)",
+            (giveaway_id, now_ms(), guild_id, user_id, giveaway_id),
+        )
+        left = self.timeout_ban_remaining(guild_id, user_id)
+        if left > 0:
+            return left
+        self.db.execute(
+            "DELETE FROM simple_giveaway_bans"
+            " WHERE guild_id = ? AND user_id = ? AND giveaways_remaining <= 0",
+            (guild_id, user_id),
+        )
+        return 0
+
+    def count_timeout_bans(self, guild_id: str) -> int:
+        """How many members of this guild are sitting out a penalty right now.
+
+        The listing is capped, so the count is what lets a caller say how many
+        it did not show instead of quietly reporting a short total.
+        """
+        row = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM simple_giveaway_bans"
+            " WHERE guild_id = ? AND giveaways_remaining > 0",
+            (guild_id,),
+        )
+        return int(row["n"]) if row and row.get("n") is not None else 0
+
+    def list_timeout_bans(self, guild_id: str, limit: int = 100) -> list[dict[str, Any]]:
+        """Members of this guild still sitting out a penalty, longest first.
+
+        Only this table and only this guild: the dashboard, the entry list and
+        the winner draw never read it. A zero row cannot normally exist (it is
+        deleted on the way to zero) but is filtered out anyway, so a row written
+        by hand cannot show a member who is actually free to enter. The limit is
+        a ceiling on one response, so pair it with count_timeout_bans() when the
+        caller has to say whether anything was left out.
+        """
+        rows = self.db.query(
+            "SELECT user_id, giveaways_remaining, created_at FROM simple_giveaway_bans"
+            " WHERE guild_id = ? AND giveaways_remaining > 0"
+            " ORDER BY giveaways_remaining DESC, user_id ASC LIMIT ?",
+            (guild_id, max(1, min(int(limit), 500))),
+        )
+        banned: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                remaining = max(0, int(row["giveaways_remaining"]))
+            except (TypeError, ValueError):
+                continue
+            if remaining <= 0:
+                continue
+            banned.append(
+                {
+                    "user_id": str(row["user_id"]),
+                    "giveaways_remaining": remaining,
+                    "created_at": int(row.get("created_at") or 0),
+                }
+            )
+        return banned
+
+    def check_timeout_ban(self, gw: Giveaway, *, user_id: str, timed_out: bool = False) -> None:
+        """Refuse a timed-out member — or one still serving that penalty.
+
+        Called by check_eligible() only once the giveaway is known to still be
+        joinable, so a stale button never hands out a penalty.
+
+        A member who is already sitting out the penalty spends one giveaway
+        here: the giveaway they are blocked from *is* one of the ones they have
+        to sit out. The timed-out test is skipped while a penalty is running,
+        which is what stops a second penalty stacking on the first. Either way
+        an entry they already had is dropped rather than left to win.
+        """
+        if not user_id:
+            return
+        left = self.timeout_ban_remaining(gw.guild_id, user_id)
+        if left <= 0 and not timed_out:
+            return
+        # Blocked, so they must not be in this giveaway at all: an entry made
+        # before Discord timed them out (or before the penalty started) goes.
+        self.db.execute(
+            "DELETE FROM simple_entries WHERE giveaway_id = ? AND user_id = ?",
+            (gw.id, user_id),
+        )
+        if left > 0:
+            left = self.consume_timeout_ban(gw.guild_id, user_id, gw.id)
+            if left > 0:
+                raise ServiceError(
+                    "You are sitting out a penalty for joining while timed out."
+                    f" {left} giveaway(s) left."
+                )
+            raise ServiceError(
+                "That was the last giveaway of your timed-out penalty —"
+                " you can enter the next one."
+            )
+        left = self.apply_timeout_penalty(gw.guild_id, user_id, giveaway_id=gw.id)
+        raise ServiceError(
+            "You are currently timed out in this server, so you cannot enter giveaways."
+            f" Timeout penalty: sit out the next {left} giveaway(s)."
+        )
 
     def due(self, now: int | None = None) -> list[Giveaway]:
         ts = now if now is not None else now_ms()

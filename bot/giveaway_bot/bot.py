@@ -33,6 +33,19 @@ def _can_manage(member: object) -> bool:
     return bool(perms.manage_guild or perms.administrator)
 
 
+def _still_in_guild(guild: discord.Guild, user_id: str) -> bool:
+    """Whether this id is still cached as a member of the guild.
+
+    Cache-only on purpose: the ban list is a snapshot, and fetching per row
+    would cost one HTTP request per banned member. A non-numeric id — only
+    reachable through a hand-edited row — counts as gone instead of raising.
+    """
+    try:
+        return guild.get_member(int(user_id)) is not None
+    except (TypeError, ValueError):
+        return False
+
+
 class GiveawayBot(commands.Bot):
     def __init__(self, settings: Settings, db: Database) -> None:
         super().__init__(command_prefix="!", intents=build_intents(), help_command=None)
@@ -162,6 +175,25 @@ class GiveawayBot(commands.Bot):
         created = getattr(user, "created_at", None)
         ts = created.timestamp() if created is not None else None
         return roles, ts
+
+    @staticmethod
+    def _timed_out(member: object) -> bool:
+        """Whether Discord has this member timed out right now (native /mute).
+
+        Member.is_timed_out() is the library's own read of the member's
+        communication_disabled_until, kept current by member updates: no role
+        named anything, and no second guess at what "muted" means. An object
+        without that API (an older client, or a plain User) and an unreadable
+        timeout both count as "not timed out" — a penalty must never come out
+        of a broken member object.
+        """
+        check = getattr(member, "is_timed_out", None)
+        if not callable(check):
+            return False
+        try:
+            return bool(check())
+        except Exception:
+            return False
 
     #: How many embeds may be re-rendered at the same time. Each refresh is an
     #: HTTP PATCH, so this guards the rate limit as much as the loop.
@@ -444,6 +476,13 @@ class GiveawayBot(commands.Bot):
         member = interaction.user
         roles, created_ts = self._member_info(member)
         uid, name = str(member.id), member.display_name
+        # Discord's native timeout, read here but acted on inside the service's
+        # eligibility gate, so it lands in the same place as every other
+        # "you may not enter" rule instead of becoming a second join path.
+        # For a component click interaction.user is a Member built from the
+        # interaction payload, so this is the state Discord reported when they
+        # clicked — not a cache read that could be minutes old.
+        timed_out = self._timed_out(member)
         try:
             gw = await asyncio.to_thread(self.service.get, giveaway_id)
         except ServiceError:
@@ -482,6 +521,7 @@ class GiveawayBot(commands.Bot):
                 account_created_ts=created_ts,
                 # Messages this member sent since the last flush still count.
                 pending_messages=self._pending_messages(str(interaction.guild.id), uid),
+                timed_out=timed_out,
             )
         except ServiceError as exc:
             await self._safe_followup(interaction, f"⚠️ {exc.message}")
@@ -1242,6 +1282,63 @@ def wire_commands(bot: GiveawayBot) -> None:
         await interaction.response.send_message(
             f"🚫 **Blocked ({len(ids)}):**\n{lines}{extra}", ephemeral=True
         )
+
+    @bot.tree.command(
+        name="giveaway_timeout_bans",
+        description="List members banned from giveaways by the timed-out penalty",
+    )
+    async def giveaway_timeout_bans(interaction: discord.Interaction) -> None:
+        """Who is sitting out the penalty for joining while timed out."""
+        if interaction.guild is None or not _can_manage(interaction.user):
+            await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
+            return
+        guild = interaction.guild
+        try:
+            rows = await asyncio.to_thread(svc.list_timeout_bans, str(guild.id))
+            # A second cheap query: the listing is capped, and the embed has to
+            # state the real total instead of the size of the page set.
+            total = await asyncio.to_thread(svc.count_timeout_bans, str(guild.id))
+        except Exception:
+            log.exception("timeout ban list failed")
+            await interaction.response.send_message(
+                "⚠️ Could not load the timeout bans. Try again.", ephemeral=True
+            )
+            return
+        if not rows:
+            await interaction.response.send_message(
+                "No users are currently banned from giveaways.", ephemeral=True
+            )
+            return
+        # Only from the member cache: a fetch per row would be one HTTP request
+        # per banned member for what is a snapshot anyway. With nothing cached
+        # (members intent off) every id would look like it had left, so plain
+        # mentions are used instead of an invented label.
+        cached = bool(guild.members)
+        for row in rows:
+            row["in_guild"] = not cached or _still_in_guild(guild, row["user_id"])
+        per_page = ParticipantsPages.PAGE_SIZE
+        pages = max(1, (len(rows) + per_page - 1) // per_page)
+        color = bot.settings.embed_color
+
+        def render(page: int) -> discord.Embed:
+            start = page * per_page
+            return embeds.timeout_bans_embed(
+                rows=rows[start : start + per_page],
+                page=page,
+                pages=pages,
+                total=total,
+                hidden=max(0, total - len(rows)),
+                color=color,
+            )
+
+        try:
+            await interaction.response.send_message(
+                embed=render(0),
+                view=ParticipantsPages(render=render, pages=pages),
+                ephemeral=True,
+            )
+        except (discord.NotFound, discord.HTTPException):
+            pass
 
 
 async def amain(settings: Settings) -> None:

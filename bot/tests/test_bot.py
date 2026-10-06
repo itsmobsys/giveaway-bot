@@ -11,7 +11,10 @@ import asyncio
 import sqlite3
 import unittest
 import uuid
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+
+import discord
 
 from giveaway_bot import views
 from giveaway_bot.bot import GiveawayBot, build_intents, wire_commands
@@ -81,6 +84,7 @@ class WiringTests(BotTestCase):
         "giveaway_notifyer",
         "giveaway_ping",
         "giveaway_reroll",
+        "giveaway_timeout_bans",
     )
 
     def test_every_command_is_registered_once(self) -> None:
@@ -190,6 +194,269 @@ class RoleTaskTests(BotTestCase):
             return len(self.bot._role_tasks)
 
         self.assertEqual(asyncio.run(scenario()), 0)
+
+
+class FakeMember(discord.Member):
+    """A Member with no gateway behind it: only what the join path reads."""
+
+    def __init__(self, user_id: int, *, name: str = "tester", timed_out: bool = False) -> None:
+        # Member.id / .name / .global_name are read-only properties that read
+        # straight through to _user (the flatten_user decorator), so the stub
+        # user is where identity has to come from.
+        self._user = SimpleNamespace(
+            id=user_id,
+            name=name,
+            global_name=None,
+            bot=False,
+            created_at=datetime.now(UTC) - timedelta(days=400),
+        )
+        self.nick = None
+        self._roles: dict = {}
+        # Member.roles walks the guild's roles, so that stub keeps it offline.
+        self.guild = SimpleNamespace(get_role=lambda role_id: None, default_role=None)
+        self._fake_timed_out = timed_out
+
+    def is_timed_out(self) -> bool:
+        return self._fake_timed_out
+
+
+class FakeGuild:
+    """Just enough guild for the member cache and the id checks."""
+
+    def __init__(self, guild_id: str = "1" * 18, members: list | None = None) -> None:
+        self.id = int(guild_id)
+        self._members = {member.id: member for member in (members or [])}
+
+    @property
+    def members(self) -> list:
+        return list(self._members.values())
+
+    def get_member(self, user_id: int):
+        return self._members.get(user_id)
+
+
+class FakeResponse:
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+        self.deferred = False
+
+    def is_done(self) -> bool:
+        return self.deferred or bool(self.sent)
+
+    async def defer(self, **kwargs) -> None:
+        self.deferred = True
+
+    async def send_message(self, content=None, **kwargs) -> None:
+        self.sent.append({"content": content, **kwargs})
+
+
+class FakeFollowup:
+    def __init__(self) -> None:
+        self.sent: list[dict] = []
+
+    async def send(self, content=None, **kwargs) -> None:
+        self.sent.append({"content": content, **kwargs})
+
+
+class FakeInteraction:
+    """The parts of an Interaction the join path and the commands touch."""
+
+    def __init__(self, *, guild: FakeGuild, user: object) -> None:
+        self.guild = guild
+        self.user = user
+        self.response = FakeResponse()
+        self.followup = FakeFollowup()
+
+    @property
+    def texts(self) -> list[str]:
+        return [m["content"] for m in self.response.sent + self.followup.sent]
+
+
+def fake_user(*, manage_guild: bool = False, administrator: bool = False):
+    """A command invoker: only the permission bits _can_manage reads."""
+    return SimpleNamespace(
+        id=999,
+        guild_permissions=SimpleNamespace(
+            manage_guild=manage_guild, administrator=administrator
+        ),
+    )
+
+
+class TimeoutDetectionTests(unittest.TestCase):
+    """Discord's own timeout state is the only source of truth."""
+
+    def test_the_library_timeout_state_is_used(self) -> None:
+        self.assertTrue(GiveawayBot._timed_out(SimpleNamespace(is_timed_out=lambda: True)))
+        self.assertFalse(GiveawayBot._timed_out(SimpleNamespace(is_timed_out=lambda: False)))
+
+    def test_an_object_without_the_api_is_not_timed_out(self) -> None:
+        self.assertFalse(GiveawayBot._timed_out(SimpleNamespace(id=1)))
+        self.assertFalse(GiveawayBot._timed_out(SimpleNamespace(is_timed_out=None)))
+
+    def test_an_unreadable_timeout_never_penalises(self) -> None:
+        def boom() -> bool:
+            raise RuntimeError("member went away")
+
+        self.assertFalse(GiveawayBot._timed_out(SimpleNamespace(is_timed_out=boom)))
+
+
+class JoinTimeoutTests(BotTestCase):
+    """The Join button's half of the rule: real bot, real database, no gateway."""
+
+    def press_join(self, giveaway_id: str, member: FakeMember) -> FakeInteraction:
+        interaction = FakeInteraction(guild=FakeGuild(self.guild, [member]), user=member)
+        asyncio.run(self.bot.handle_join(interaction, giveaway_id))
+        return interaction
+
+    def test_a_timed_out_member_cannot_enter_and_is_penalised(self) -> None:
+        gw = self.make()
+        member = FakeMember(333333333333333333, timed_out=True)
+        interaction = self.press_join(gw.id, member)
+        self.assertEqual(self.svc.entry_count(gw.id), 0)
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, str(member.id)), 3)
+        self.assertTrue(any("timed out" in text for text in interaction.texts))
+
+    def test_an_untimed_out_member_enters_as_usual(self) -> None:
+        gw = self.make()
+        member = FakeMember(444444444444444444)
+        interaction = self.press_join(gw.id, member)
+        self.assertEqual(self.svc.entry_count(gw.id), 1)
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, str(member.id)), 0)
+        self.assertTrue(any("You're in!" in text for text in interaction.texts))
+
+    def test_a_penalised_member_is_refused_by_the_button(self) -> None:
+        first = self.make(prize="trigger")
+        member = FakeMember(555555555555555555, timed_out=True)
+        self.press_join(first.id, member)
+        second = self.make(prize="next")
+        member._fake_timed_out = False  # the timeout ended; the penalty has not
+        interaction = self.press_join(second.id, member)
+        self.assertEqual(self.svc.entry_count(second.id), 0)
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, str(member.id)), 2)
+        self.assertTrue(any("penalty" in text for text in interaction.texts))
+
+
+class TimeoutBanCommandTests(BotTestCase):
+    """The /giveaway_timeout_bans listing: who is sitting out, and only who."""
+
+    def run_command(self, interaction: FakeInteraction) -> None:
+        command = self.bot.tree.get_command("giveaway_timeout_bans")
+        self.assertIsNotNone(command, "the command must be registered")
+        asyncio.run(command.callback(interaction))
+
+    def banned(self, user_id: str, remaining: int = 3) -> None:
+        self.svc.apply_timeout_penalty(
+            self.guild, user_id, giveaways=remaining, giveaway_id="gw_x"
+        )
+
+    def test_lists_active_bans_with_mentions_and_remaining(self) -> None:
+        first, second = "1" * 18, "2" * 18
+        self.banned(first, 3)
+        self.banned(second, 1)
+        interaction = FakeInteraction(
+            guild=FakeGuild(self.guild, [FakeMember(int(first)), FakeMember(int(second))]),
+            user=fake_user(manage_guild=True),
+        )
+        self.run_command(interaction)
+        sent = interaction.response.sent[0]
+        self.assertTrue(sent["ephemeral"])
+        self.assertIsInstance(sent["view"], views.ParticipantsPages)
+        desc = sent["embed"].description
+        self.assertIn(f"<@{first}>", desc)
+        self.assertIn(f"<@{second}>", desc)
+        self.assertIn("**3**", desc)
+        self.assertIn("**1**", desc)
+        self.assertLess(desc.index(first), desc.index(second), "longest penalty first")
+        self.assertIn("Total: **2**", desc)
+
+    def test_users_with_no_giveaways_left_are_excluded(self) -> None:
+        self.db.execute(
+            "INSERT INTO simple_giveaway_bans (guild_id, user_id, giveaways_remaining)"
+            " VALUES (?, ?, 0)",
+            (self.guild, "3" * 18),
+        )
+        self.banned("4" * 18)
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user(administrator=True))
+        self.run_command(interaction)
+        desc = interaction.response.sent[0]["embed"].description
+        self.assertNotIn("3" * 18, desc)
+        self.assertIn("4" * 18, desc)
+
+    def test_an_empty_list_says_so(self) -> None:
+        interaction = FakeInteraction(
+            guild=FakeGuild(self.guild), user=fake_user(manage_guild=True)
+        )
+        self.run_command(interaction)
+        self.assertEqual(interaction.texts, ["No users are currently banned from giveaways."])
+        self.assertNotIn("embed", interaction.response.sent[0])
+
+    def test_unauthorised_members_are_denied(self) -> None:
+        self.banned("1" * 18)
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        self.run_command(interaction)
+        self.assertEqual(interaction.texts, ["You need **Manage Server**."])
+        self.assertNotIn("embed", interaction.response.sent[0])
+        self.assertNotIn("1" * 18, str(interaction.texts), "no data for non-moderators")
+
+    def test_a_database_blip_is_reported_not_raised(self) -> None:
+        self.banned("1" * 18)
+
+        def boom(*args, **kwargs):
+            raise OSError("turso down")
+
+        self.bot.service.list_timeout_bans = boom
+        interaction = FakeInteraction(
+            guild=FakeGuild(self.guild), user=fake_user(manage_guild=True)
+        )
+        self.run_command(interaction)
+        self.assertEqual(interaction.texts, ["⚠️ Could not load the timeout bans. Try again."])
+
+    def test_a_member_who_left_is_shown_by_id(self) -> None:
+        gone = "9" * 18
+        self.banned(gone)
+        interaction = FakeInteraction(
+            guild=FakeGuild(self.guild, [FakeMember(111111111111111111)]),
+            user=fake_user(manage_guild=True),
+        )
+        self.run_command(interaction)
+        desc = interaction.response.sent[0]["embed"].description
+        self.assertIn("`" + gone + "` (left the server)", desc)
+        self.assertNotIn(f"<@{gone}>", desc)
+
+    def test_an_unnumbered_id_does_not_break_the_list(self) -> None:
+        self.banned("not-a-snowflake")
+        interaction = FakeInteraction(
+            guild=FakeGuild(self.guild, [FakeMember(111111111111111111)]),
+            user=fake_user(manage_guild=True),
+        )
+        self.run_command(interaction)
+        self.assertIn("not-a-snowflake", interaction.response.sent[0]["embed"].description)
+
+    def test_a_capped_list_admits_how_many_it_hid(self) -> None:
+        for index in range(5):
+            self.banned(f"{index + 1:0>18}")
+        # Shrink the one-response limit instead of seeding 101 penalties: what
+        # is under test is that the embed reports the real total, not the page.
+        self.bot.service.list_timeout_bans = (
+            lambda guild_id, limit=100: self.svc.list_timeout_bans(guild_id, limit=3)
+        )
+        interaction = FakeInteraction(
+            guild=FakeGuild(self.guild), user=fake_user(manage_guild=True)
+        )
+        self.run_command(interaction)
+        desc = interaction.response.sent[0]["embed"].description
+        self.assertIn("Total: **5**", desc)
+        self.assertIn("2 more not shown.", desc)
+
+    def test_long_lists_are_paginated(self) -> None:
+        for index in range(11):
+            self.banned(f"{index + 1:0>18}", remaining=3 - index % 3)
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user(manage_guild=True))
+        self.run_command(interaction)
+        sent = interaction.response.sent[0]
+        self.assertIn("page 1/2", sent["embed"].title)
+        self.assertIn("Total: **11**", sent["embed"].description)
+        self.assertIsInstance(sent["view"], views.ParticipantsPages)
 
 
 if __name__ == "__main__":

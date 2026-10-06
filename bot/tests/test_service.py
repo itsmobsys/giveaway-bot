@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import unittest
 import uuid
@@ -470,6 +471,206 @@ class BlacklistTests(ServiceTestCase):
         self.assertFalse(self.svc.blacklist_remove(self.guild, "1" * 18))
         self.assertEqual(self.svc.blacklist_list(self.guild), ["2" * 18])
         self.assertFalse(self.svc.is_blacklisted(self.guild, "1" * 18))
+
+
+class TimeoutBanTests(ServiceTestCase):
+    """The penalty for joining while timed out (Discord's native /mute).
+
+    Caught timed out, a member starts a three-giveaway penalty; every giveaway
+    they are then blocked from spends one and the restriction ends with the
+    third. All of it lives in the database, so a restart cannot forgive it.
+    """
+
+    USER = "7" * 18
+
+    def refused(self, gw, **kwargs) -> str:
+        """Assert the join is refused and hand back the message."""
+        with self.assertRaises(ServiceError) as ctx:
+            self.join(gw, user_id=self.USER, **kwargs)
+        return str(ctx.exception.message)
+
+    def test_a_timed_out_member_is_refused_and_starts_the_penalty(self) -> None:
+        gw = self.make()
+        message = self.refused(gw, timed_out=True)
+        self.assertIn("timed out", message)
+        self.assertIn("3 giveaway(s)", message)
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, self.USER), 3)
+        self.assertEqual(self.svc.entry_count(gw.id), 0, "a refused join leaves no entry")
+
+    def test_an_untimed_out_member_is_unaffected(self) -> None:
+        gw = self.make()
+        self.assertEqual(self.join(gw, user_id=self.USER), 1)
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, self.USER), 0)
+        self.assertEqual(self.svc.list_timeout_bans(self.guild), [])
+
+    def test_a_role_is_never_mistaken_for_a_timeout(self) -> None:
+        # Only the timed_out flag counts. A role called "Muted" would be just
+        # another id in this list, and ids are not what the rule reads.
+        self.assertEqual(self.join(self.make(), user_id=self.USER, roles=["5" * 18]), 1)
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, self.USER), 0)
+
+    def test_three_blocked_giveaways_spend_the_penalty_and_lift_it(self) -> None:
+        self.refused(self.make(prize="trigger"), timed_out=True)
+        left = []
+        for index in range(3):
+            gw = self.make(prize=f"blocked {index}")
+            self.assertIn("penalty", self.refused(gw))
+            self.assertEqual(self.svc.entry_count(gw.id), 0)
+            left.append(self.svc.timeout_ban_remaining(self.guild, self.USER))
+        self.assertEqual(left, [2, 1, 0], "one giveaway per blocked attempt")
+        self.assertEqual(self.svc.list_timeout_bans(self.guild), [], "gone, not left at zero")
+        self.assertEqual(self.join(self.make(prize="free"), user_id=self.USER), 1)
+
+    def test_repeated_attempts_never_stack_or_respend_the_penalty(self) -> None:
+        gw = self.make(prize="trigger")
+        self.refused(gw, timed_out=True)
+        # Still timed out, same giveaway: neither a second penalty nor a second
+        # giveaway spent on the one they were already caught in.
+        for _ in range(3):
+            self.assertIn("3 giveaway(s) left", self.refused(gw, timed_out=True))
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, self.USER), 3)
+        # A different giveaway while still timed out spends one and is reported
+        # as the running penalty, never as a fresh three.
+        other = self.make(prize="other")
+        self.assertIn("2 giveaway(s) left", self.refused(other, timed_out=True))
+
+    def test_an_entry_made_before_the_timeout_is_dropped(self) -> None:
+        gw = self.make()
+        self.assertEqual(self.join(gw, user_id=self.USER), 1)
+        self.refused(gw, timed_out=True)
+        self.assertEqual(self.svc.entry_count(gw.id), 0, "a timed-out member cannot stay in")
+
+    def test_a_blacklisted_member_is_refused_without_a_penalty(self) -> None:
+        self.svc.blacklist_add(self.guild, self.USER)
+        message = self.refused(self.make(), timed_out=True)
+        self.assertIn("blocked", message)
+        self.assertEqual(
+            self.svc.timeout_ban_remaining(self.guild, self.USER), 0,
+            "a permanent block is not a timeout penalty",
+        )
+
+    def test_an_ended_giveaway_never_hands_out_a_penalty(self) -> None:
+        gw = self.make()
+        self.svc.end(gw.id)
+        self.assertIn("ended", self.refused(self.svc.get(gw.id), timed_out=True))
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, self.USER), 0)
+
+    def test_an_expired_deadline_never_hands_out_a_penalty(self) -> None:
+        gw = self.make()
+        self.db.execute("UPDATE simple_giveaways SET ends_at = ? WHERE id = ?", (now_ms() - 1, gw.id))
+        self.assertIn("ended", self.refused(self.svc.get(gw.id), timed_out=True))
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, self.USER), 0)
+
+    def test_the_penalty_is_per_guild_and_per_user(self) -> None:
+        self.refused(self.make(prize="trigger"), timed_out=True)
+        self.assertEqual(self.svc.timeout_ban_remaining("555555555555555555", self.USER), 0)
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, "8" * 18), 0)
+        self.assertEqual(self.svc.timeout_ban_remaining("", self.USER), 0)
+
+    def test_a_second_penalty_never_shrinks_the_first(self) -> None:
+        self.svc.apply_timeout_penalty(self.guild, self.USER, giveaway_id="gw_a")
+        self.assertEqual(
+            self.svc.apply_timeout_penalty(self.guild, self.USER, giveaway_id="gw_b"), 3
+        )
+        self.svc.apply_timeout_penalty(self.guild, self.USER, giveaways=1, giveaway_id="gw_c")
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, self.USER), 3)
+
+    def test_one_penalty_does_not_block_anybody_else(self) -> None:
+        self.refused(self.make(prize="trigger"), timed_out=True)
+        self.assertEqual(self.join(self.make(prize="someone else"), user_id="9" * 18), 1)
+
+    def test_the_entry_sweep_never_touches_a_penalty(self) -> None:
+        gw = self.make()
+        self.refused(gw, timed_out=True)
+        self.svc.end(gw.id)
+        # The 5h entry wipe runs long after a giveaway ends; a penalty must
+        # outlive it, which is exactly why it lives in its own table.
+        self.assertEqual(self.svc.wipe_stale_entries(now=now_ms() + 10 * DAY_MS), 0)
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, self.USER), 3)
+
+    def test_two_simultaneous_clicks_cannot_stack_the_penalty(self) -> None:
+        gw = self.make(prize="race")
+        messages: list[str] = []
+        barrier = threading.Barrier(2, timeout=10)
+
+        def click() -> None:
+            try:
+                barrier.wait()
+                self.svc.join(
+                    gw,
+                    user_id=self.USER,
+                    username="racer",
+                    member_roles=[],
+                    account_created_ts=time.time() - 400 * 86400,
+                    timed_out=True,
+                )
+            except ServiceError as exc:
+                messages.append(str(exc.message))
+            except Exception as exc:  # a lost race must not surface as a crash
+                messages.append(f"unexpected: {exc!r}")
+
+        threads = [threading.Thread(target=click) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+        self.assertEqual(len(messages), 2, messages)
+        self.assertTrue(
+            all("timed out" in m or "penalty" in m for m in messages), messages
+        )
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, self.USER), 3)
+        self.assertEqual(self.svc.entry_count(gw.id), 0)
+
+    def test_the_penalty_survives_a_restart(self) -> None:
+        self.refused(self.make(prize="trigger"), timed_out=True)
+        # A new Database on the same store is what a restart looks like: fresh
+        # connections, fresh schema pass, same rows.
+        restarted = Database(Settings(turso_url=""), connect=self._connect)
+        try:
+            restarted.init_schema()
+            service = GiveawayService(restarted)
+            self.assertEqual(service.timeout_ban_remaining(self.guild, self.USER), 3)
+            self.assertEqual(len(service.list_timeout_bans(self.guild)), 1)
+            gw = self.svc.get(self.make(prize="after the restart").id)
+            with self.assertRaises(ServiceError) as ctx:
+                service.join(
+                    gw,
+                    user_id=self.USER,
+                    username="restarted",
+                    member_roles=[],
+                    account_created_ts=time.time() - 400 * 86400,
+                )
+            self.assertIn("penalty", str(ctx.exception.message))
+        finally:
+            restarted.close_all()
+
+    def test_counting_matches_the_listing(self) -> None:
+        self.assertEqual(self.svc.count_timeout_bans(self.guild), 0)
+        for user_id in ("1" * 18, "2" * 18):
+            self.svc.apply_timeout_penalty(self.guild, user_id, giveaway_id="gw_x")
+        self.db.execute(
+            "INSERT INTO simple_giveaway_bans (guild_id, user_id, giveaways_remaining)"
+            " VALUES (?, ?, 0)",
+            (self.guild, "5" * 18),
+        )
+        self.assertEqual(self.svc.count_timeout_bans(self.guild), 2, "zero rows are not bans")
+        self.assertEqual(self.svc.count_timeout_bans("555555555555555555"), 0)
+
+    def test_list_is_guild_scoped_ordered_and_skips_zero_rows(self) -> None:
+        for user_id in ("1" * 18, "2" * 18):
+            self.svc.apply_timeout_penalty(self.guild, user_id, giveaway_id="gw_x")
+        self.svc.apply_timeout_penalty(self.guild, "3" * 18, giveaways=1, giveaway_id="gw_x")
+        # A hand-written zero row must never be reported as a ban.
+        self.db.execute(
+            "INSERT INTO simple_giveaway_bans (guild_id, user_id, giveaways_remaining)"
+            " VALUES (?, ?, 0)",
+            (self.guild, "4" * 18),
+        )
+        rows = self.svc.list_timeout_bans(self.guild)
+        self.assertEqual([r["user_id"] for r in rows], ["1" * 18, "2" * 18, "3" * 18])
+        self.assertEqual([r["giveaways_remaining"] for r in rows], [3, 3, 1])
+        self.assertEqual(self.svc.list_timeout_bans("555555555555555555"), [])
+        self.assertEqual(len(self.svc.list_timeout_bans(self.guild, limit=1)), 1)
 
 
 class GuildSettingTests(ServiceTestCase):

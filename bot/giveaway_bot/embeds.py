@@ -81,6 +81,43 @@ def participants_embed(
     )
 
 
+def timeout_bans_embed(
+    *,
+    rows: list[dict],
+    page: int,
+    pages: int,
+    total: int,
+    color: int,
+    hidden: int = 0,
+) -> discord.Embed:
+    """One page of members sitting out a penalty for joining while timed out.
+
+    Rows arrive from GiveawayService.list_timeout_bans(); each one carries the
+    "in_guild" flag the caller resolved from its own member cache, so a member
+    who left the server is shown by id instead of a mention that would never
+    resolve.
+    """
+    lines: list[str] = []
+    for row in rows:
+        user_id = str(row["user_id"])
+        who = f"<@{user_id}>" if row.get("in_guild") else f"`{user_id}` (left the server)"
+        line = f"{who} — **{int(row['giveaways_remaining'])}** giveaway(s) left"
+        since = int(row.get("created_at") or 0) // 1000
+        if since:
+            line += f" · since <t:{since}:R>"
+        lines.append(line)
+    desc = "\n".join(lines) + f"\n\nTotal: **{total}** member(s) banned from giveaways"
+    if hidden > 0:
+        # The listing is capped (list_timeout_bans), so say so rather than
+        # letting the page count pass for the whole picture.
+        desc += f"\n{hidden} more not shown."
+    return discord.Embed(
+        title=f"⏳ Timed-out giveaway bans — page {page + 1}/{pages}",
+        description=desc,
+        colour=color,
+    )
+
+
 def winner_embed(gw: Giveaway, winners: list[str], entries: int, color: int) -> discord.Embed:
     if winners:
         mentions = ", ".join(f"<@{w}>" for w in winners)
