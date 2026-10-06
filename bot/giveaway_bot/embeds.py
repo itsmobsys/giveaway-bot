@@ -8,6 +8,10 @@ import discord
 
 from .service import Giveaway
 
+#: Winners named individually in an announcement. Past this the list is
+#: summarised, because the mention text alone would overflow the embed.
+WINNERS_NAMED = 50
+
 
 def countdown(ends_at_ms: int) -> str:
     """Human 'ends in' text, re-rendered every tick so it visibly ticks down."""
@@ -69,7 +73,9 @@ def participants_embed(
     color: int,
 ) -> discord.Embed:
     lines = [f"<@{row['user_id']}> (1 entry)" for row in rows]
-    chance = (winner_count / total * 100) if mine and total else 0.0
+    # Clamped like every other odds readout in the bot: a giveaway created with
+    # 25 winners and 3 entrants would otherwise advertise 833%.
+    chance = min(100.0, winner_count / total * 100) if mine and total else 0.0
     desc = (
         f"These are the members that have participated in the giveaway of {prize}:\n\n"
         + "\n".join(lines)
@@ -120,7 +126,13 @@ def timeout_bans_embed(
 
 def winner_embed(gw: Giveaway, winners: list[str], entries: int, color: int) -> discord.Embed:
     if winners:
-        mentions = ", ".join(f"<@{w}>" for w in winners)
+        # Discord caps a description at 4096 characters, so an old reroll row
+        # holding hundreds of winners would lose the whole announcement: name
+        # the first fifty and count the rest.
+        named = winners[:WINNERS_NAMED]
+        mentions = ", ".join(f"<@{w}>" for w in named)
+        if len(winners) > len(named):
+            mentions += f" …and {len(winners) - len(named)} more"
         desc = (
             f"## 🎊 {gw.prize} 🎊\n\n"
             f"Congratulations {mentions} — you won!\n\n"

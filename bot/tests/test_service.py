@@ -297,6 +297,13 @@ class JoinTests(ServiceTestCase):
         # Two messages are still buffered in memory by the bot.
         self.assertEqual(self.join(gw, user_id="6" * 18, pending_messages=2), 1)
 
+    def test_has_entry_is_a_targeted_lookup(self) -> None:
+        gw = self.make()
+        self.join(gw, user_id="1" * 18)
+        self.assertTrue(self.svc.has_entry(gw.id, "1" * 18))
+        self.assertFalse(self.svc.has_entry(gw.id, "2" * 18))
+        self.assertFalse(self.svc.has_entry(gw.id, ""))
+
     def test_entries_can_be_limited_for_a_display_path(self) -> None:
         gw = self.make()
         for index in range(5):
@@ -350,9 +357,20 @@ class MessageCountTests(ServiceTestCase):
         self.svc.end(gw.id)
         self.assertEqual(self.svc.message_count(self.guild, "c" * 18), 0)
 
+    def test_end_resets_only_the_guild_whose_giveaway_ended(self) -> None:
+        other = "555555555555555555"
+        self.svc.record_message(self.guild, "c" * 18)
+        self.svc.record_message(other, "c" * 18)
+        self.svc.end(self.make().id)
+        self.assertEqual(self.svc.message_count(self.guild, "c" * 18), 0)
+        self.assertEqual(
+            self.svc.message_count(other, "c" * 18), 1,
+            "another server's min_messages counters must survive",
+        )
+
 
 class DrawTests(ServiceTestCase):
-    def test_end_draws_and_is_idempotent(self) -> None:
+    def test_end_draws_once_and_refuses_a_second_call(self) -> None:
         gw = self.make(winner_count=2)
         for i in range(5):
             self.join(gw, user_id=str(10 ** 17 + i))
@@ -360,9 +378,40 @@ class DrawTests(ServiceTestCase):
         self.assertEqual(len(winners), 2)
         self.assertEqual(sorted(ended.winners), sorted(winners))
         self.assertEqual(ended.status, "ended")
-        again, winners2 = self.svc.end(gw.id)
-        self.assertEqual(winners2, winners, "re-ending must not redraw")
-        self.assertEqual(again.status, "ended")
+        # The status flip is the claim, so a second ender cannot draw again —
+        # and cannot get a different set of winners to announce either.
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.end(gw.id)
+        self.assertIn("already ended", str(ctx.exception.message))
+        self.assertEqual(sorted(self.svc.get(gw.id).winners), sorted(winners))
+
+    def test_two_end_calls_cannot_both_draw(self) -> None:
+        gw = self.make(winner_count=1)
+        for i in range(30):
+            self.join(gw, user_id=str(10 ** 17 + i))
+        winners: list[list[str]] = []
+        refusals: list[str] = []
+        barrier = threading.Barrier(2, timeout=10)
+
+        def finish() -> None:
+            try:
+                barrier.wait()
+                _, drawn = self.svc.end(gw.id)
+                winners.append(drawn)
+            except ServiceError as exc:
+                refusals.append(str(exc.message))
+            except Exception as exc:  # a lost race must not surface as a crash
+                refusals.append(f"unexpected: {exc!r}")
+
+        threads = [threading.Thread(target=finish) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+        self.assertEqual(len(winners), 1, f"exactly one draw, got {winners}")
+        self.assertEqual(len(refusals), 1, refusals)
+        self.assertIn("already ended", refusals[0])
+        self.assertEqual(sorted(self.svc.get(gw.id).winners), sorted(winners[0]))
 
     def test_end_without_entries_is_safe(self) -> None:
         ended, winners = self.svc.end(self.make().id)
@@ -398,6 +447,28 @@ class DrawTests(ServiceTestCase):
         with self.assertRaises(ServiceError) as ctx:
             self.svc.reroll(gw.id, 1)
         self.assertIn("End the giveaway", str(ctx.exception.message))
+
+    def test_reroll_never_exceeds_the_winner_cap(self) -> None:
+        gw = self.make(winner_count=1)
+        for i in range(30):
+            self.join(gw, user_id=str(10 ** 17 + i))
+        self.svc.end(gw.id)
+        _, fresh = self.svc.reroll(gw.id, 200)
+        self.assertEqual(
+            len(self.svc.get(gw.id).winners), 25, "the list stays inside the cap"
+        )
+        self.assertEqual(len(fresh), 24, "the existing winner leaves room for 24 more")
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.reroll(gw.id, 1)
+        self.assertIn("most one", str(ctx.exception.message))
+
+    def test_a_cancelled_giveaway_cannot_be_rerolled(self) -> None:
+        gw = self.make()
+        self.join(gw, user_id="1" * 18)
+        self.svc.cancel(gw.id)
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.reroll(gw.id, 1)
+        self.assertIn("cancelled", str(ctx.exception.message))
 
     def test_extend_and_cancel(self) -> None:
         gw = self.make(duration_seconds=600)
@@ -454,6 +525,18 @@ class RetentionTests(ServiceTestCase):
         self.assertEqual(len(self.svc.get(old.id).winners), 1, "the record and winners stay")
 
 
+    def test_rows_without_an_ended_at_still_expire(self) -> None:
+        gw = self.make()
+        self.join(gw, user_id="1" * 18)
+        # ended_at arrived as a later column, so giveaways that finished before
+        # it existed carry NULL and used to keep their entries forever.
+        self.db.execute(
+            "UPDATE simple_giveaways SET status = 'cancelled', ended_at = NULL WHERE id = ?",
+            (gw.id,),
+        )
+        self.assertEqual(self.svc.wipe_stale_entries(now=now_ms() + 10 * DAY_MS), 1)
+
+
 class BlacklistTests(ServiceTestCase):
     def test_add_blocks_and_purges_only_running_giveaways(self) -> None:
         running = self.make()
@@ -478,6 +561,37 @@ class BlacklistTests(ServiceTestCase):
             self.svc.blacklist_add(self.guild, user_id)
         self.assertEqual(self.svc.count_blacklisted(self.guild), 2)
         self.assertEqual(self.svc.count_blacklisted("999"), 0)
+
+    def test_the_purge_leaves_other_guilds_alone(self) -> None:
+        other = "555555555555555555"
+        here = self.make()
+        there = self.make(guild_id=other)
+        self.join(here, user_id="1" * 18)
+        self.join(there, user_id="1" * 18)
+        self.svc.blacklist_add(self.guild, "1" * 18)
+        self.assertEqual(self.svc.entry_count(here.id), 0)
+        self.assertEqual(self.svc.entry_count(there.id), 1, "another server is untouched")
+
+    def test_a_blacklist_landing_mid_join_still_refuses(self) -> None:
+        gw = self.make()
+        # The block lands after check_eligible has read the blacklist, which is
+        # the window the in-statement guard exists to close.
+        self.svc.blacklist_add(self.guild, "1" * 18)
+        original = self.svc.is_blacklisted
+        calls = {"n": 0}
+
+        def stale_first_read(guild_id: str, user_id: str) -> bool:
+            calls["n"] += 1
+            return False if calls["n"] == 1 else original(guild_id, user_id)
+
+        self.svc.is_blacklisted = stale_first_read  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(ServiceError) as ctx:
+                self.join(gw, user_id="1" * 18)
+        finally:
+            self.svc.is_blacklisted = original  # type: ignore[method-assign]
+        self.assertIn("blocked", str(ctx.exception.message))
+        self.assertEqual(self.svc.entry_count(gw.id), 0, "the guard held")
 
     def test_remove_and_list(self) -> None:
         for user_id in ("1" * 18, "2" * 18):
@@ -569,6 +683,18 @@ class TimeoutBanTests(ServiceTestCase):
         self.assertEqual(self.join(gw, user_id=self.USER), 1)
         self.refused(gw, timed_out=True)
         self.assertEqual(self.svc.entry_count(gw.id), 0, "a timed-out member cannot stay in")
+
+    def test_a_penalty_clears_entries_in_every_running_giveaway(self) -> None:
+        yesterday = self.make(prize="joined yesterday")
+        today = self.make(prize="joined today")
+        self.assertEqual(self.join(yesterday, user_id=self.USER), 1)
+        self.assertEqual(self.join(today, user_id=self.USER), 1)
+        self.refused(self.make(prize="trigger"), timed_out=True)
+        # Sitting out has to mean not entered anywhere: keeping the entry in the
+        # giveaway they joined before the mute would let them win it.
+        self.assertEqual(self.svc.entry_count(yesterday.id), 0)
+        self.assertEqual(self.svc.entry_count(today.id), 0)
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, self.USER), 3)
 
     def test_a_blacklisted_member_is_refused_without_a_penalty(self) -> None:
         self.svc.blacklist_add(self.guild, self.USER)

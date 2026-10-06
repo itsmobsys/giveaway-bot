@@ -171,8 +171,13 @@ class ParticipantsPages(discord.ui.View):
 
     PAGE_SIZE = 10
 
+    #: Long enough to match the 15-minute interaction token: after that the
+    #: buttons are dead anyway, and before it a click that arrives after the
+    #: view timed out is dropped with no message and no log.
+    VIEW_TIMEOUT = 900.0
+
     def __init__(self, *, render: Callable[[int], discord.Embed], pages: int) -> None:
-        super().__init__(timeout=180)
+        super().__init__(timeout=self.VIEW_TIMEOUT)
         self._render = render
         self._pages = max(1, pages)
         self.page = 0
@@ -186,7 +191,8 @@ class ParticipantsPages(discord.ui.View):
             custom_id="gw_pages:counter",
             disabled=True,
         )
-        counter.callback = self._noop  # type: ignore[method-assign]
+        # No callback on purpose: a disabled component is never dispatched, so
+        # the counter is decoration and nothing here can respond to it.
         nxt = discord.ui.Button(
             label="Next ▶", style=discord.ButtonStyle.secondary, custom_id="gw_pages:next"
         )
@@ -204,15 +210,24 @@ class ParticipantsPages(discord.ui.View):
         self._next_btn.disabled = self.page >= self._pages - 1
         self._counter_btn.label = f"Page {self.page + 1}/{self._pages}"
 
-    async def _noop(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer()
+    async def _show(self, interaction: discord.Interaction, page: int) -> None:
+        """Render one page, recording it only once Discord accepted the edit.
+
+        Moving self.page before the edit meant a failed edit left the buttons
+        describing a page the message never showed, so the next click skipped
+        one.
+        """
+        previous, self.page = self.page, max(0, min(page, self._pages - 1))
+        self._sync()
+        try:
+            await interaction.response.edit_message(embed=self._render(self.page), view=self)
+        except Exception:
+            self.page = previous
+            self._sync()
+            raise
 
     async def _prev(self, interaction: discord.Interaction) -> None:
-        self.page = max(0, self.page - 1)
-        self._sync()
-        await interaction.response.edit_message(embed=self._render(self.page), view=self)
+        await self._show(interaction, self.page - 1)
 
     async def _next(self, interaction: discord.Interaction) -> None:
-        self.page = min(self._pages - 1, self.page + 1)
-        self._sync()
-        await interaction.response.edit_message(embed=self._render(self.page), view=self)
+        await self._show(interaction, self.page + 1)

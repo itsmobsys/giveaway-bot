@@ -13,7 +13,7 @@ from discord.ext import commands, tasks
 from . import embeds
 from .config import Settings
 from .db import Database
-from .service import TIMEOUT_BAN_KIND, Giveaway, GiveawayService, ServiceError
+from .service import TIMEOUT_BAN_KIND, Giveaway, GiveawayService, PartialFlush, ServiceError
 from .views import GiveawayView, ParticipantsPages
 
 log = logging.getLogger("giveaway_bot")
@@ -31,6 +31,28 @@ def _can_manage(member: object) -> bool:
     if perms is None:
         return False
     return bool(perms.manage_guild or perms.administrator)
+
+
+#: Discord's content limit for one message, and what one mention costs there
+#: ("<@1234567890123456789> " is 22 characters, rounded up for slack).
+CONTENT_LIMIT = 2000
+MENTION_CHARS = 23
+
+
+def _mention_chunks(ids: list[str], head: str) -> list[str]:
+    """Split mentions into messages that fit Discord's content cap.
+
+    The first chunk carries the announcement text, so its budget is smaller.
+    Sizing chunks on a fixed 80 mentions ignored that: a 256-character prize
+    pushed the first message past 2000, Discord answered 400, and the whole ping
+    was dropped instead of being split.
+    """
+    per = max(1, (CONTENT_LIMIT - len(head) - 1) // MENTION_CHARS)
+    chunks: list[str] = []
+    for start in range(0, len(ids), per):
+        block = " ".join(f"<@{uid}>" for uid in ids[start : start + per])
+        chunks.append(f"{head}\n{block}" if start == 0 else block)
+    return chunks
 
 
 def _still_in_guild(guild: discord.Guild, user_id: str) -> bool:
@@ -69,6 +91,8 @@ class GiveawayBot(commands.Bot):
         #: Tick counter; the entry-wipe sweep runs every ~20 ticks so a
         #: usually-empty DELETE doesn't cost a Turso write on every pass.
         self._tick_count = 0
+        #: Where the rotating embed-refresh window starts on the next tick.
+        self._refresh_cursor = 0
 
     # -- lifecycle ------------------------------------------------------
     async def setup_hook(self) -> None:
@@ -199,6 +223,20 @@ class GiveawayBot(commands.Bot):
     #: HTTP PATCH, so this guards the rate limit as much as the loop.
     REFRESH_CONCURRENCY = 5
 
+    #: Embeds re-rendered every tick. The soonest deadlines always get a slot, so
+    #: the countdown members are watching stays live; the rest rotate below.
+    REFRESH_PER_TICK = 10
+
+    #: Rotating slots for the giveaways past that cap. Without them the eleventh
+    #: giveaway on a busy server shows the entry count it had when it was posted,
+    #: for as long as earlier giveaways keep running.
+    REFRESH_ROTATING = 5
+
+    #: Entrants loaded for the Participants panel (10 per page). The panel shows
+    #: a window instead of the whole table: a giveaway with 100k entries should
+    #: not pull every row into memory, for every member who clicks the button.
+    PARTICIPANT_WINDOW = 500
+
     async def _refresh_embeds(self, giveaways: list[Giveaway]) -> None:
         """Re-render several embeds concurrently, a few at a time."""
         gate = asyncio.Semaphore(self.REFRESH_CONCURRENCY)
@@ -211,6 +249,18 @@ class GiveawayBot(commands.Bot):
                     log.exception("embed refresh failed for %s", gw.id)
 
         await asyncio.gather(*(one(gw) for gw in giveaways))
+
+    def _refresh_window(self, live: list[Giveaway]) -> list[Giveaway]:
+        """The soonest deadlines, plus a rotating slice of everything else."""
+        head = live[: self.REFRESH_PER_TICK]
+        rest = live[self.REFRESH_PER_TICK :]
+        if not rest:
+            return head
+        start = self._refresh_cursor % len(rest)
+        count = min(self.REFRESH_ROTATING, len(rest))
+        extra = [rest[(start + step) % len(rest)] for step in range(count)]
+        self._refresh_cursor = (start + count) % len(rest)
+        return head + extra
 
     async def _refresh_embed(self, gw: Giveaway) -> None:
         if not gw.message_id:
@@ -230,8 +280,14 @@ class GiveawayBot(commands.Bot):
                 embed=embeds.giveaway_embed(gw, count, self.settings.embed_color),
                 view=GiveawayView(gw.id, self.settings.dashboard_url),
             )
-        except discord.HTTPException:
-            pass
+        except discord.NotFound:
+            # The message is gone for good: nothing to edit, and nothing worth
+            # repeating in the log every tick.
+            log.debug("giveaway message for %s no longer exists", gw.id)
+        except discord.HTTPException as exc:
+            # Swallowing this made a frozen embed invisible: the countdown simply
+            # stopped moving, with no line in the log to say why.
+            log.warning("embed refresh failed for %s (%s)", gw.id, exc)
 
     # -- message counting (min-messages requirement) ----------------------
     #: How often buffered counts reach the database, and how many distinct users
@@ -271,16 +327,25 @@ class GiveawayBot(commands.Bot):
         # Swap first: anything counted while the write is in flight lands in the
         # fresh dict instead of being overwritten by the batch we are sending.
         batch, self._message_buffer = self._message_buffer, {}
+        rows = [(guild_id, user_id, n) for (guild_id, user_id), n in batch.items()]
         try:
-            await asyncio.to_thread(
-                self.service.add_message_counts,
-                [(guild_id, user_id, n) for (guild_id, user_id), n in batch.items()],
-            )
-        except Exception:
-            # Hand the counts back instead of dropping them on a Turso blip.
-            for key, n in batch.items():
-                self._message_buffer[key] = self._message_buffer.get(key, 0) + n
+            await asyncio.to_thread(self.service.add_message_counts, rows)
+        except PartialFlush as exc:
+            # The chunks before the failure are already stored, so only the tail
+            # goes back: restoring the whole batch would write the committed head
+            # a second time and inflate everybody's count.
+            self._requeue(rows[exc.applied :])
             raise
+        except Exception:
+            # Nothing is known to have landed; hand the whole batch back.
+            self._requeue(rows)
+            raise
+
+    def _requeue(self, rows: list[tuple[str, str, int]]) -> None:
+        """Put counts that did not reach the database back in the buffer."""
+        for guild_id, user_id, count in rows:
+            key = (guild_id, user_id)
+            self._message_buffer[key] = self._message_buffer.get(key, 0) + count
 
     # -- entrants role (ping everyone in the giveaway) --------------------
     async def _member_for(
@@ -358,6 +423,10 @@ class GiveawayBot(commands.Bot):
     #: How many members may be stripped of the entrants role at the same time.
     ROLE_STRIP_CONCURRENCY = 5
 
+    #: Entrants per gather. One task per entrant would allocate 50k tasks for a
+    #: 50k-entry giveaway; the semaphore caps concurrency, not the allocation.
+    STRIP_BATCH = 200
+
     async def _strip_entrants_role(self, gw: Giveaway) -> None:
         """Take the role from every entrant now, delete it in 5 minutes."""
         role = self._role_for(gw)
@@ -388,7 +457,9 @@ class GiveawayBot(commands.Bot):
                     except (discord.Forbidden, discord.HTTPException):
                         pass
 
-            await asyncio.gather(*(strip_one(str(row["user_id"])) for row in entrants))
+            for start in range(0, len(entrants), self.STRIP_BATCH):
+                window = entrants[start : start + self.STRIP_BATCH]
+                await asyncio.gather(*(strip_one(str(row["user_id"])) for row in window))
         self._schedule_role_delete(
             str(gw.guild_id), str(role.id), gw.id, delay=self.ROLE_DELETE_DELAY
         )
@@ -410,6 +481,12 @@ class GiveawayBot(commands.Bot):
         )
         self._role_tasks.add(task)
         task.add_done_callback(self._role_tasks.discard)
+        # Also released from the callback, not only from the task's own finally:
+        # a task cancelled before it ever started never runs that block, and the
+        # giveaway would stay marked as scheduled for the life of the process.
+        task.add_done_callback(
+            lambda _task: self._scheduled_role_deletes.discard(giveaway_id)
+        )
 
     async def _delete_entrants_role_later(
         self, guild_id: str, role_id: str, giveaway_id: str, delay: float
@@ -421,6 +498,15 @@ class GiveawayBot(commands.Bot):
             except (TypeError, ValueError):
                 guild = None
             if guild is None:
+                # The bot cannot see the guild any more (removed, or unavailable
+                # right now). The role is unreachable either way, so clear the
+                # row: leaving it set makes the restart sweep re-queue this
+                # giveaway on every boot, forever, for nothing.
+                log.warning(
+                    "guild %s unavailable; dropping entrants role cleanup for %s",
+                    guild_id, giveaway_id,
+                )
+                await asyncio.to_thread(self.service.set_entrants_role, giveaway_id, None)
                 return
             role = guild.get_role(int(role_id)) if role_id.isdigit() else None
             if role is not None:
@@ -543,7 +629,14 @@ class GiveawayBot(commands.Bot):
         except Exception:
             log.exception("post-join refresh lookup failed for %s", giveaway_id)
             return
-        await self._grant_entrants_role(fresh, member)
+        if fresh.active:
+            await self._grant_entrants_role(fresh, member)
+        else:
+            # The draw won the race: this member joined in the same instant the
+            # giveaway ended, and the strip pass may already have walked past
+            # them. Granting the role now would leave them holding the
+            # ping-everyone role of a giveaway that is over.
+            await self._take_entrants_role(fresh, uid)
         await self._refresh_embed(fresh)
 
     async def _safe_followup(self, interaction: discord.Interaction, text: str) -> None:
@@ -559,7 +652,20 @@ class GiveawayBot(commands.Bot):
             return
         try:
             gw = await asyncio.to_thread(self.service.get, giveaway_id)
-            entrants = await asyncio.to_thread(self.service.entries, gw.id)
+            total = await asyncio.to_thread(self.service.entry_count, gw.id)
+            # One bounded window instead of the whole table, and the "am I in it"
+            # question answered by a lookup rather than by scanning the rows we
+            # happened to load.
+            entrants = await asyncio.to_thread(
+                self.service.entries, gw.id, self.PARTICIPANT_WINDOW
+            )
+            mine = (
+                1
+                if await asyncio.to_thread(
+                    self.service.has_entry, gw.id, str(interaction.user.id)
+                )
+                else 0
+            )
         except ServiceError as exc:
             await self._safe_followup(interaction, f"⚠️ {exc.message}")
             return
@@ -572,9 +678,7 @@ class GiveawayBot(commands.Bot):
                 interaction, f"🏆 **{gw.prize}** — no entrants yet."
             )
             return
-        mine = 1 if str(interaction.user.id) in {str(r["user_id"]) for r in entrants} else 0
-        total = len(entrants)
-        pages = max(1, (total + 9) // 10)
+        pages = max(1, (len(entrants) + 9) // 10)
         color = self.settings.embed_color
 
         def render(page: int) -> discord.Embed:
@@ -635,7 +739,11 @@ class GiveawayBot(commands.Bot):
         for gw in due:
             try:
                 ended, winners = await asyncio.to_thread(self.service.end, gw.id)
-            except ServiceError:
+            except ServiceError as exc:
+                # Usually another ender won the claim (the tick and
+                # /giveaway_end firing together), but a giveaway that never ends
+                # should leave a trace rather than look like a quiet pass.
+                log.info("could not end %s: %s", gw.id, exc.message)
                 continue
             except Exception:
                 log.exception("end failed for %s", gw.id)
@@ -643,7 +751,8 @@ class GiveawayBot(commands.Bot):
             await self._announce(ended, winners)
             await self._strip_entrants_role(ended)
         # Live timer: re-render active embeds every tick so the countdown
-        # visibly ticks down (soonest deadline first, capped per tick).
+        # visibly ticks down. The soonest deadlines always get a slot; the rest
+        # rotate, so no running giveaway is left showing a stale count.
         try:
             # One query feeds both consumers: the per-guild autocomplete cache
             # wants them all, the embeds below only the soonest ten.
@@ -652,7 +761,7 @@ class GiveawayBot(commands.Bot):
             log.exception("live list failed")
             return
         self._cache_autocomplete(live)
-        await self._refresh_embeds(live[:10])
+        await self._refresh_embeds(self._refresh_window(live))
         # Privacy sweep: join data (who entered) older than 5h past the end
         # is wiped. Giveaway records + winner lists stay; message counts are
         # already cleared at end-time.
@@ -830,7 +939,14 @@ def wire_commands(bot: GiveawayBot) -> None:
             return
         channel = bot._target_channel(interaction)
         if channel is None:
-            await interaction.response.send_message("No text channel available.", ephemeral=True)
+            # A thread looks like a channel to the person running the command but
+            # is not a TextChannel, and "no text channel available" hid that.
+            problem = (
+                "Giveaways need a text channel — a thread cannot hold one."
+                if isinstance(interaction.channel, discord.Thread)
+                else "No text channel available."
+            )
+            await interaction.response.send_message(problem, ephemeral=True)
             return
         try:
             await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1045,14 +1161,12 @@ def wire_commands(bot: GiveawayBot) -> None:
                 )
             else:
                 ids = [str(row["user_id"]) for row in entrants]
-                for i in range(0, len(ids), 80):
-                    chunk = " ".join(f"<@{uid}>" for uid in ids[i : i + 80])
+                for chunk in _mention_chunks(ids, notice):
                     await channel.send(
-                        f"{notice}\n{chunk}" if i == 0 else chunk,
-                        allowed_mentions=discord.AllowedMentions(users=True),
+                        chunk, allowed_mentions=discord.AllowedMentions(users=True)
                     )
-        except (discord.Forbidden, discord.HTTPException):
-            log.warning("extend notice failed for %s", fresh.id)
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("extend notice failed for %s (%s)", fresh.id, exc)
 
     @bot.tree.command(name="giveaway_list", description="Show entrants, or active giveaways")
     @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
@@ -1108,8 +1222,12 @@ def wire_commands(bot: GiveawayBot) -> None:
         for gw in active[:10]:
             n = await asyncio.to_thread(svc.entry_count, gw.id)
             each = f" — **{min(100.0, gw.winner_count / n * 100):.1f}%** each" if n else ""
+            # Ten lines carrying full 256-character prizes pass Discord's 2000
+            # character cap, and the resulting 400 would be swallowed by
+            # _safe_followup — the moderator would get no reply at all.
+            prize = gw.prize if len(gw.prize) <= 80 else gw.prize[:77] + "…"
             lines.append(
-                f"• **{gw.prize}** — {n} entries{each} — `{gw.id}`"
+                f"• **{prize}** — {n} entries{each} — `{gw.id}`"
                 f" — <t:{int(gw.ends_at/1000)}:R>"
             )
         lines.append("\nTip: run `/giveaway_list` with an id to see who entered.")
@@ -1126,37 +1244,53 @@ def wire_commands(bot: GiveawayBot) -> None:
             await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
             return
         gid = str(interaction.guild.id)
+        # Ack first: this command does an HTTP role edit plus a database write
+        # before it can answer, and Discord only allows 3 seconds.
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
         if role is None:
             try:
                 current = await asyncio.to_thread(svc.get_notify_role, gid)
             except Exception:
                 current = None
-            if current and interaction.guild.get_role(int(current)) is not None:
-                await interaction.response.send_message(
+            # A hand-edited non-numeric id must read as "unset", not crash the
+            # command with a ValueError.
+            if (
+                current
+                and str(current).isdigit()
+                and interaction.guild.get_role(int(current)) is not None
+            ):
+                await bot._safe_followup(
+                    interaction,
                     f"🔔 Notify role: <@&{current}> — give it to members so they"
                     " get pinged on giveaway news.",
-                    ephemeral=True,
                 )
             else:
-                await interaction.response.send_message(
+                await bot._safe_followup(
+                    interaction,
                     "No notify role set. Run `/giveaway_notifyer role:@YourRole` once.",
-                    ephemeral=True,
                 )
             return
+        note = ""
         try:
             await role.edit(mentionable=True, reason="Giveaway notify role setup")
         except (discord.Forbidden, discord.HTTPException):
-            pass
+            # A role that cannot be made mentionable pings nobody. Saving it
+            # anyway is fine, but claiming success is not.
+            log.warning("could not make notify role %s mentionable", role.id)
+            note = " — but I could not make it mentionable (I need **Manage Roles**)"
         try:
             await asyncio.to_thread(svc.set_notify_role, gid, str(role.id))
         except Exception:
             log.exception("notify role save failed")
-            await interaction.response.send_message("⚠️ Could not save. Try again.", ephemeral=True)
+            await bot._safe_followup(interaction, "⚠️ Could not save. Try again.")
             return
-        await interaction.response.send_message(
+        await bot._safe_followup(
+            interaction,
             f"✅ {role.mention} will now be pinged on every giveaway (new, winners,"
-            " rerolls, cancellations).",
-            ephemeral=True,
+            f" rerolls, cancellations){note}.",
         )
 
     @bot.tree.command(name="giveaway_ping", description="Ping everyone who joined a giveaway")
@@ -1183,6 +1317,12 @@ def wire_commands(bot: GiveawayBot) -> None:
         if not entrants:
             await bot._safe_followup(interaction, "Nobody has joined this giveaway yet.")
             return
+        # Discord accepts up to 6000 characters on an option but only allows
+        # 2000 in a message, so a long announcement has to be cut here rather
+        # than turning into a 400 that reads like a permissions problem.
+        text = (text or "").strip()
+        if len(text) > 1400:
+            text = text[:1397] + "…"
         body = f"📢 **{gw.prize}**" + (f" — {text}" if text else "")
         role = bot._role_for(gw)
         channel = interaction.channel
@@ -1197,13 +1337,12 @@ def wire_commands(bot: GiveawayBot) -> None:
                 )
             else:
                 ids = [str(row["user_id"]) for row in entrants]
-                for i in range(0, len(ids), 80):
-                    chunk = " ".join(f"<@{uid}>" for uid in ids[i : i + 80])
+                for chunk in _mention_chunks(ids, body):
                     await channel.send(
-                        f"{body}\n{chunk}" if i == 0 else chunk,
-                        allowed_mentions=discord.AllowedMentions(users=True),
+                        chunk, allowed_mentions=discord.AllowedMentions(users=True)
                     )
-        except (discord.Forbidden, discord.HTTPException):
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            log.warning("ping failed for %s (%s)", gw.id, exc)
             await bot._safe_followup(interaction, "⚠️ I cannot send messages there.")
             return
         await bot._safe_followup(
@@ -1248,21 +1387,28 @@ def wire_commands(bot: GiveawayBot) -> None:
         if interaction.guild is None or not _can_manage(interaction.user):
             await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
             return
+        # Ack first: the write below is a database round-trip, and a slow one
+        # used to blow the 3-second window and surface as "the application did
+        # not respond" even though the unblock had happened.
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
         try:
             removed = await asyncio.to_thread(
                 svc.blacklist_remove, str(interaction.guild.id), str(user.id)
             )
         except Exception:
             log.exception("blacklist remove failed for %s", user.id)
-            await interaction.response.send_message(
-                "⚠️ Could not update the blacklist. Try again.", ephemeral=True
+            await bot._safe_followup(
+                interaction, "⚠️ Could not update the blacklist. Try again."
             )
             return
-        await interaction.response.send_message(
+        await bot._safe_followup(
+            interaction,
             f"✅ {user.mention} can join giveaways again."
             if removed
             else f"{user.mention} was not on the blacklist.",
-            ephemeral=True,
         )
 
     @bot.tree.command(name="giveaway_blacklist_list", description="Show blocked users")
@@ -1308,6 +1454,12 @@ def wire_commands(bot: GiveawayBot) -> None:
             await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
             return
         guild = interaction.guild
+        # Ack first: two database round-trips before the answer used to be able
+        # to exceed the 3-second window.
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
         try:
             rows = await asyncio.to_thread(svc.list_timeout_bans, str(guild.id))
             # A second cheap query: the listing is capped, and the embed has to
@@ -1315,13 +1467,13 @@ def wire_commands(bot: GiveawayBot) -> None:
             total = await asyncio.to_thread(svc.count_timeout_bans, str(guild.id))
         except Exception:
             log.exception("timeout ban list failed")
-            await interaction.response.send_message(
-                "⚠️ Could not load the timeout bans. Try again.", ephemeral=True
+            await bot._safe_followup(
+                interaction, "⚠️ Could not load the timeout bans. Try again."
             )
             return
         if not rows:
-            await interaction.response.send_message(
-                "No users are currently banned from giveaways.", ephemeral=True
+            await bot._safe_followup(
+                interaction, "No users are currently banned from giveaways."
             )
             return
         # Only from the member cache: a fetch per row would be one HTTP request
@@ -1347,7 +1499,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             )
 
         try:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=render(0),
                 view=ParticipantsPages(render=render, pages=pages),
                 ephemeral=True,

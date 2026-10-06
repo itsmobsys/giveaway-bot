@@ -30,6 +30,10 @@ class _Handler(BaseHTTPRequestHandler):
     # Content-Length on every response (including 404 and HEAD), cannot hang a
     # client waiting for a body that never comes.
     protocol_version = "HTTP/1.1"
+    #: A thread is spawned per connection, and keep-alive means a client that
+    #: connects and then says nothing would park that thread until the process
+    #: exits. http.server turns a socket timeout into a closed connection.
+    timeout = 10
 
     def _respond(self, status: int, body: bytes, *, head_only: bool = False) -> None:
         self.send_response(status)

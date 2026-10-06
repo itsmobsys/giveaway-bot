@@ -38,7 +38,7 @@ Needs **Server Members Intent** on (Bot tab in the Developer Portal) for role ch
   - `image`: http(s) photo URL shown on the embed — e.g. a Steam gift-card picture
 
 Message counts start accumulating the moment the bot logs in (even with no
-giveaway running), and **reset to 0 for everybody when a giveaway ends** —
+giveaway running), and **reset to 0 for everybody in that server when a giveaway ends** —
 so each giveaway measures fresh activity since the last one ended.
 
 Joining grants a mentionable **🎉 \<prize\> entrants role** (created per
@@ -57,17 +57,21 @@ it lacks the permission the giveaway still runs, just without the role.
 - `/giveaway_timeout_bans` — who is sitting out a timed-out penalty, with
   how many giveaways they have left (Manage Server)
 - `/giveaway_end giveaway_id` — suggestions appear as you type; with one live
-  giveaway any id falls back to it
+  giveaway any id falls back to it. Ending a giveaway that is already over is
+  reported back instead of announcing the winners a second time
 - `/giveaway_extend giveaway_id minutes` — add 1 minute to 60 days of time to
   a running giveaway
 - `/giveaway_reroll giveaway_id [count]` — same suggestions + fallback; works
-  on ended giveaways, drawing fresh winners that exclude previous ones
+  on ended giveaways (not cancelled ones), drawing fresh winners that exclude
+  previous ones and keeping the whole list within 25 names, which is what one
+  announcement can hold
 - `/giveaway_cancel giveaway_id` — same suggestions + fallback
 
 **Timed-out members** (Discord's native `/mute` — read with
 `Member.is_timed_out()`, never a role called "Muted"): clicking Join while
 timed out is refused, any entry they already had — and the entrants role that
-came with it — is removed, and they must sit
+came with it — is removed from **every running giveaway in that server**, and
+they must sit
 out the **next 3 giveaways**. Each giveaway they are then blocked from spends
 one, and the restriction lifts with the third. Re-clicking the same giveaway
 neither stacks a second penalty nor spends two at once, and merely being muted

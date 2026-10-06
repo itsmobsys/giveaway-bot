@@ -18,10 +18,36 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _changed(cur: Any) -> bool:
+    """True when a statement that must match a row actually matched one.
+
+    rowcount is not part of every driver's contract, and a missing count reads
+    as "did not match": for a status flip that means refusing to draw rather
+    than drawing a second time.
+    """
+    try:
+        return int(cur.rowcount or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 #: Tag carried by the refusals a caller has to treat differently from a plain
 #: "no": the member was stopped by the timed-out rule and their entry was
 #: dropped, so anything granted on joining has to go with it.
 TIMEOUT_BAN_KIND = "timeout_ban"
+
+
+@dataclass
+class PartialFlush(Exception):
+    """A batched write stopped part way, after applied rows had landed.
+
+    A batch is written in chunks that commit individually, so the rows before
+    the failure are already stored. Retrying the whole batch would add them a
+    second time; the caller hands back only the tail.
+    """
+
+    applied: int
+    error: Exception
 
 
 @dataclass
@@ -97,6 +123,10 @@ class Giveaway:
 
 
 class GiveawayService:
+    #: Hard bound on winners per giveaway. create() and reroll() both enforce it:
+    #: the winner announcement has to fit in one Discord message.
+    MAX_WINNERS = 25
+
     def __init__(self, db: Database) -> None:
         self.db = db
         self._rand = secrets.SystemRandom()
@@ -123,8 +153,8 @@ class GiveawayService:
         prize = prize.strip()
         if not prize or len(prize) > 256:
             raise ServiceError("Prize must be 1-256 characters.")
-        if winner_count < 1 or winner_count > 25:
-            raise ServiceError("Winner count must be 1-25.")
+        if winner_count < 1 or winner_count > self.MAX_WINNERS:
+            raise ServiceError(f"Winner count must be 1-{self.MAX_WINNERS}.")
         if duration_seconds < 30 or duration_seconds > 60 * 86400:
             raise ServiceError("Duration must be 30 seconds to 60 days.")
         if min_messages < 0 or min_messages > 100000:
@@ -253,6 +283,22 @@ class GiveawayService:
             return self.db.query(statement, (giveaway_id,))
         return self.db.query(statement + " LIMIT ?", (giveaway_id, max(1, int(limit))))
 
+    def has_entry(self, giveaway_id: str, user_id: str) -> bool:
+        """Whether this member is entered: one lookup, no rows loaded.
+
+        The Participants panel shows a bounded window, so "am I in it" cannot be
+        answered by scanning the rows it happens to hold.
+        """
+        if not user_id:
+            return False
+        return (
+            self.db.query_one(
+                "SELECT 1 AS one FROM simple_entries WHERE giveaway_id = ? AND user_id = ?",
+                (giveaway_id, user_id),
+            )
+            is not None
+        )
+
     # -- join / leave ---------------------------------------------------
     def check_eligible(
         self,
@@ -318,13 +364,19 @@ class GiveawayService:
     #: limit is 999 and each row takes 3, so 300 leaves plenty of headroom.
     MESSAGE_FLUSH_CHUNK = 300
 
-    def add_message_counts(self, rows: list[tuple[str, str, int]]) -> None:
-        """Apply many (guild_id, user_id, delta) counts in a few statements.
+    def add_message_counts(self, rows: list[tuple[str, str, int]]) -> int:
+        """Apply many (guild_id, user_id, delta) counts. Returns rows applied.
 
         One statement per flush instead of one per message is the entire point:
         N messages in the server cost ceil(N / MESSAGE_FLUSH_CHUNK) round-trips
         per flush interval rather than N immediate ones.
+
+        Each chunk commits on its own, so a failure part way leaves the earlier
+        chunks stored. The failure is raised as PartialFlush, which says how many
+        rows landed: the caller hands back only the tail, because restoring the
+        whole batch would write the committed head a second time.
         """
+        applied = 0
         for start in range(0, len(rows), self.MESSAGE_FLUSH_CHUNK):
             chunk = rows[start : start + self.MESSAGE_FLUSH_CHUNK]
             values = ", ".join("(?, ?, ?)" for _ in chunk)
@@ -334,11 +386,16 @@ class GiveawayService:
             # Interpolated text is the placeholder list only: every value still
             # travels as a bound parameter, so there is nothing to inject.
             statement = f"INSERT INTO simple_message_counts (guild_id, user_id, count) VALUES {values}"  # noqa: S608
-            self.db.execute(
-                statement
-                + " ON CONFLICT (guild_id, user_id) DO UPDATE SET count = count + excluded.count",
-                params,
-            )
+            try:
+                self.db.execute(
+                    statement
+                    + " ON CONFLICT (guild_id, user_id) DO UPDATE SET count = count + excluded.count",
+                    params,
+                )
+            except Exception as exc:
+                raise PartialFlush(applied, exc) from exc
+            applied += len(chunk)
+        return applied
 
     def join(
         self,
@@ -355,17 +412,19 @@ class GiveawayService:
             gw, member_roles=member_roles, account_created_ts=account_created_ts,
             user_id=user_id, pending_messages=pending_messages, timed_out=timed_out,
         )
-        # The giveaway is re-checked inside the statement itself. check_eligible
-        # above reads a row that was fetched moments earlier, so an end() landing
-        # in between would otherwise let the entry through; this makes that
-        # impossible without a second round-trip.
+        # The giveaway and the blacklist are re-checked inside the statement
+        # itself. check_eligible above reads rows fetched moments earlier, so an
+        # end() or a blacklist_add landing in between would otherwise let the
+        # entry through; this makes both impossible without a second round-trip.
         try:
             cur = self.db.execute(
                 "INSERT INTO simple_entries (giveaway_id, user_id, username, entered_at)"
                 " SELECT ?, ?, ?, ? WHERE EXISTS ("
                 "   SELECT 1 FROM simple_giveaways WHERE id = ? AND status = 'active'"
+                " ) AND NOT EXISTS ("
+                "   SELECT 1 FROM simple_blacklist WHERE guild_id = ? AND user_id = ?"
                 " )",
-                (gw.id, user_id, username[:64], now_ms(), gw.id),
+                (gw.id, user_id, username[:64], now_ms(), gw.id, gw.guild_id, user_id),
             )
         except Exception as exc:
             msg = str(exc).upper()
@@ -377,6 +436,9 @@ class GiveawayService:
         except (TypeError, ValueError):
             inserted = 1
         if inserted == 0:
+            # The guard can refuse for two reasons now, so say which one bit.
+            if self.is_blacklisted(gw.guild_id, user_id):
+                raise ServiceError("🚫 You are blocked from giveaways in this server.")
             raise ServiceError("This giveaway has ended.")
         return self.entry_count(gw.id)
 
@@ -404,28 +466,61 @@ class GiveawayService:
         return self._rand.sample(pool, min(n, len(pool)))
 
     def end(self, giveaway_id: str) -> tuple[Giveaway, list[str]]:
+        """End a running giveaway and draw its winners.
+
+        The status flip is the gate, and it happens before the draw with
+        "status = 'active'" in the WHERE clause: the auto-draw tick and
+        /giveaway_end can fire in the same second, and without a claim both would
+        sample their own winners and announce different names. Whoever loses the
+        claim is told the giveaway is already over, like cancel().
+        """
         gw = self.get(giveaway_id)
         if not gw.active:
-            return gw, list(gw.winners)
+            raise ServiceError("This giveaway has already ended.")
+        cur = self.db.execute(
+            "UPDATE simple_giveaways SET status = 'ended', ended_at = ?"
+            " WHERE id = ? AND status = 'active'",
+            (now_ms(), gw.id),
+        )
+        if not _changed(cur):
+            raise ServiceError("This giveaway has already ended.")
         winners = self._pick(gw.id, gw.winner_count)
         self.db.execute(
-            "UPDATE simple_giveaways SET status = 'ended', ended_at = ?, winners_json = ? WHERE id = ?",
-            (now_ms(), json.dumps(winners), gw.id),
+            "UPDATE simple_giveaways SET winners_json = ? WHERE id = ?",
+            (json.dumps(winners), gw.id),
         )
-        # Fresh grind for the next giveaway: everybody's message count goes
-        # back to zero, so the next min-messages requirement measures activity
-        # *after* this giveaway, not lifetime activity.
-        self.db.execute("DELETE FROM simple_message_counts")
+        # Fresh grind for the next giveaway *in this server*: message counts go
+        # back to zero here, so the next min-messages requirement measures
+        # activity after this giveaway rather than lifetime activity. Scoped by
+        # guild — wiping the whole table would silently zero every other
+        # server's counts and disable their min-messages requirement.
+        self.db.execute(
+            "DELETE FROM simple_message_counts WHERE guild_id = ?", (gw.guild_id,)
+        )
         return self.get(gw.id), winners
 
     def reroll(self, giveaway_id: str, count: int = 1) -> tuple[Giveaway, list[str]]:
         gw = self.get(giveaway_id)
         if gw.active:
             raise ServiceError("End the giveaway before rerolling.")
+        if gw.status != "ended":
+            # A cancelled giveaway keeps its entries, so without this a reroll
+            # would hand out prizes for a giveaway the server called off.
+            raise ServiceError("A cancelled giveaway cannot be rerolled.")
+        # The whole list has to stay inside MAX_WINNERS. create() bounds the first
+        # draw, but a reroll only ever adds, so repeated rerolls used to grow the
+        # announcement past what Discord will accept — and the post then failed.
         prev = list(gw.winners)
-        fresh = self._pick(gw.id, count or gw.winner_count, exclude=prev)
+        room = self.MAX_WINNERS - len(prev)
+        if room < 1:
+            raise ServiceError(
+                f"This giveaway already names {len(prev)} winners, the most one"
+                " announcement can hold."
+            )
+        wanted = max(1, min(int(count or gw.winner_count), room))
+        fresh = self._pick(gw.id, wanted, exclude=prev)
         if not fresh:  # not enough fresh entrants left; draw from everyone
-            fresh = self._pick(gw.id, count or gw.winner_count)
+            fresh = self._pick(gw.id, wanted)
         combined = prev + [w for w in fresh if w not in prev]
         self.db.execute(
             "UPDATE simple_giveaways SET winners_json = ? WHERE id = ?", (json.dumps(combined), gw.id)
@@ -499,9 +594,12 @@ class GiveawayService:
         """Delete entry rows for giveaways finished over 5h ago. Returns count."""
         cutoff = (now if now is not None else now_ms()) - self.ENTRY_RETENTION_MS
         cur = self.db.execute(
+            # ended_at was added to a table that already held data, so giveaways
+            # that finished before that migration carry NULL forever; created_at
+            # is the fallback that still lets their entry rows expire.
             "DELETE FROM simple_entries WHERE giveaway_id IN"
             " (SELECT id FROM simple_giveaways WHERE status != 'active'"
-            " AND ended_at IS NOT NULL AND ended_at <= ?)",
+            " AND COALESCE(ended_at, created_at) <= ?)",
             (cutoff,),
         )
         try:
@@ -700,11 +798,15 @@ class GiveawayService:
         left = self.timeout_ban_remaining(gw.guild_id, user_id)
         if left <= 0 and not timed_out:
             return
-        # Blocked, so they must not be in this giveaway at all: an entry made
-        # before Discord timed them out (or before the penalty started) goes.
+        # Blocked, so they must not be in a giveaway at all: entries made before
+        # Discord timed them out (or before the penalty started) are dropped from
+        # every running giveaway in the server, exactly as blacklist_add does.
+        # Dropping only the one they clicked would let them win the giveaway
+        # they joined yesterday while sitting out this one.
         self.db.execute(
-            "DELETE FROM simple_entries WHERE giveaway_id = ? AND user_id = ?",
-            (gw.id, user_id),
+            "DELETE FROM simple_entries WHERE user_id = ? AND giveaway_id IN"
+            " (SELECT id FROM simple_giveaways WHERE guild_id = ? AND status = 'active')",
+            (user_id, gw.guild_id),
         )
         if left > 0:
             left = self.consume_timeout_ban(gw.guild_id, user_id, gw.id)

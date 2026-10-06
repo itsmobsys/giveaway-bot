@@ -1,3 +1,3 @@
-"""Simple standalone Discord giveaway bot (no dashboard)."""
+"""Standalone Discord giveaway bot: slash commands, buttons, optional dashboard link."""
 
 __version__ = "2.0.0"

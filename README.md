@@ -25,9 +25,9 @@ Simple standalone Discord giveaway bot. MIT licensed.
   refused, their entry is removed, and they sit out the next 3 giveaways.
   `/giveaway_timeout_bans` lists who is currently sitting out
 - Per-giveaway mentionable entrants role, granted on join, stripped on end
-- Message counts reset for everyone when a giveaway ends. They are kept in
-  memory and written in one batched statement every 10s, so a busy server does
-  not pay a database round-trip per message
+- Message counts reset for everyone **in that server** when a giveaway ends.
+  They are kept in memory and written in one batched statement every 10s, so a
+  busy server does not pay a database round-trip per message
 - Turso-only storage, so restarts never lose data
 - Built-in `/health` server, so it runs on Render's free Web Service tier
 
@@ -115,7 +115,7 @@ schema, constraints and upserts are exercised without a Turso account.
 | `TURSO_AUTH_TOKEN` | yes | Turso auth token |
 | `DISCORD_GIVEAWAY_CHANNEL_ID` | no | Force all giveaways into one channel |
 | `TICK_SECONDS` | no | Embed refresh + due checks (default 30) |
-| `EMBED_COLOR` | no | e.g. `0x7C5CFF` |
+| `EMBED_COLOR` | no | e.g. `0x7C5CFF`, `#7C5CFF` or `7C5CFF`; masked to 24 bits |
 | `DASHBOARD_URL` | no | Blue "Dashboard" link button on every giveaway message (empty = no button) |
 | `PORT` | no | Health server port (Render sets it; default 10000) |
 

@@ -19,6 +19,25 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _color(name: str, default: int) -> int:
+    """A colour setting as a 24-bit int, in any spelling people actually write.
+
+    Accepts 0x7C5CFF (the documented form), #7C5CFF, 7C5CFF and plain decimal.
+    Discord's colour field is 24 bits wide, so anything wider — an 8-digit ARGB
+    value pasted in — is masked down instead of being sent for the API to
+    reject. Anything unparseable keeps the default, as _int does.
+    """
+    raw = (os.getenv(name, "") or "").strip().lstrip("#")
+    if not raw:
+        return default
+    for base in (0, 16):
+        try:
+            return int(raw, base) & 0xFFFFFF
+        except ValueError:
+            continue
+    return default
+
+
 @dataclass
 class Settings:
     bot_token: str = field(default_factory=lambda: os.getenv("DISCORD_BOT_TOKEN", "").strip())
@@ -48,15 +67,8 @@ class Settings:
 
 
 def get_settings() -> Settings:
-    raw = (os.getenv("EMBED_COLOR", "") or "").strip().lstrip("#")
-    color = 0x7C5CFF
-    if raw:
-        try:
-            color = int(raw, 0)
-        except ValueError:
-            pass
     settings = Settings()
-    settings.embed_color = color
+    settings.embed_color = _color("EMBED_COLOR", settings.embed_color)
     if settings.tick_seconds < 5:
         settings.tick_seconds = 5
     return settings

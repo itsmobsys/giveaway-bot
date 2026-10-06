@@ -19,17 +19,24 @@ from .config import Settings, get_settings
 
 log = logging.getLogger("giveaway_bot.db")
 
-#: Substrings meaning the Turso Hrana stream behind this connection is gone
-#: (server-side idle timeout, restart, network blip). The driver raises a bare
-#: ValueError with no exception hierarchy, so the message text is the signal.
-#: A dead stream means the statement never reached the server, so dropping the
-#: connection and replaying the statement once cannot double-apply anything.
-_DEAD_STREAM_MARKERS = (
+#: Substrings meaning the stream is gone and the statement never ran: the server
+#: rejected a stream it no longer knows (idle timeout, restart), or the client
+#: never had a usable connection to send on. The driver raises a bare ValueError
+#: with no exception hierarchy, so the message text is the only signal. Nothing
+#: was applied, so replaying either a read or a write is safe.
+_UNAPPLIED_MARKERS = (
     "stream not found",
     "stream was idle for too long",
     "no transaction is active",
     "connection closed",
     "not connected",
+)
+
+#: Substrings meaning the socket died *mid-request*: the server may already have
+#: applied the statement before the response was lost. A read can be replayed; a
+#: write must not be, because replaying "count = count + 1" or
+#: "ends_at = ends_at + ?" would apply it a second time.
+_AMBIGUOUS_MARKERS = (
     "broken pipe",
     "connection reset",
     "connection aborted",
@@ -39,7 +46,13 @@ _DEAD_STREAM_MARKERS = (
 
 
 def _is_dead_stream(message: str) -> bool:
-    return any(marker in message for marker in _DEAD_STREAM_MARKERS)
+    """True when the statement provably never reached the server."""
+    return any(marker in message for marker in _UNAPPLIED_MARKERS)
+
+
+def _is_ambiguous_loss(message: str) -> bool:
+    """True when the connection dropped and the statement's fate is unknown."""
+    return any(marker in message for marker in _AMBIGUOUS_MARKERS)
 
 
 def _is_write(sql: str) -> bool:
@@ -249,7 +262,12 @@ class Database:
         try:
             rows = self.query(f"PRAGMA table_info({table})")
         except Exception:
-            return
+            # The columns could not be read, so one may be missing. Failing here
+            # beats running the whole process against an unmigrated table, where
+            # every statement naming the column dies with "no such column"
+            # instead of the problem showing up once, at startup.
+            log.exception("could not read the columns of %s", table)
+            raise
         existing = {str(r.get("name")) for r in rows}
         for name, ddl in desired.items():
             if name not in existing:
@@ -258,10 +276,14 @@ class Database:
     def execute(self, sql: str, params: Sequence[Any] = ()) -> Any:
         """Run one statement, surviving dead Turso streams and brief contention.
 
-        * Dead/idle Hrana stream: the connection is dropped and the statement
-          is replayed on a fresh connection, on *every* hit up to the attempt
-          cap (streams can flap repeatedly during a Turso wobble). Safe
-          because a dead stream never applied anything.
+        * Stream the server never saw: the connection is dropped and the
+          statement is replayed on a fresh one, on *every* hit up to the attempt
+          cap (streams can flap repeatedly during a Turso wobble). Safe,
+          because nothing ran.
+        * Connection lost mid-request: a read is replayed, a write is not. The
+          server may have applied the write before the response was lost, and a
+          blind replay would apply it twice. The error goes to the caller, which
+          can retry the whole operation deliberately.
         * `locked`/`busy`/`conflict`: genuine writer contention, retried with a
           short backoff. Anything else raises untouched.
         """
@@ -275,11 +297,17 @@ class Database:
                 return cur
             except Exception as exc:
                 message = str(exc).lower()
-                if _is_dead_stream(message):
+                ambiguous = _is_ambiguous_loss(message)
+                if ambiguous or _is_dead_stream(message):
+                    self.close()
+                    if ambiguous and _is_write(sql):
+                        log.warning(
+                            "connection lost mid-write (%s); not replaying", _brief(exc)
+                        )
+                        raise
                     log.warning(
                         "database stream went away (%s); reconnecting", _brief(exc)
                     )
-                    self.close()
                     last_error = exc
                     time.sleep(0.15 * (attempt + 1))
                     continue
@@ -301,7 +329,11 @@ class Database:
                 rows = cur.fetchall()
                 break
             except Exception as exc:
-                if _is_dead_stream(str(exc).lower()):
+                message = str(exc).lower()
+                # Every statement query() runs is a read, so replaying is safe
+                # whether the server never saw it or the rows were lost on the
+                # way back. A write could not be replayed here.
+                if _is_dead_stream(message) or _is_ambiguous_loss(message):
                     log.warning(
                         "database stream died mid-read (%s); retrying", _brief(exc)
                     )
@@ -358,14 +390,3 @@ class Database:
         for conn in connections:
             with contextlib.suppress(Exception):
                 conn.close()
-
-
-_database: Database | None = None
-
-
-def get_database() -> Database:
-    global _database
-    if _database is None:
-        _database = Database()
-        _database.init_schema()
-    return _database

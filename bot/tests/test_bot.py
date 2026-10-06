@@ -21,7 +21,7 @@ from giveaway_bot import views
 from giveaway_bot.bot import GiveawayBot, build_intents, wire_commands
 from giveaway_bot.config import Settings
 from giveaway_bot.db import Database
-from giveaway_bot.service import GiveawayService
+from giveaway_bot.service import GiveawayService, PartialFlush
 
 
 def fake_message(guild_id: str, user_id: str, *, bot: bool = False):
@@ -49,6 +49,9 @@ class BotTestCase(unittest.TestCase):
         self.bot.register_components()
 
     def tearDown(self) -> None:
+        # views._HANDLERS is module-global: leaving this bot bound there would
+        # let a later test dispatch a click into a torn-down database.
+        views._HANDLERS.clear()
         self.db.close_all()
         self.keeper.close()
 
@@ -93,7 +96,16 @@ class WiringTests(BotTestCase):
         self.assertEqual(names, list(self.EXPECTED))
 
     def test_an_error_handler_is_installed(self) -> None:
-        self.assertTrue(callable(self.bot.tree.on_error))
+        # CommandTree already defines on_error, so callable() proves nothing:
+        # @tree.error is what writes the handler into the instance.
+        self.assertIn("on_error", self.bot.tree.__dict__)
+
+    def test_the_error_handler_answers_without_leaking_the_error(self) -> None:
+        handler = self.bot.tree.__dict__["on_error"]
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        with self.assertLogs("giveaway_bot", level="ERROR"):
+            asyncio.run(handler(interaction, RuntimeError("boom")))
+        self.assertEqual(interaction.texts, ["⚠️ /? failed. Please try again."])
 
     def test_click_handlers_are_wired_to_the_bot(self) -> None:
         """A click is matched by custom_id pattern, not by a per-giveaway view."""
@@ -146,6 +158,28 @@ class CommandWiringTests(BotTestCase):
         asyncio.run(self.bot._flush_message_buffer())
         self.assertEqual(self.svc.message_count(self.guild, "3" * 18), 1)
 
+    def test_a_partial_flush_hands_back_only_what_did_not_land(self) -> None:
+        for _ in range(3):
+            asyncio.run(self.bot.on_message(fake_message(self.guild, "3" * 18)))
+        asyncio.run(self.bot.on_message(fake_message(self.guild, "4" * 18)))
+        original = self.bot.service.add_message_counts
+
+        def half_written(rows):
+            # One of the two buffered users made it; the other did not.
+            raise PartialFlush(applied=1, error=OSError("turso down"))
+
+        self.bot.service.add_message_counts = half_written
+        with self.assertRaises(PartialFlush):
+            asyncio.run(self.bot._flush_message_buffer())
+        self.bot.service.add_message_counts = original
+        self.assertEqual(
+            self.bot._message_buffer,
+            {(self.guild, "4" * 18): 1},
+            "only the tail goes back: the committed head must not be counted twice",
+        )
+        asyncio.run(self.bot._flush_message_buffer())
+        self.assertEqual(self.svc.message_count(self.guild, "4" * 18), 1)
+
     def test_buffer_overflow_flushes_early(self) -> None:
         self.bot.MESSAGE_BUFFER_MAX = 2
         asyncio.run(self.bot.on_message(fake_message(self.guild, "1" * 18)))
@@ -174,19 +208,21 @@ class AutocompleteCacheTests(BotTestCase):
 
 class RoleTaskTests(BotTestCase):
     def test_scheduled_deletes_are_kept_alive_and_deduplicated(self) -> None:
-        async def scenario() -> tuple[int, int]:
+        async def scenario() -> tuple[int, int, int]:
             self.bot._schedule_role_delete(self.guild, "123", "gw_a", delay=60)
             self.bot._schedule_role_delete(self.guild, "123", "gw_a", delay=60)
             self.bot._schedule_role_delete(self.guild, "123", "gw_b", delay=60)
             held = len(self.bot._role_tasks)
+            queued = len(self.bot._scheduled_role_deletes)
             for task in list(self.bot._role_tasks):
                 task.cancel()
             await asyncio.gather(*list(self.bot._role_tasks), return_exceptions=True)
-            return held, len(self.bot._scheduled_role_deletes)
+            return held, queued, len(self.bot._scheduled_role_deletes)
 
-        held, in_flight = asyncio.run(scenario())
+        held, queued, left = asyncio.run(scenario())
         self.assertEqual(held, 2, "one task per giveaway, the duplicate is dropped")
-        self.assertEqual(in_flight, 2)
+        self.assertEqual(queued, 2, "both giveaways are marked as scheduled")
+        self.assertEqual(left, 0, "and released again once the tasks finish")
 
     def test_incomplete_targets_are_ignored(self) -> None:
         async def scenario() -> int:
@@ -265,12 +301,25 @@ class FakeInteraction:
     def __init__(self, *, guild: FakeGuild, user: object) -> None:
         self.guild = guild
         self.user = user
+        # Real interactions carry the command that produced them (or None) and
+        # the guild id, and the error handler reads both for its log line.
+        self.command = None
+        self.guild_id = guild.id
         self.response = FakeResponse()
         self.followup = FakeFollowup()
 
     @property
+    def replies(self) -> list[dict]:
+        """Everything sent, whichever channel the command used to answer.
+
+        Commands that defer answer through the followup, so the tests read this
+        instead of assuming which one holds the reply.
+        """
+        return self.response.sent + self.followup.sent
+
+    @property
     def texts(self) -> list[str]:
-        return [m["content"] for m in self.response.sent + self.followup.sent]
+        return [m["content"] for m in self.replies]
 
 
 def fake_user(*, manage_guild: bool = False, administrator: bool = False):
@@ -410,7 +459,7 @@ class BlacklistListTests(BotTestCase):
             guild=FakeGuild(self.guild), user=fake_user(manage_guild=True)
         )
         self.run_command(interaction)
-        content = interaction.response.sent[0]["content"]
+        content = interaction.replies[0]["content"]
         self.assertLessEqual(len(content), 2000, "Discord rejects anything longer")
         self.assertIn("Blocked (90)", content)
         self.assertIn("…plus 10 more.", content)
@@ -439,7 +488,7 @@ class TimeoutBanCommandTests(BotTestCase):
             user=fake_user(manage_guild=True),
         )
         self.run_command(interaction)
-        sent = interaction.response.sent[0]
+        sent = interaction.replies[0]
         self.assertTrue(sent["ephemeral"])
         self.assertIsInstance(sent["view"], views.ParticipantsPages)
         desc = sent["embed"].description
@@ -459,7 +508,7 @@ class TimeoutBanCommandTests(BotTestCase):
         self.banned("4" * 18)
         interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user(administrator=True))
         self.run_command(interaction)
-        desc = interaction.response.sent[0]["embed"].description
+        desc = interaction.replies[0]["embed"].description
         self.assertNotIn("3" * 18, desc)
         self.assertIn("4" * 18, desc)
 
@@ -469,14 +518,14 @@ class TimeoutBanCommandTests(BotTestCase):
         )
         self.run_command(interaction)
         self.assertEqual(interaction.texts, ["No users are currently banned from giveaways."])
-        self.assertNotIn("embed", interaction.response.sent[0])
+        self.assertNotIn("embed", interaction.replies[0])
 
     def test_unauthorised_members_are_denied(self) -> None:
         self.banned("1" * 18)
         interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
         self.run_command(interaction)
         self.assertEqual(interaction.texts, ["You need **Manage Server**."])
-        self.assertNotIn("embed", interaction.response.sent[0])
+        self.assertNotIn("embed", interaction.replies[0])
         self.assertNotIn("1" * 18, str(interaction.texts), "no data for non-moderators")
 
     def test_a_database_blip_is_reported_not_raised(self) -> None:
@@ -500,7 +549,7 @@ class TimeoutBanCommandTests(BotTestCase):
             user=fake_user(manage_guild=True),
         )
         self.run_command(interaction)
-        desc = interaction.response.sent[0]["embed"].description
+        desc = interaction.replies[0]["embed"].description
         self.assertIn("`" + gone + "` (left the server)", desc)
         self.assertNotIn(f"<@{gone}>", desc)
 
@@ -511,7 +560,7 @@ class TimeoutBanCommandTests(BotTestCase):
             user=fake_user(manage_guild=True),
         )
         self.run_command(interaction)
-        self.assertIn("not-a-snowflake", interaction.response.sent[0]["embed"].description)
+        self.assertIn("not-a-snowflake", interaction.replies[0]["embed"].description)
 
     def test_a_capped_list_admits_how_many_it_hid(self) -> None:
         for index in range(5):
@@ -525,7 +574,7 @@ class TimeoutBanCommandTests(BotTestCase):
             guild=FakeGuild(self.guild), user=fake_user(manage_guild=True)
         )
         self.run_command(interaction)
-        desc = interaction.response.sent[0]["embed"].description
+        desc = interaction.replies[0]["embed"].description
         self.assertIn("Total: **5**", desc)
         self.assertIn("2 more not shown.", desc)
 
@@ -534,10 +583,123 @@ class TimeoutBanCommandTests(BotTestCase):
             self.banned(f"{index + 1:0>18}", remaining=3 - index % 3)
         interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user(manage_guild=True))
         self.run_command(interaction)
-        sent = interaction.response.sent[0]
+        sent = interaction.replies[0]
         self.assertIn("page 1/2", sent["embed"].title)
         self.assertIn("Total: **11**", sent["embed"].description)
         self.assertIsInstance(sent["view"], views.ParticipantsPages)
+
+
+class RoleCleanupTests(BotTestCase):
+    """The delayed entrants-role delete, actually driven instead of scheduled."""
+
+    @staticmethod
+    async def run_pending(bot) -> None:
+        await asyncio.gather(*list(bot._role_tasks), return_exceptions=True)
+
+    def test_the_task_deletes_the_role_and_clears_the_row(self) -> None:
+        deleted: list[str] = []
+        cleared: list[str] = []
+
+        class FakeRole:
+            async def delete(self, *, reason=None) -> None:
+                deleted.append(reason or "")
+
+        class FakeGuild:
+            def get_role(self, role_id):
+                return FakeRole() if role_id == 123 else None
+
+        self.bot.get_guild = lambda guild_id: FakeGuild()
+        self.bot.service.set_entrants_role = lambda gid, rid: cleared.append(str(rid))
+
+        async def scenario() -> None:
+            self.bot._schedule_role_delete(self.guild, "123", "gw_a", delay=0)
+            await self.run_pending(self.bot)
+
+        asyncio.run(scenario())
+        self.assertEqual(len(deleted), 1, "the role is deleted after the delay")
+        self.assertEqual(cleared, ["None"], "the row is cleared so the sweep stops")
+        self.assertEqual(self.bot._scheduled_role_deletes, set())
+
+    def test_an_unreachable_guild_still_clears_the_row(self) -> None:
+        cleared: list[str] = []
+        self.bot.get_guild = lambda guild_id: None
+        self.bot.service.set_entrants_role = lambda gid, rid: cleared.append(str(rid))
+
+        async def scenario() -> None:
+            self.bot._schedule_role_delete(self.guild, "123", "gw_b", delay=0)
+            await self.run_pending(self.bot)
+
+        asyncio.run(scenario())
+        # Otherwise the restart sweep re-queues this giveaway on every boot, for
+        # a role it can never reach.
+        self.assertEqual(cleared, ["None"])
+        self.assertEqual(self.bot._scheduled_role_deletes, set())
+
+
+class LeaveTests(BotTestCase):
+    """The Leave button: the entry goes, and a database blip is reported."""
+
+    def press_leave(self, giveaway_id: str, member: FakeMember) -> FakeInteraction:
+        interaction = FakeInteraction(guild=FakeGuild(self.guild, [member]), user=member)
+        asyncio.run(self.bot.handle_leave(interaction, giveaway_id))
+        return interaction
+
+    def join(self, gw, user_id: str) -> int:
+        return self.svc.join(
+            gw,
+            user_id=user_id,
+            username="member",
+            member_roles=[],
+            account_created_ts=time.time() - 400 * 86400,
+        )
+
+    def test_leave_removes_the_entry(self) -> None:
+        gw = self.make()
+        member = FakeMember(888888888888888888)
+        self.join(gw, str(member.id))
+        interaction = self.press_leave(gw.id, member)
+        self.assertEqual(self.svc.entry_count(gw.id), 0)
+        self.assertIn("You left the giveaway.", interaction.texts)
+
+    def test_a_failing_leave_is_reported_not_raised(self) -> None:
+        gw = self.make()
+        member = FakeMember(999999999999999999)
+        interaction = FakeInteraction(guild=FakeGuild(self.guild, [member]), user=member)
+
+        def boom(*args, **kwargs):
+            raise OSError("turso down")
+
+        self.bot.service.leave = boom
+        asyncio.run(self.bot.handle_leave(interaction, gw.id))
+        # This used to escape the button callback: a bare "interaction failed"
+        # with nothing tying the error to the giveaway.
+        self.assertIn("Could not update your entry", interaction.texts[0])
+
+
+class ParticipantsPanelTests(BotTestCase):
+    def test_the_page_is_bounded_and_finds_me_by_lookup(self) -> None:
+        gw = self.make()
+        member = FakeMember(222222222222222222)
+        for index in range(60):
+            self.svc.join(
+                gw,
+                user_id=f"{index + 1:0>18}",
+                username="member",
+                member_roles=[],
+                account_created_ts=time.time() - 400 * 86400,
+            )
+        self.svc.join(
+            gw,
+            user_id=str(member.id),
+            username="me",
+            member_roles=[],
+            account_created_ts=time.time() - 400 * 86400,
+        )
+        interaction = FakeInteraction(guild=FakeGuild(self.guild, [member]), user=member)
+        asyncio.run(self.bot.handle_participants(interaction, gw.id))
+        embed = interaction.followup.sent[-1]["embed"]
+        self.assertIn("Total Participants: 61", embed.description)
+        self.assertIn("Your Entries: 1", embed.description, "answered by a lookup")
 
 
 if __name__ == "__main__":
