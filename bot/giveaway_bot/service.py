@@ -18,9 +18,17 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+#: Tag carried by the refusals a caller has to treat differently from a plain
+#: "no": the member was stopped by the timed-out rule and their entry was
+#: dropped, so anything granted on joining has to go with it.
+TIMEOUT_BAN_KIND = "timeout_ban"
+
+
 @dataclass
 class ServiceError(Exception):
     message: str
+    #: Optional machine-readable tag. Empty for an ordinary refusal.
+    kind: str = ""
 
 
 @dataclass
@@ -230,12 +238,20 @@ class GiveawayService:
         )
         return int(row["n"]) if row else 0
 
-    def entries(self, giveaway_id: str) -> list[dict]:
-        return self.db.query(
+    def entries(self, giveaway_id: str, limit: int | None = None) -> list[dict]:
+        """Entrants in entry order. Pass limit for a display path.
+
+        The draw needs the whole pool, but a listing shows the first page only:
+        a giveaway with tens of thousands of entries should not ship all of them
+        over the wire (and allocate them) to print fifty mentions.
+        """
+        statement = (
             "SELECT user_id, username, entered_at FROM simple_entries"
-            " WHERE giveaway_id = ? ORDER BY entered_at ASC",
-            (giveaway_id,),
+            " WHERE giveaway_id = ? ORDER BY entered_at ASC"
         )
+        if limit is None:
+            return self.db.query(statement, (giveaway_id,))
+        return self.db.query(statement + " LIMIT ?", (giveaway_id, max(1, int(limit))))
 
     # -- join / leave ---------------------------------------------------
     def check_eligible(
@@ -527,6 +543,17 @@ class GiveawayService:
         except Exception:
             return True
 
+    def count_blacklisted(self, guild_id: str) -> int:
+        """How many members of this guild are blocked from giveaways.
+
+        The listing is capped, so this is what keeps a caller from reporting the
+        size of the page set as if it were the whole blacklist.
+        """
+        row = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM simple_blacklist WHERE guild_id = ?", (guild_id,)
+        )
+        return int(row["n"]) if row and row.get("n") is not None else 0
+
     def blacklist_list(self, guild_id: str, limit: int = 100) -> list[str]:
         rows = self.db.query(
             "SELECT user_id FROM simple_blacklist WHERE guild_id = ?"
@@ -684,16 +711,19 @@ class GiveawayService:
             if left > 0:
                 raise ServiceError(
                     "You are sitting out a penalty for joining while timed out."
-                    f" {left} giveaway(s) left."
+                    f" {left} giveaway(s) left.",
+                    kind=TIMEOUT_BAN_KIND,
                 )
             raise ServiceError(
                 "That was the last giveaway of your timed-out penalty —"
-                " you can enter the next one."
+                " you can enter the next one.",
+                kind=TIMEOUT_BAN_KIND,
             )
         left = self.apply_timeout_penalty(gw.guild_id, user_id, giveaway_id=gw.id)
         raise ServiceError(
             "You are currently timed out in this server, so you cannot enter giveaways."
-            f" Timeout penalty: sit out the next {left} giveaway(s)."
+            f" Timeout penalty: sit out the next {left} giveaway(s).",
+            kind=TIMEOUT_BAN_KIND,
         )
 
     def due(self, now: int | None = None) -> list[Giveaway]:

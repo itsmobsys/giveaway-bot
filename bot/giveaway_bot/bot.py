@@ -13,7 +13,7 @@ from discord.ext import commands, tasks
 from . import embeds
 from .config import Settings
 from .db import Database
-from .service import Giveaway, GiveawayService, ServiceError
+from .service import TIMEOUT_BAN_KIND, Giveaway, GiveawayService, ServiceError
 from .views import GiveawayView, ParticipantsPages
 
 log = logging.getLogger("giveaway_bot")
@@ -525,6 +525,11 @@ class GiveawayBot(commands.Bot):
             )
         except ServiceError as exc:
             await self._safe_followup(interaction, f"⚠️ {exc.message}")
+            if exc.kind == TIMEOUT_BAN_KIND:
+                # The gate dropped the entry they already had, so the entrants
+                # role it earned has to go too — otherwise a blocked member
+                # keeps the ping-everyone role until the giveaway ends.
+                await self._take_entrants_role(gw, uid)
             return
         except Exception:
             log.exception("join failed for %s", giveaway_id)
@@ -1069,24 +1074,27 @@ def wire_commands(bot: GiveawayBot) -> None:
             except ServiceError as exc:
                 await bot._safe_followup(interaction, f"⚠️ {exc.message}")
                 return
-            entrants = await asyncio.to_thread(svc.entries, gw.id)
+            # Count and page separately: the total is what the header needs, and
+            # only 50 of them are ever printed.
+            total = await asyncio.to_thread(svc.entry_count, gw.id)
+            entrants = await asyncio.to_thread(svc.entries, gw.id, 50)
             host = f" by <@{gw.host_id}>" if gw.host_id else ""
-            chance = min(100.0, gw.winner_count / len(entrants) * 100) if entrants else 0.0
+            chance = min(100.0, gw.winner_count / total * 100) if total else 0.0
             odds = (
                 f"\n📊 Each entrant has a **{chance:.1f}%** chance"
-                f" ({gw.winner_count} winner(s) / {len(entrants)} entries)."
+                f" ({gw.winner_count} winner(s) / {total} entries)."
             )
             if not entrants:
                 await bot._safe_followup(
                     interaction, f"🏆 **{gw.prize}**{host} — no entrants yet."
                 )
                 return
-            shown = [f"<@{row['user_id']}>" for row in entrants[:50]]
-            extra = f"\n…and {len(entrants) - 50} more." if len(entrants) > 50 else ""
+            shown = [f"<@{row['user_id']}>" for row in entrants]
+            extra = f"\n…and {total - len(entrants)} more." if total > len(entrants) else ""
             status = "running 🟢" if gw.active else gw.status
             await bot._safe_followup(
                 interaction,
-                f"🏆 **{gw.prize}**{host} — **{len(entrants)}** entrant(s) ({status})"
+                f"🏆 **{gw.prize}**{host} — **{total}** entrant(s) ({status})"
                 + odds + ":\n"
                 + ", ".join(shown)
                 + extra,
@@ -1266,6 +1274,9 @@ def wire_commands(bot: GiveawayBot) -> None:
             ids = await asyncio.to_thread(
                 svc.blacklist_list, str(interaction.guild.id)
             )
+            total = await asyncio.to_thread(
+                svc.count_blacklisted, str(interaction.guild.id)
+            )
         except Exception:
             log.exception("blacklist list failed")
             await interaction.response.send_message(
@@ -1277,10 +1288,14 @@ def wire_commands(bot: GiveawayBot) -> None:
                 "Blacklist is empty — nobody is blocked.", ephemeral=True
             )
             return
-        lines = "\n".join(f"<@{uid}>" for uid in ids[:100])
-        extra = f"\n…plus {len(ids) - 100} more." if len(ids) > 100 else ""
+        # A mention is 21 characters and Discord rejects a message over 2000,
+        # so the body stops at 80 — the same chunk size /giveaway_ping uses —
+        # while the header keeps the real count instead of the shown one.
+        shown = ids[:80]
+        lines = "\n".join(f"<@{uid}>" for uid in shown)
+        extra = f"\n…plus {total - len(shown)} more." if total > len(shown) else ""
         await interaction.response.send_message(
-            f"🚫 **Blocked ({len(ids)}):**\n{lines}{extra}", ephemeral=True
+            f"🚫 **Blocked ({total}):**\n{lines}{extra}", ephemeral=True
         )
 
     @bot.tree.command(

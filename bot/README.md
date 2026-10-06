@@ -66,7 +66,8 @@ it lacks the permission the giveaway still runs, just without the role.
 
 **Timed-out members** (Discord's native `/mute` — read with
 `Member.is_timed_out()`, never a role called "Muted"): clicking Join while
-timed out is refused, any entry they already had is removed, and they must sit
+timed out is refused, any entry they already had — and the entrants role that
+came with it — is removed, and they must sit
 out the **next 3 giveaways**. Each giveaway they are then blocked from spends
 one, and the restriction lifts with the third. Re-clicking the same giveaway
 neither stacks a second penalty nor spends two at once, and merely being muted

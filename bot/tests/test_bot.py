@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import time
 import unittest
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -324,6 +325,32 @@ class JoinTimeoutTests(BotTestCase):
         self.assertEqual(self.svc.timeout_ban_remaining(self.guild, str(member.id)), 0)
         self.assertTrue(any("You're in!" in text for text in interaction.texts))
 
+    def test_a_dropped_entry_also_loses_the_entrants_role(self) -> None:
+        gw = self.make()
+        member = FakeMember(666666666666666666, timed_out=True)
+        calls: list[tuple[str, str]] = []
+
+        async def fake_take(giveaway, user_id: str) -> None:
+            calls.append((giveaway.id, user_id))
+
+        self.bot._take_entrants_role = fake_take
+        self.press_join(gw.id, member)
+        self.assertEqual(calls, [(gw.id, str(member.id))], "the entry went, the role goes")
+
+    def test_an_ordinary_refusal_leaves_roles_alone(self) -> None:
+        gw = self.make()
+        member = FakeMember(777777777777777777)
+        self.press_join(gw.id, member)  # enters normally first
+        calls: list[tuple[str, str]] = []
+
+        async def fake_take(giveaway, user_id: str) -> None:
+            calls.append((giveaway.id, user_id))
+
+        self.bot._take_entrants_role = fake_take
+        interaction = self.press_join(gw.id, member)
+        self.assertTrue(any("already entered" in text for text in interaction.texts))
+        self.assertEqual(calls, [], "a plain refusal must not strip anything")
+
     def test_a_penalised_member_is_refused_by_the_button(self) -> None:
         first = self.make(prize="trigger")
         member = FakeMember(555555555555555555, timed_out=True)
@@ -334,6 +361,60 @@ class JoinTimeoutTests(BotTestCase):
         self.assertEqual(self.svc.entry_count(second.id), 0)
         self.assertEqual(self.svc.timeout_ban_remaining(self.guild, str(member.id)), 2)
         self.assertTrue(any("penalty" in text for text in interaction.texts))
+
+
+class GiveawayListTests(BotTestCase):
+    """The entrant listing prints one bounded page but counts everybody."""
+
+    def run_command(self, interaction: FakeInteraction, giveaway_id=None) -> None:
+        command = self.bot.tree.get_command("giveaway_list")
+        self.assertIsNotNone(command, "the command must be registered")
+        asyncio.run(command.callback(interaction, giveaway_id))
+
+    def test_the_page_is_capped_while_the_header_counts_everyone(self) -> None:
+        gw = self.make()
+        for index in range(60):
+            self.svc.join(
+                gw,
+                user_id=f"{index + 1:0>18}",
+                username=f"user{index}",
+                member_roles=[],
+                account_created_ts=time.time() - 400 * 86400,
+            )
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        self.run_command(interaction, gw.id)
+        text = interaction.followup.sent[-1]["content"]
+        self.assertIn("**60** entrant(s)", text)
+        self.assertIn("…and 10 more.", text)
+        self.assertEqual(text.count("<@"), 51, "50 entrants listed, plus the host mention")
+
+    def test_no_entrants_says_so(self) -> None:
+        gw = self.make()
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        self.run_command(interaction, gw.id)
+        self.assertIn("no entrants yet", interaction.followup.sent[-1]["content"])
+
+
+class BlacklistListTests(BotTestCase):
+    """The blocked-user listing has to survive a long blacklist."""
+
+    def run_command(self, interaction: FakeInteraction) -> None:
+        command = self.bot.tree.get_command("giveaway_blacklist_list")
+        self.assertIsNotNone(command, "the command must be registered")
+        asyncio.run(command.callback(interaction))
+
+    def test_the_body_fits_and_the_header_counts_the_whole_list(self) -> None:
+        for index in range(90):
+            self.svc.blacklist_add(self.guild, f"{index + 1:0>18}")
+        interaction = FakeInteraction(
+            guild=FakeGuild(self.guild), user=fake_user(manage_guild=True)
+        )
+        self.run_command(interaction)
+        content = interaction.response.sent[0]["content"]
+        self.assertLessEqual(len(content), 2000, "Discord rejects anything longer")
+        self.assertIn("Blocked (90)", content)
+        self.assertIn("…plus 10 more.", content)
+        self.assertEqual(content.count("<@"), 80)
 
 
 class TimeoutBanCommandTests(BotTestCase):

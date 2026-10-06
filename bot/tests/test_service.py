@@ -21,7 +21,7 @@ import uuid
 
 from giveaway_bot.config import Settings
 from giveaway_bot.db import Database, _is_write
-from giveaway_bot.service import GiveawayService, ServiceError, now_ms
+from giveaway_bot.service import TIMEOUT_BAN_KIND, GiveawayService, ServiceError, now_ms
 
 DAY_MS = 86_400_000
 
@@ -297,6 +297,16 @@ class JoinTests(ServiceTestCase):
         # Two messages are still buffered in memory by the bot.
         self.assertEqual(self.join(gw, user_id="6" * 18, pending_messages=2), 1)
 
+    def test_entries_can_be_limited_for_a_display_path(self) -> None:
+        gw = self.make()
+        for index in range(5):
+            self.join(gw, user_id=f"{index + 1:0>18}")
+        full = self.svc.entries(gw.id)
+        self.assertEqual(len(full), 5)
+        self.assertEqual(self.svc.entries(gw.id, 2), full[:2], "oldest first, same order")
+        self.assertEqual(self.svc.entry_count(gw.id), 5, "the count is still the whole pool")
+        self.assertEqual(self.svc.entries(gw.id, 0), full[:1], "never an unbounded read")
+
     def test_ended_giveaway_refuses_joins(self) -> None:
         gw = self.make()
         self.svc.end(gw.id)
@@ -462,6 +472,13 @@ class BlacklistTests(ServiceTestCase):
             self.join(running, user_id="1" * 18)
         self.assertIn("blocked", str(ctx.exception.message))
 
+    def test_count_matches_the_list(self) -> None:
+        self.assertEqual(self.svc.count_blacklisted(self.guild), 0)
+        for user_id in ("1" * 18, "2" * 18):
+            self.svc.blacklist_add(self.guild, user_id)
+        self.assertEqual(self.svc.count_blacklisted(self.guild), 2)
+        self.assertEqual(self.svc.count_blacklisted("999"), 0)
+
     def test_remove_and_list(self) -> None:
         for user_id in ("1" * 18, "2" * 18):
             self.svc.blacklist_add(self.guild, user_id)
@@ -496,6 +513,19 @@ class TimeoutBanTests(ServiceTestCase):
         self.assertIn("3 giveaway(s)", message)
         self.assertEqual(self.svc.timeout_ban_remaining(self.guild, self.USER), 3)
         self.assertEqual(self.svc.entry_count(gw.id), 0, "a refused join leaves no entry")
+
+    def test_a_timeout_refusal_is_tagged_for_the_caller(self) -> None:
+        gw = self.make()
+        with self.assertRaises(ServiceError) as ctx:
+            self.join(gw, user_id=self.USER, timed_out=True)
+        self.assertEqual(ctx.exception.kind, TIMEOUT_BAN_KIND)
+        # An ordinary refusal must stay untagged, so a caller never cleans up
+        # after a join that was never blocked by this rule.
+        ended = self.make(prize="plain")
+        self.svc.end(ended.id)
+        with self.assertRaises(ServiceError) as plain:
+            self.join(self.svc.get(ended.id), user_id=self.USER)
+        self.assertEqual(plain.exception.kind, "")
 
     def test_an_untimed_out_member_is_unaffected(self) -> None:
         gw = self.make()
