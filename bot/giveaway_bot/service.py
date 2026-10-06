@@ -7,7 +7,7 @@ import secrets
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from typing import Any
 
 from .db import Database
 
@@ -121,6 +121,8 @@ class GiveawayService:
             raise ServiceError("Duration must be 30 seconds to 60 days.")
         if min_messages < 0 or min_messages > 100000:
             raise ServiceError("Minimum messages must be 0-100000.")
+        if min_account_age_days < 0 or min_account_age_days > 3650:
+            raise ServiceError("Minimum account age must be 0-3650 days.")
         image_url = (image_url or "").strip() or None
         if image_url and (len(image_url) > 512 or not image_url.startswith(("http://", "https://"))):
             raise ServiceError("Image must be an http(s) URL.")
@@ -178,11 +180,16 @@ class GiveawayService:
         return [Giveaway.from_row(r) for r in rows]
 
     def list_all_active(self, limit: int = 25) -> list[Giveaway]:
-        """Every active giveaway, soonest deadline first (embed refresher)."""
+        """Every active giveaway, soonest deadline first.
+
+        Feeds both the embed refresher and the autocomplete cache, so the cap is
+        per tick rather than per guild: 200 rows is one small query and keeps
+        suggestions available in every guild the bot is in.
+        """
         rows = self.db.query(
             "SELECT * FROM simple_giveaways WHERE status = 'active'"
             " ORDER BY ends_at ASC LIMIT ?",
-            (max(1, min(limit, 50)),),
+            (max(1, min(limit, 200)),),
         )
         return [Giveaway.from_row(r) for r in rows]
 
@@ -197,9 +204,16 @@ class GiveawayService:
         raw_id = (raw_id or "").strip()
         if raw_id:
             try:
-                return self.get(raw_id)
+                gw = self.get(raw_id)
             except ServiceError:
                 pass
+            else:
+                # An id can be typed by hand (or copied from another server's
+                # message), and every command here is guild-scoped: refuse
+                # rather than end someone else's giveaway.
+                if str(gw.guild_id) != str(guild_id):
+                    raise ServiceError("That giveaway belongs to another server.")
+                return gw
         active = self.list_active(guild_id)
         if len(active) == 1:
             return active[0]
@@ -231,6 +245,7 @@ class GiveawayService:
         member_roles: list[str],
         account_created_ts: float | None,
         user_id: str = "",
+        pending_messages: int = 0,
     ) -> None:
         if not gw.active:
             raise ServiceError("This giveaway has ended.")
@@ -243,12 +258,20 @@ class GiveawayService:
             raise ServiceError("You need one of the required roles to enter.")
         if gw.blocked_role_id and gw.blocked_role_id in roles:
             raise ServiceError("Your role is not allowed to enter.")
-        if gw.min_account_age_days > 0 and account_created_ts:
-            age_days = (datetime.now(UTC).timestamp() - account_created_ts) / 86400
+        if gw.min_account_age_days > 0:
+            if account_created_ts is None:
+                # The age could not be read, so the requirement cannot be
+                # checked. Refusing is the safe side of that trade: waving it
+                # through would silently disable the alt-account filter.
+                raise ServiceError("Could not check your account age — try again in a moment.")
+            age_days = (time.time() - account_created_ts) / 86400
             if age_days < gw.min_account_age_days:
                 raise ServiceError(f"Account must be {gw.min_account_age_days}+ days old.")
         if gw.min_messages > 0:
-            sent = self.message_count(gw.guild_id, user_id)
+            # pending_messages adds the rows still sitting in the bot's in-memory
+            # buffer, so nobody is told they sent fewer messages than they did
+            # since the last flush.
+            sent = self.message_count(gw.guild_id, user_id) + max(0, pending_messages)
             if sent < gw.min_messages:
                 raise ServiceError(
                     f"You need {gw.min_messages}+ messages in this server ({sent} counted)."
@@ -264,9 +287,35 @@ class GiveawayService:
     def record_message(self, guild_id: str, user_id: str) -> None:
         self.db.execute(
             "INSERT INTO simple_message_counts (guild_id, user_id, count) VALUES (?, ?, 1)"
-            " ON CONFLICT (guild_id, user_id) DO UPDATE SET count = count + 1",
+            " ON CONFLICT (guild_id, user_id) DO UPDATE SET count = count + excluded.count",
             (guild_id, user_id),
         )
+
+    #: Rows per INSERT when flushing buffered counts. SQLite's default parameter
+    #: limit is 999 and each row takes 3, so 300 leaves plenty of headroom.
+    MESSAGE_FLUSH_CHUNK = 300
+
+    def add_message_counts(self, rows: list[tuple[str, str, int]]) -> None:
+        """Apply many (guild_id, user_id, delta) counts in a few statements.
+
+        One statement per flush instead of one per message is the entire point:
+        N messages in the server cost ceil(N / MESSAGE_FLUSH_CHUNK) round-trips
+        per flush interval rather than N immediate ones.
+        """
+        for start in range(0, len(rows), self.MESSAGE_FLUSH_CHUNK):
+            chunk = rows[start : start + self.MESSAGE_FLUSH_CHUNK]
+            values = ", ".join("(?, ?, ?)" for _ in chunk)
+            params: list[Any] = []
+            for guild_id, user_id, count in chunk:
+                params.extend((guild_id, user_id, count))
+            # Interpolated text is the placeholder list only: every value still
+            # travels as a bound parameter, so there is nothing to inject.
+            statement = f"INSERT INTO simple_message_counts (guild_id, user_id, count) VALUES {values}"  # noqa: S608
+            self.db.execute(
+                statement
+                + " ON CONFLICT (guild_id, user_id) DO UPDATE SET count = count + excluded.count",
+                params,
+            )
 
     def join(
         self,
@@ -276,22 +325,35 @@ class GiveawayService:
         username: str,
         member_roles: list[str],
         account_created_ts: float | None,
+        pending_messages: int = 0,
     ) -> int:
         self.check_eligible(
             gw, member_roles=member_roles, account_created_ts=account_created_ts,
-            user_id=user_id,
+            user_id=user_id, pending_messages=pending_messages,
         )
+        # The giveaway is re-checked inside the statement itself. check_eligible
+        # above reads a row that was fetched moments earlier, so an end() landing
+        # in between would otherwise let the entry through; this makes that
+        # impossible without a second round-trip.
         try:
-            self.db.execute(
+            cur = self.db.execute(
                 "INSERT INTO simple_entries (giveaway_id, user_id, username, entered_at)"
-                " VALUES (?, ?, ?, ?)",
-                (gw.id, user_id, username[:64], now_ms()),
+                " SELECT ?, ?, ?, ? WHERE EXISTS ("
+                "   SELECT 1 FROM simple_giveaways WHERE id = ? AND status = 'active'"
+                " )",
+                (gw.id, user_id, username[:64], now_ms(), gw.id),
             )
         except Exception as exc:
             msg = str(exc).upper()
             if "UNIQUE" in msg or "PRIMARY" in msg or "CONSTRAINT" in msg:
                 raise ServiceError("You are already entered.") from None
             raise
+        try:
+            inserted = int(cur.rowcount or 0)
+        except (TypeError, ValueError):
+            inserted = 1
+        if inserted == 0:
+            raise ServiceError("This giveaway has ended.")
         return self.entry_count(gw.id)
 
     def leave(self, giveaway_id: str, user_id: str) -> bool:
@@ -305,12 +367,17 @@ class GiveawayService:
 
     # -- end / reroll / cancel ------------------------------------------
     def _pick(self, giveaway_id: str, n: int, exclude: list[str] | None = None) -> list[str]:
-        rows = self.entries(giveaway_id)
-        pool = [r["user_id"] for r in rows if not exclude or r["user_id"] not in set(exclude)]
-        if not pool:
+        # The exclusion set is built once per draw: rebuilding it for every row
+        # made picking from a large giveaway quadratic for no reason.
+        skipped = set(exclude or ())
+        pool = [
+            str(row["user_id"])
+            for row in self.entries(giveaway_id)
+            if str(row["user_id"]) not in skipped
+        ]
+        if not pool or n < 1:
             return []
-        n = min(n, len(pool))
-        return self._rand.sample(pool, n)
+        return self._rand.sample(pool, min(n, len(pool)))
 
     def end(self, giveaway_id: str) -> tuple[Giveaway, list[str]]:
         gw = self.get(giveaway_id)
@@ -340,6 +407,16 @@ class GiveawayService:
             "UPDATE simple_giveaways SET winners_json = ? WHERE id = ?", (json.dumps(combined), gw.id)
         )
         return self.get(gw.id), fresh
+
+    def discard(self, giveaway_id: str) -> None:
+        """Drop a giveaway that never reached Discord.
+
+        Used when the announcement message could not be posted: the row would
+        otherwise stay 'active' forever, auto-end on schedule, and try to
+        announce winners into a channel that already refused the bot.
+        """
+        self.db.execute("DELETE FROM simple_entries WHERE giveaway_id = ?", (giveaway_id,))
+        self.db.execute("DELETE FROM simple_giveaways WHERE id = ?", (giveaway_id,))
 
     def cancel(self, giveaway_id: str) -> Giveaway:
         gw = self.get(giveaway_id)

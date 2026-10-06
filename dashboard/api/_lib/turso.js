@@ -32,6 +32,18 @@ export function send(res, status, body, cache = "s-maxage=10, stale-while-revali
 }
 
 /**
+ * "?, ?, ?" for n bound parameters.
+ *
+ * Used to turn a list of ids into one IN (...) query instead of one query per
+ * id. The result is only ever a list of placeholders: the ids themselves are
+ * still passed as bound arguments, so nothing here reaches SQL as text.
+ */
+export function placeholders(n) {
+  const count = Number.isInteger(n) && n > 0 ? n : 0;
+  return Array.from({ length: count }, () => "?").join(",");
+}
+
+/**
  * Shape ONE dashboard card. Only the 4 agreed fields (+ ids for keying):
  *  - prize: what you are getting
  *  - entrants: people who joined (count + usernames, never user ids)

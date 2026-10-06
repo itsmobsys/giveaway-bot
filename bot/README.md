@@ -32,7 +32,9 @@ Needs **Server Members Intent** on (Bot tab in the Developer Portal) for role ch
   pinged on every giveaway event (new, winners, rerolls, cancellations).
   Members opt in/out themselves with the **🔔 Notify me** button on any
   giveaway message. Run without a role to view the current one.
-  - `min_messages`: members must have sent that many messages in the server (counted from when the bot is online)
+  - `min_messages`: members must have sent that many messages in the server
+    (counted from when the bot is online; counts are batched in memory and
+    written every ~10s, and unflushed counts still count towards the check)
   - `image`: http(s) photo URL shown on the embed — e.g. a Steam gift-card picture
 
 Message counts start accumulating the moment the bot logs in (even with no
@@ -58,13 +60,22 @@ it lacks the permission the giveaway still runs, just without the role.
   a running giveaway
 - `/giveaway_reroll giveaway_id [count]` — same suggestions + fallback; works
   on ended giveaways, drawing fresh winners that exclude previous ones
-- `/giveaway_reroll giveaway_id [count]` — same suggestions + fallback
 - `/giveaway_cancel giveaway_id` — same suggestions + fallback
 
 The embed shows a live **⏳ Ends in ...** countdown, re-rendered every tick
 (`TICK_SECONDS`, default 30). The **👥 Participants** button opens a paged
 entrant list (10 per page, ◀ Previous | page | Next ▶) with totals and your
 personal odds. The prize photo is shown on both the giveaway and winner messages.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -t .
+```
+
+`Database` accepts an injected connection, so the suite runs the real SQL
+(schema, indexes, upserts, constraints) on stdlib `sqlite3` with no Turso
+account and no network.
 
 ## Layout
 
@@ -76,3 +87,5 @@ personal odds. The prize photo is shown on both the giveaway and winner messages
 | `bot.py` | Discord wiring, buttons, timer |
 | `embeds.py` / `views.py` | Messages + Join/Leave buttons |
 | `cli.py` | `run` / `doctor` |
+| `views.py` | Join/Leave/Participants buttons (dynamic custom_id dispatch) |
+| `tests/` | unittest suite, run against in-memory SQLite |

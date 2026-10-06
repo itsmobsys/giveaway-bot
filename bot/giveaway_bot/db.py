@@ -12,7 +12,7 @@ import contextlib
 import logging
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from .config import Settings, get_settings
@@ -51,10 +51,13 @@ def _is_write(sql: str) -> bool:
     exact "created fine, join says not found, restart forgets everything"
     failure. SELECTs/PRAGMAs commit nothing.
     """
-    verb = sql.strip().split(None, 1)
-    return bool(verb) and verb[0].upper() not in (
-        "SELECT", "PRAGMA", "EXPLAIN", "WITH", "VALUES",
-    )
+    verb = sql.lstrip().split(None, 1)
+    if not verb:
+        return False
+    # WITH counts as a write on purpose: a CTE can head an INSERT/UPDATE/DELETE.
+    # Committing a read costs nothing, while forgetting to commit a write
+    # silently loses it.
+    return verb[0].upper() not in ("SELECT", "PRAGMA", "EXPLAIN", "VALUES")
 
 
 def _brief(exc: Exception, limit: int = 120) -> str:
@@ -101,13 +104,30 @@ CREATE TABLE IF NOT EXISTS {TABLE_ENTRIES} (
 SCHEMA_INDEXES = f"""
 CREATE INDEX IF NOT EXISTS idx_simple_gw_status_ends ON {TABLE_GIVEAWAYS}(status, ends_at);
 CREATE INDEX IF NOT EXISTS idx_simple_entries_giveaway ON {TABLE_ENTRIES}(giveaway_id);
+CREATE INDEX IF NOT EXISTS idx_simple_entries_user ON {TABLE_ENTRIES}(user_id);
 """
 
 
 class Database:
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        connect: Callable[[], Any] | None = None,
+    ) -> None:
         self.settings = settings or get_settings()
         self._local = threading.local()
+        #: Every connection this process opened. close() recycles one thread's
+        #: connection; close_all() is for shutdown.
+        self._connections: list[Any] = []
+        self._lock = threading.Lock()
+        if connect is not None:
+            # Injection point for tests: anything with sqlite3's
+            # execute/commit/close surface works, so the rules can run against a
+            # real (in-memory) database without a Turso account or the driver.
+            self._factory = connect
+            self.backend = "injected"
+            return
         if not self.settings.turso_url:
             raise RuntimeError(
                 "TURSO_DATABASE_URL is not set. This bot stores everything in Turso"
@@ -137,6 +157,8 @@ class Database:
             except Exception:
                 pass
             self._local.conn = conn
+            with self._lock:
+                self._connections.append(conn)
         return conn
 
     def init_schema(self) -> None:
@@ -297,13 +319,29 @@ class Database:
         return rows[0] if rows else None
 
     def close(self) -> None:
+        """Close the calling thread's connection (also used to drop a dead stream).
+
+        Only this thread's: another thread may be mid-statement on its own
+        connection, and killing that one would surface as a phantom failure.
+        """
         conn = getattr(self._local, "conn", None)
-        if conn is not None:
-            try:
+        if conn is None:
+            return
+        self._local.conn = None
+        with self._lock, contextlib.suppress(ValueError):
+            self._connections.remove(conn)
+        with contextlib.suppress(Exception):
+            conn.close()
+
+    def close_all(self) -> None:
+        """Close every connection, including other threads'. For shutdown."""
+        with self._lock:
+            connections = self._connections[:]
+            self._connections.clear()
+        self._local.conn = None
+        for conn in connections:
+            with contextlib.suppress(Exception):
                 conn.close()
-            except Exception:
-                pass
-            self._local.conn = None
 
 
 _database: Database | None = None

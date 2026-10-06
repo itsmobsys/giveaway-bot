@@ -1,5 +1,5 @@
 import { timingSafeEqual } from "node:crypto";
-import { card, db, send } from "./_lib/turso.js";
+import { card, db, placeholders, send } from "./_lib/turso.js";
 
 // Default password so the panel works with zero extra setup; override with
 // the ADMIN_PASSWORD env var. Note: anyone who can read this repo (or its
@@ -40,7 +40,7 @@ async function listPrevious(limit, offset, now) {
   if (rows.length) {
     const rs = await db().execute({
       sql: `SELECT giveaway_id, COUNT(*) AS n FROM simple_entries
-            WHERE giveaway_id IN (${rows.map(() => "?").join(",")})
+            WHERE giveaway_id IN (${placeholders(rows.length)})
             GROUP BY giveaway_id`,
       args: rows.map((r) => r.id),
     });
@@ -56,20 +56,41 @@ async function listPrevious(limit, offset, now) {
   };
 }
 
-/** Delete one giveaway + its entries. Live ones are refused. */
-async function deleteOne(id) {
+/**
+ * Delete giveaways and their entries, reporting per id.
+ *
+ * Live giveaways are refused, and so is an id that does not exist. This used to
+ * be three sequential round-trips per id, so a 100-row bulk delete spent 300
+ * round-trips inside one serverless invocation and could time out halfway. It is
+ * now a fixed five statements for the whole batch, whatever its size.
+ */
+async function deleteMany(ids) {
+  const unique = [...new Set(ids.map(String))].filter(Boolean);
+  if (!unique.length) return [];
+
+  const list = placeholders(unique.length);
   const rs = await db().execute({
-    sql: "SELECT id, status, prize FROM simple_giveaways WHERE id = ? LIMIT 1",
-    args: [id],
+    sql: `SELECT id, status, prize FROM simple_giveaways WHERE id IN (${list})`,
+    args: unique,
   });
-  const gw = rs.rows?.[0];
-  if (!gw) return { id, ok: false, status: 404, error: "Giveaway not found" };
-  if (gw.status === "active") {
-    return { id, ok: false, status: 409, error: "Still live — end it in Discord first." };
+  const found = new Map((rs.rows || []).map((r) => [String(r.id), r]));
+
+  const results = unique.map((id) => {
+    const gw = found.get(id);
+    if (!gw) return { id, ok: false, status: 404, error: "Giveaway not found" };
+    if (gw.status === "active") {
+      return { id, ok: false, status: 409, error: "Still live — end it in Discord first." };
+    }
+    return { id, ok: true, prize: gw.prize };
+  });
+
+  const removable = results.filter((r) => r.ok).map((r) => r.id);
+  if (removable.length) {
+    const del = placeholders(removable.length);
+    await db().execute({ sql: `DELETE FROM simple_entries WHERE giveaway_id IN (${del})`, args: removable });
+    await db().execute({ sql: `DELETE FROM simple_giveaways WHERE id IN (${del})`, args: removable });
   }
-  await db().execute({ sql: "DELETE FROM simple_entries WHERE giveaway_id = ?", args: [id] });
-  await db().execute({ sql: "DELETE FROM simple_giveaways WHERE id = ?", args: [id] });
-  return { id, ok: true, prize: gw.prize };
+  return results;
 }
 
 export default async function handler(req, res) {
@@ -100,11 +121,10 @@ export default async function handler(req, res) {
 
     if (action === "delete") {
       // Bulk: { ids: [...] }. Partial success is a 200 with a `failed` list —
-      // a race with the bot ending a giveaway shouldn't fail the whole batch.
+      // a race with the bot ending a giveaway should not fail the whole batch.
       const ids = (Array.isArray(body?.ids) ? body.ids : []).slice(0, MAX_PAGE).map(String);
       if (ids.length) {
-        const results = [];
-        for (const id of ids) results.push(await deleteOne(id));
+        const results = await deleteMany(ids);
         const ok = results.filter((r) => r.ok);
         const failed = results.filter((r) => !r.ok);
         const status = failed.length === results.length ? failed[0].status : 200;
@@ -116,7 +136,7 @@ export default async function handler(req, res) {
 
       const id = String(body?.id || "");
       if (!id) return send(res, 400, { error: "Missing giveaway id" }, "no-store");
-      const r = await deleteOne(id);
+      const [r] = await deleteMany([id]);
       if (!r.ok) return send(res, r.status, { error: r.error }, "no-store");
       return send(res, 200, { deleted: r.id, prize: r.prize }, "no-store");
     }

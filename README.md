@@ -14,7 +14,7 @@ Simple standalone Discord giveaway bot. MIT licensed.
 
 ## What it does
 
-- `/giveaway_create` — prize, winners, duration, up to 3 required roles, blocked
+- `/giveaway_create` — prize, winners, duration, up to 5 required roles, blocked
   role, min account age, min messages, host picker, prize photo
 - Join / Leave / Participants buttons, live countdown embed, auto-draw timer
 - `/giveaway_end`, `/giveaway_extend`, `/giveaway_reroll`, `/giveaway_cancel`
@@ -22,7 +22,9 @@ Simple standalone Discord giveaway bot. MIT licensed.
 - `/giveaway_list` (entrants + win odds), `/giveaway_ping`, `/giveaway_notifyer`
   (one-time notify-role setup, pinged on every event)
 - Per-giveaway mentionable entrants role, granted on join, stripped on end
-- Message counts reset for everyone when a giveaway ends
+- Message counts reset for everyone when a giveaway ends. They are kept in
+  memory and written in one batched statement every 10s, so a busy server does
+  not pay a database round-trip per message
 - Turso-only storage, so restarts never lose data
 - Built-in `/health` server, so it runs on Render's free Web Service tier
 
@@ -89,6 +91,18 @@ python -m giveaway_bot doctor   # from bot/
 python -m giveaway_bot run      # or: python app.py (from root)
 ```
 
+## Tests
+
+No extra dependencies: both suites are plain stdlib and Node.
+
+```bash
+cd bot       && python -m unittest discover -s tests -t .   # rules, embeds, bot
+cd dashboard && node smoke.js                              # page + card shape
+```
+
+The Python suite hands `Database` an in-memory SQLite connection, so the real
+schema, constraints and upserts are exercised without a Turso account.
+
 ## Env
 
 | Var | Required | What |
@@ -99,6 +113,7 @@ python -m giveaway_bot run      # or: python app.py (from root)
 | `DISCORD_GIVEAWAY_CHANNEL_ID` | no | Force all giveaways into one channel |
 | `TICK_SECONDS` | no | Embed refresh + due checks (default 30) |
 | `EMBED_COLOR` | no | e.g. `0x7C5CFF` |
+| `DASHBOARD_URL` | no | Blue "Dashboard" link button on every giveaway message (empty = no button) |
 | `PORT` | no | Health server port (Render sets it; default 10000) |
 
 The bot needs **Server Members Intent** (Developer Portal → Bot) for role checks

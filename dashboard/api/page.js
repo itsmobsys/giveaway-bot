@@ -31,8 +31,10 @@ function pick(req) {
   try {
     const u = new URL(req.url || "/", "http://x");
     const f = u.searchParams.get("f");
-    if (f && BODY[f]) return f;
-    const p = BY_PATH[u.pathname];
+    // hasOwn, not a truthiness check: BODY["constructor"] resolves to Object, so
+    // ?f=constructor used to return a function and crash on file.slice below.
+    if (f && Object.hasOwn(BODY, f)) return f;
+    const p = Object.hasOwn(BY_PATH, u.pathname) ? BY_PATH[u.pathname] : null;
     if (p) return p;
   } catch {}
   return null;

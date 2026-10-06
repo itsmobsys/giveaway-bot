@@ -2,7 +2,8 @@
 // Run: node smoke.js
 import assert from "node:assert";
 import { fmtDuration, ago, esc, cardHTML } from "./public/format.js";
-import { card as serverCard } from "./api/_lib/turso.js";
+import { card as serverCard, placeholders } from "./api/_lib/turso.js";
+import pageHandler from "./api/page.js";
 
 // -- time formatting ------------------------------------------------------
 assert.strictEqual(fmtDuration(0), "00:00");
@@ -108,5 +109,112 @@ for (const key of ["Nitro", "25", "1 in 4", "12 entrants", "Live"]) {
   assert.ok(round.includes(key), `rendered card missing ${key}`);
 }
 console.log("server->view round trip ok");
+
+// -- placeholder building (shared by the grouped queries) ------------------
+assert.strictEqual(placeholders(1), "?");
+assert.strictEqual(placeholders(3), "?,?,?");
+assert.strictEqual(placeholders(0), "");
+assert.strictEqual(placeholders(-2), "");
+assert.strictEqual(placeholders(2.5), "");
+console.log("placeholders ok");
+
+// -- the page function: routing, caching, and hostile query strings --------
+function mockRes() {
+  const res = { statusCode: null, headers: {}, body: null };
+  res.setHeader = (k, v) => {
+    res.headers[String(k).toLowerCase()] = v;
+  };
+  res.status = (code) => {
+    res.statusCode = code;
+    return res;
+  };
+  res.send = (body) => {
+    res.body = body;
+    return res;
+  };
+  return res;
+}
+
+function fetchPage(url) {
+  const res = mockRes();
+  pageHandler({ url }, res);
+  return res;
+}
+
+const home = fetchPage("/");
+assert.strictEqual(home.statusCode, 200);
+assert.ok(home.body.toLowerCase().startsWith("<!doctype html"), "index is served at /");
+assert.ok(home.headers["content-type"].includes("text/html"));
+assert.ok(home.headers["cache-control"].includes("s-maxage=30"));
+
+const css = fetchPage("/styles.css");
+assert.strictEqual(css.statusCode, 200);
+assert.ok(css.headers["content-type"].includes("text/css"));
+assert.ok(css.headers["cache-control"].includes("immutable"), "static assets stay cached");
+assert.ok(fetchPage("/app.js").body.includes("REFRESH_MS"), "app.js is baked in");
+assert.ok(fetchPage("/format.js").body.includes("cardHTML"), "format.js is baked in");
+assert.ok(fetchPage("/admin.js").body.includes("password"), "admin.js is baked in");
+
+const adminPage = fetchPage("/admin");
+assert.strictEqual(adminPage.statusCode, 200);
+assert.ok(adminPage.headers["cache-control"].includes("no-store"), "the admin page is never cached");
+assert.strictEqual(fetchPage("/admin.html").statusCode, 200);
+
+assert.strictEqual(fetchPage("/api/page?f=index.html").statusCode, 200);
+assert.strictEqual(fetchPage("/?f=styles.css").statusCode, 200);
+assert.strictEqual(fetchPage("/nope").statusCode, 404);
+assert.strictEqual(fetchPage("/health").statusCode, 404, "the page function only serves page assets");
+// Regression: a plain truthiness lookup made these resolve to Object.prototype
+// values (constructor, toString, __proto__), which then crashed on file.slice
+// and turned a junk URL into a 500.
+for (const hostile of ["/constructor", "/toString", "/__proto__", "/valueOf"]) {
+  const res = fetchPage(hostile);
+  assert.strictEqual(res.statusCode, 404, hostile + " must 404, got " + res.statusCode);
+  assert.strictEqual(res.body, "unknown page asset");
+}
+// A junk ?f= is not an error: it falls back to the pathname mapping, which
+// itself can only ever name one of the six baked assets.
+assert.strictEqual(fetchPage("/?f=missing.css").statusCode, 200);
+for (const hostile of ["/?f=constructor", "/?f=toString", "/?f=__proto__", "/?f=hasOwnProperty"]) {
+  const res = fetchPage(hostile);
+  assert.strictEqual(res.statusCode, 200, hostile + " falls back to the index page");
+  assert.strictEqual(typeof res.body, "string");
+  assert.ok(res.body.toLowerCase().startsWith("<!doctype html"), "a real asset, never a prototype value");
+}
+const traversal = fetchPage("/?f=../api/admin.js");
+assert.strictEqual(traversal.statusCode, 200);
+assert.ok(
+  !String(traversal.body).includes("duggalbadmoshnahirahalol"),
+  "no query string can reach a file outside the baked set"
+);
+assert.ok(!String(fetchPage("/?f=../../.env").body).includes("TURSO"), "and not the environment either");
+const broken = mockRes();
+pageHandler({ url: "http://[::1" }, broken);
+assert.strictEqual(broken.statusCode, 404, "an unparseable url is a 404, not a 500");
+console.log("page routing ok");
+
+// -- server card edge cases -----------------------------------------------
+const zero = serverCard(
+  { id: "gw_z", status: "active", prize: "Nothing", winner_count: 0, ends_at: now + 1000, ended_at: null },
+  0, [], now
+);
+assert.strictEqual(zero.chance.winners, 1, "winner_count 0 falls back to 1");
+assert.strictEqual(zero.chance.one_in, null);
+assert.strictEqual(zero.timer.seconds_remaining, 1);
+const odd = serverCard(
+  { id: "gw_o", status: "ended", prize: "P", winner_count: 2, ends_at: now - 10, ended_at: now - 5 },
+  3, ["a"], now
+);
+assert.strictEqual(odd.timer.is_live, false);
+assert.strictEqual(odd.timer.ms_remaining, 0, "an ended giveaway has no time left");
+assert.strictEqual(odd.timer.ended_at, now - 5);
+assert.strictEqual(odd.chance.percent, 66.67);
+assert.strictEqual(odd.chance.one_in, 1.5);
+const overflowing = serverCard(
+  { id: "gw_x", status: "active", prize: "P", winner_count: 9, ends_at: now + 1000, ended_at: null },
+  2, [], now
+);
+assert.strictEqual(overflowing.chance.percent, 100, "odds never exceed 100%");
+console.log("card edge cases ok");
 
 console.log("ALL OK");
