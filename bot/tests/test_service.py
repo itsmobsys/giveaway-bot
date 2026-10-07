@@ -17,11 +17,18 @@ import sqlite3
 import threading
 import time
 import unittest
+import unittest.mock
 import uuid
 
 from giveaway_bot.config import Settings
 from giveaway_bot.db import Database, _is_write
-from giveaway_bot.service import TIMEOUT_BAN_KIND, GiveawayService, ServiceError, now_ms
+from giveaway_bot.service import (
+    TIMEOUT_BAN_KIND,
+    GiveawayService,
+    PartialFlush,
+    ServiceError,
+    now_ms,
+)
 
 DAY_MS = 86_400_000
 
@@ -93,6 +100,7 @@ class SchemaTests(ServiceTestCase):
         for name in (
             "id", "prize", "winner_count", "ends_at", "status", "required_role_id",
             "required_role_ids", "blocked_role_id", "entrants_role_id", "winners_json",
+            "entrant_count",
         ):
             self.assertIn(name, cols)
         entry_cols = {str(r["name"]) for r in self.db.query("PRAGMA table_info(simple_entries)")}
@@ -249,6 +257,29 @@ class JoinTests(ServiceTestCase):
         self.assertFalse(self.svc.leave(gw.id, "333333333333333333"))
         self.assertEqual(self.svc.entry_count(gw.id), 1)
 
+    def test_leave_after_the_end_keeps_the_entry(self) -> None:
+        gw = self.make()
+        self.join(gw)
+        self.svc.end(gw.id)
+        self.assertFalse(self.svc.leave(gw.id, "333333333333333333"))
+        self.assertEqual(self.svc.entry_count(gw.id), 1, "the drawn pool is not rewritten")
+
+    def test_a_non_duplicate_constraint_error_is_not_called_already_entered(self) -> None:
+        gw = self.make()
+        original = self.db.execute
+
+        def failing(sql, params=()):
+            if sql.lstrip().startswith("INSERT INTO simple_entries"):
+                raise sqlite3.IntegrityError("NOT NULL constraint failed: simple_entries.username")
+            return original(sql, params)
+
+        self.db.execute = failing  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(sqlite3.IntegrityError):
+                self.join(gw)
+        finally:
+            self.db.execute = original  # type: ignore[method-assign]
+
     def test_double_join_is_a_service_error(self) -> None:
         gw = self.make()
         self.join(gw)
@@ -351,11 +382,51 @@ class MessageCountTests(ServiceTestCase):
         self.assertEqual(self.db.query_one(
             "SELECT COUNT(*) AS n FROM simple_message_counts")["n"], 700)
 
+    def test_ambiguous_chunk_failure_requeues_only_what_is_missing(self) -> None:
+        # The write landed but its response was lost: the retry must not add
+        # the chunk a second time.
+        original = self.db.execute
+
+        def flaky(sql, params=()):
+            if "simple_message_counts" in sql and "INSERT" in sql:
+                original(sql, params)  # applied, then the response is "lost"
+                raise OSError("connection reset by peer")
+            return original(sql, params)
+
+        rows = [(self.guild, "a" * 18, 2), (self.guild, "b" * 18, 3)]
+        with self.assertRaises(PartialFlush), unittest.mock.patch.object(self.db, "execute", flaky):
+            self.svc.add_message_counts(rows)
+        # rows was reconciled in place: the retry adds nothing twice.
+        self.assertEqual(self.svc.message_count(self.guild, "a" * 18), 2)
+        self.assertEqual(self.svc.message_count(self.guild, "b" * 18), 3)
+
+    def test_deterministic_chunk_failure_requeues_the_whole_chunk(self) -> None:
+        original = self.db.execute
+
+        def boom(sql, params=()):
+            if "INSERT" in sql and "simple_message_counts" in sql:
+                raise OSError("disk is full")
+            return original(sql, params)
+
+        with self.assertRaises(PartialFlush) as ctx, unittest.mock.patch.object(self.db, "execute", boom):
+            self.svc.add_message_counts([(self.guild, "a" * 18, 2)])
+        self.assertEqual(ctx.exception.applied, 0)
+        self.assertEqual(self.svc.message_count(self.guild, "a" * 18), 0)
+
     def test_end_resets_counts_for_the_next_grind(self) -> None:
         gw = self.make()
         self.svc.record_message(self.guild, "c" * 18)
         self.svc.end(gw.id)
         self.assertEqual(self.svc.message_count(self.guild, "c" * 18), 0)
+
+    def test_end_keeps_counts_while_another_giveaway_needs_them(self) -> None:
+        self.make(prize="grind", min_messages=5)
+        self.svc.record_message(self.guild, "c" * 18)
+        self.svc.end(self.make(prize="plain").id)
+        self.assertEqual(
+            self.svc.message_count(self.guild, "c" * 18), 1,
+            "a running min_messages giveaway must not be reset under its entrants",
+        )
 
     def test_end_resets_only_the_guild_whose_giveaway_ended(self) -> None:
         other = "555555555555555555"
@@ -435,12 +506,71 @@ class DrawTests(ServiceTestCase):
         self.assertNotIn(fresh[0], first)
         self.assertEqual(sorted(after.winners), sorted(first + fresh))
 
-    def test_reroll_falls_back_when_the_pool_is_exhausted(self) -> None:
+    def test_reroll_refuses_when_the_pool_is_exhausted(self) -> None:
         gw = self.make()
         self.join(gw, user_id="1" * 18)
         _, first = self.svc.end(gw.id)
-        _, fresh = self.svc.reroll(gw.id, 1)
-        self.assertEqual(fresh, first, "only entrant is redrawn rather than failing")
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.reroll(gw.id, 1)
+        self.assertIn("No other entrants", str(ctx.exception.message))
+        self.assertEqual(self.svc.get(gw.id).winners, first, "winners unchanged")
+
+    def test_reroll_refuses_after_the_entries_were_wiped(self) -> None:
+        gw = self.make()
+        self.join(gw, user_id="1" * 18)
+        self.svc.end(gw.id)
+        self.svc.wipe_stale_entries(now=now_ms() + 10 * DAY_MS)
+        with self.assertRaises(ServiceError):
+            self.svc.reroll(gw.id, 1)
+
+    def test_end_stores_the_entrant_count(self) -> None:
+        gw = self.make()
+        for i in range(3):
+            self.join(gw, user_id=str(10 ** 17 + i))
+        self.svc.end(gw.id)
+        row = self.db.query_one("SELECT entrant_count FROM simple_giveaways WHERE id = ?", (gw.id,))
+        self.assertEqual(row["entrant_count"], 3)
+
+    def test_a_failed_end_write_leaves_the_giveaway_active(self) -> None:
+        gw = self.make()
+        self.join(gw)
+        original = self.db.execute
+
+        def failing(sql, params=()):
+            if "status = 'ended'" in sql:
+                raise RuntimeError("write failed")
+            return original(sql, params)
+
+        self.db.execute = failing  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(RuntimeError):
+                self.svc.end(gw.id)
+        finally:
+            self.db.execute = original  # type: ignore[method-assign]
+        self.assertTrue(self.svc.get(gw.id).active, "not stranded as ended with no winners")
+        _, winners = self.svc.end(gw.id)
+        self.assertEqual(winners, ["333333333333333333"])
+
+    def test_cancel_stores_the_entrant_count_and_loses_a_race_to_end(self) -> None:
+        gw = self.make()
+        self.join(gw)
+        self.svc.cancel(gw.id)
+        row = self.db.query_one("SELECT entrant_count FROM simple_giveaways WHERE id = ?", (gw.id,))
+        self.assertEqual(row["entrant_count"], 1)
+        # A stale read: get() still says active, but end() already claimed it.
+        other = self.make(prize="raced")
+        stale = self.svc.get(other.id)
+        self.svc.end(other.id)
+        original = self.svc.get
+        self.svc.get = lambda _id: stale  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(ServiceError):
+                self.svc.cancel(other.id)
+            with self.assertRaises(ServiceError):
+                self.svc.extend(other.id, 600)
+        finally:
+            self.svc.get = original  # type: ignore[method-assign]
+        self.assertEqual(self.svc.get(other.id).status, "ended")
 
     def test_reroll_refuses_a_running_giveaway(self) -> None:
         gw = self.make()
@@ -677,6 +807,29 @@ class TimeoutBanTests(ServiceTestCase):
         # as the running penalty, never as a fresh three.
         other = self.make(prize="other")
         self.assertIn("2 giveaway(s) left", self.refused(other, timed_out=True))
+
+    def test_alternating_giveaways_cannot_burn_the_penalty(self) -> None:
+        a = self.make(prize="a")
+        b = self.make(prize="b")
+        self.refused(a, timed_out=True)
+        for gw in (b, a, b, a):
+            self.refused(gw)
+        self.assertEqual(
+            self.svc.timeout_ban_remaining(self.guild, self.USER), 2,
+            "only b was a new giveaway to sit out",
+        )
+
+    def test_the_giveaway_that_spent_the_last_unit_still_refuses(self) -> None:
+        self.refused(self.make(prize="trigger"), timed_out=True)
+        blocked = [self.make(prize=f"blocked {i}") for i in range(3)]
+        for gw in blocked:
+            self.refused(gw)
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, self.USER), 0)
+        with self.assertRaises(ServiceError) as ctx:
+            self.join(blocked[-1], user_id=self.USER)
+        self.assertEqual(ctx.exception.kind, TIMEOUT_BAN_KIND)
+        self.assertEqual(self.svc.entry_count(blocked[-1].id), 0)
+        self.assertEqual(self.join(self.make(prize="next"), user_id=self.USER), 1)
 
     def test_an_entry_made_before_the_timeout_is_dropped(self) -> None:
         gw = self.make()

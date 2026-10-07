@@ -8,7 +8,9 @@ cannot be read.
 
 from __future__ import annotations
 
+import sqlite3
 import unittest
+import uuid
 
 from giveaway_bot.config import Settings
 from giveaway_bot.db import Database, _is_ambiguous_loss, _is_dead_stream
@@ -119,6 +121,23 @@ class ReplaySafetyTests(unittest.TestCase):
             self.assertFalse(_is_dead_stream(message), message)
 
 
+class LocalFileGuardTests(unittest.TestCase):
+    def test_a_file_url_is_refused_loudly(self) -> None:
+        # No injected connection here: this is the production path, where a
+        # file: URL would silently lose data on Render.
+        with self.assertRaisesRegex(RuntimeError, "libsql://"):
+            Database(Settings(turso_url="file:./data.db"))
+        with self.assertRaisesRegex(RuntimeError, "libsql://"):
+            Database(Settings(turso_url="file::memory:"))
+
+    def test_injected_connections_still_work_for_tests(self) -> None:
+        # The guard only fires on the settings path: the injected-connect path
+        # the whole suite uses must keep working regardless of the URL.
+        conn = ScriptedConnection({})
+        db = Database(Settings(turso_url="file:anything"), connect=lambda: conn)
+        self.assertEqual(db.backend, "injected")
+
+
 class MigrationTests(unittest.TestCase):
     def test_a_column_check_that_fails_stops_startup_instead_of_being_skipped(self) -> None:
         conn = ScriptedConnection({"table_info": ["unable to open database file"]})
@@ -129,6 +148,41 @@ class MigrationTests(unittest.TestCase):
         ):
             db.init_schema()
         self.assertIn("simple_giveaways", captured.output[0])
+
+    def test_an_existing_table_gains_entrant_count_and_keeps_its_rows(self) -> None:
+        uri = f"file:gwmig_{uuid.uuid4().hex}?mode=memory&cache=shared"
+        keeper = sqlite3.connect(uri, uri=True)
+        try:
+            # A table from before the column existed, holding a finished giveaway.
+            keeper.execute(
+                "CREATE TABLE simple_giveaways (id TEXT PRIMARY KEY, guild_id TEXT NOT NULL,"
+                " channel_id TEXT NOT NULL, prize TEXT NOT NULL, ends_at INTEGER NOT NULL,"
+                " status TEXT NOT NULL DEFAULT 'active', created_by TEXT NOT NULL,"
+                " created_at INTEGER NOT NULL, ended_at INTEGER)"
+            )
+            keeper.execute(
+                "INSERT INTO simple_giveaways VALUES ('gw_old', 'g', 'c', 'p', 1, 'ended', 'u', 1, 2)"
+            )
+            keeper.commit()
+            db = Database(
+                Settings(turso_url=""),
+                connect=lambda: sqlite3.connect(uri, uri=True, check_same_thread=False),
+            )
+            try:
+                db.init_schema()
+                db.init_schema()
+                cols = {str(r["name"]) for r in db.query("PRAGMA table_info(simple_giveaways)")}
+                self.assertIn("entrant_count", cols)
+                row = db.query_one("SELECT entrant_count FROM simple_giveaways WHERE id = 'gw_old'")
+                self.assertIsNone(row["entrant_count"], "unknown for giveaways that ended before")
+                tables = {str(r["name"]) for r in db.query(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )}
+                self.assertIn("simple_giveaway_ban_hits", tables)
+            finally:
+                db.close_all()
+        finally:
+            keeper.close()
 
 
 if __name__ == "__main__":

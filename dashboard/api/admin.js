@@ -1,18 +1,14 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { card, db, placeholders, send } from "./_lib/turso.js";
 
-// Default password so the panel works with zero extra setup; override with
-// the ADMIN_PASSWORD env var. Note: anyone who can read this repo (or its
-// Vercel env settings) can see it — it keeps curious visitors out, nothing more.
-const PASSWORD = process.env.ADMIN_PASSWORD || "duggalbadmoshnahirahalol";
 
 /** Rows per page cap — the panel pages through everything else. */
 const MAX_PAGE = 100;
 
-function authorized(pw) {
-  const a = Buffer.from(String(pw ?? ""));
-  const b = Buffer.from(PASSWORD);
-  return a.length === b.length && timingSafeEqual(a, b);
+function authorized(pw, password) {
+  const a = createHash("sha256").update(String(pw ?? "")).digest();
+  const b = createHash("sha256").update(password).digest();
+  return timingSafeEqual(a, b);
 }
 
 /**
@@ -24,10 +20,12 @@ function authorized(pw) {
 async function listPrevious(limit, offset, now) {
   const [rowsRs, totalRs, liveRs] = await Promise.all([
     db().execute({
-      sql: `SELECT id, prize, winner_count, ends_at, ended_at, status, image_url, host_name
+      sql: `SELECT id, prize, winner_count, ends_at,
+                   COALESCE(ended_at, created_at) AS ended_at, entrant_count,
+                   status, image_url, host_name
             FROM simple_giveaways
             WHERE status != 'active'
-            ORDER BY ended_at DESC
+            ORDER BY COALESCE(ended_at, created_at) DESC, id DESC
             LIMIT ? OFFSET ?`,
       args: [limit, offset],
     }),
@@ -62,7 +60,7 @@ async function listPrevious(limit, offset, now) {
  * Live giveaways are refused, and so is an id that does not exist. This used to
  * be three sequential round-trips per id, so a 100-row bulk delete spent 300
  * round-trips inside one serverless invocation and could time out halfway. It is
- * now a fixed five statements for the whole batch, whatever its size.
+ * now one lookup and one transactional two-statement batch, whatever its size.
  */
 async function deleteMany(ids) {
   const unique = [...new Set(ids.map(String))].filter(Boolean);
@@ -87,13 +85,28 @@ async function deleteMany(ids) {
   const removable = results.filter((r) => r.ok).map((r) => r.id);
   if (removable.length) {
     const del = placeholders(removable.length);
-    await db().execute({ sql: `DELETE FROM simple_entries WHERE giveaway_id IN (${del})`, args: removable });
-    await db().execute({ sql: `DELETE FROM simple_giveaways WHERE id IN (${del})`, args: removable });
+    const [, deleted] = await db().batch([
+      { sql: `DELETE FROM simple_entries WHERE giveaway_id IN (
+                SELECT id FROM simple_giveaways WHERE status != 'active' AND id IN (${del})
+              )`, args: removable },
+      { sql: `DELETE FROM simple_giveaways WHERE status != 'active'
+              AND id IN (${del}) RETURNING id`, args: removable },
+    ], "write");
+    const deletedIds = new Set((deleted.rows || []).map((r) => String(r.id)));
+    for (const result of results) {
+      if (result.ok && !deletedIds.has(result.id)) {
+        result.ok = false;
+        result.status = 409;
+        result.error = "Giveaway is no longer eligible for deletion";
+      }
+    }
   }
   return results;
 }
 
 export default async function handler(req, res) {
+  const password = process.env.ADMIN_PASSWORD;
+  if (!password) return send(res, 503, { error: "Admin disabled: ADMIN_PASSWORD not set" }, "no-store");
   if (req.method === "OPTIONS") return res.status(204).end();
   if (req.method !== "POST") return send(res, 405, { error: "POST only" }, "no-store");
 
@@ -106,7 +119,10 @@ export default async function handler(req, res) {
     }
   }
   const pw = req.headers?.["x-admin-password"] ?? body?.password;
-  if (!authorized(pw)) return send(res, 401, { error: "Wrong password" }, "no-store");
+  if (!authorized(pw, password)) {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    return send(res, 401, { error: "Wrong password" }, "no-store");
+  }
 
   const { action } = body || {};
 
@@ -114,8 +130,12 @@ export default async function handler(req, res) {
     if (action === "ping") return send(res, 200, { ok: true }, "no-store");
 
     if (action === "list") {
-      const limit = Math.max(1, Math.min(MAX_PAGE, Number(body?.limit) || 25));
-      const offset = Math.max(0, Number(body?.offset) || 0);
+      const requestedLimit = Number(body?.limit);
+      const requestedOffset = Number(body?.offset);
+      const limit = Number.isFinite(requestedLimit)
+        ? Math.max(1, Math.min(MAX_PAGE, Math.trunc(requestedLimit))) : 25;
+      const offset = Number.isFinite(requestedOffset)
+        ? Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, Math.trunc(requestedOffset))) : 0;
       return send(res, 200, await listPrevious(limit, offset, Date.now()), "no-store");
     }
 
@@ -141,7 +161,8 @@ export default async function handler(req, res) {
       return send(res, 200, { deleted: r.id, prize: r.prize }, "no-store");
     }
   } catch (err) {
-    return send(res, err.statusCode || 500, { error: err.message || "DB error" }, "no-store");
+    console.error("Admin API error:", err);
+    return send(res, 500, { error: "Internal server error" }, "no-store");
   }
 
   return send(res, 400, { error: "Unknown action" }, "no-store");

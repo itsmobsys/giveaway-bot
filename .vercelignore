@@ -15,4 +15,6 @@ requirements.txt
 sillydev.conf
 serve.js
 smoke.js
+smoke-api.js
+smoke-browser.js
 build-page.js

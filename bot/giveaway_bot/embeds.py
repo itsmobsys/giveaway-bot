@@ -71,13 +71,15 @@ def participants_embed(
     mine: int,
     winner_count: int,
     color: int,
+    shown: int | None = None,
 ) -> discord.Embed:
     lines = [f"<@{row['user_id']}> (1 entry)" for row in rows]
     # Clamped like every other odds readout in the bot: a giveaway created with
     # 25 winners and 3 entrants would otherwise advertise 833%.
     chance = min(100.0, winner_count / total * 100) if mine and total else 0.0
+    window = f"\nShowing the first {shown} of {total}." if shown is not None and shown < total else ""
     desc = (
-        f"These are the members that have participated in the giveaway of {prize}:\n\n"
+        f"These are the members that have participated in the giveaway of {prize}:{window}\n\n"
         + "\n".join(lines)
         + f"\n\nTotal Participants: {total}\nTotal Entries: {total}"
         + f"\n\nYour Entries: {mine}\nYour Chance of Winning: {chance:g}%"

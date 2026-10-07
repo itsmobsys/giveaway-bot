@@ -1,6 +1,7 @@
 // Tests the shared browser helpers (public/format.js) and the server card shape.
 // Run: node smoke.js
 import assert from "node:assert";
+import { readFileSync } from "node:fs";
 import { fmtDuration, ago, esc, cardHTML } from "./public/format.js";
 import { card as serverCard, placeholders } from "./api/_lib/turso.js";
 import pageHandler from "./api/page.js";
@@ -89,6 +90,8 @@ assert.ok(!ehtml.includes("data-ends-at=\"undefined\""), "no undefined in attrs"
 assert.ok(ehtml.includes('class="timer ended"'), "ended timer styled ended");
 assert.ok(ehtml.includes('data-live="false"'), "ended timer is not ticked");
 assert.ok(ehtml.includes("Finished"), "accessible label for the finish time");
+assert.ok(cardHTML({ ...ended, timer: { ...ended.timer, ended_at: null } }, now).includes("—"), "unknown finish time shows a dash");
+assert.ok(cardHTML({ ...ended, timer: { ...ended.timer, ended_at: 0 } }, now).includes("—"), "zero finish time shows a dash");
 console.log("ended card ok");
 
 assert.ok(cardHTML({ ...ended, status: "cancelled", prize: "Void drop" }, now).includes("Cancelled"));
@@ -154,6 +157,11 @@ assert.ok(css.headers["cache-control"].includes("immutable"), "static assets sta
 assert.ok(fetchPage("/app.js").body.includes("REFRESH_MS"), "app.js is baked in");
 assert.ok(fetchPage("/format.js").body.includes("cardHTML"), "format.js is baked in");
 assert.ok(fetchPage("/admin.js").body.includes("password"), "admin.js is baked in");
+for (const asset of ["index.html", "styles.css", "app.js", "format.js", "admin.html", "admin.js"]) {
+  assert.strictEqual(fetchPage(`/?f=${asset}`).body, readFileSync(new URL(`./public/${asset}`, import.meta.url), "utf8"),
+    `${asset} in page.js must match public/ exactly`);
+}
+console.log("baked assets match public/ ok");
 
 const adminPage = fetchPage("/admin");
 assert.strictEqual(adminPage.statusCode, 200);
@@ -184,7 +192,7 @@ for (const hostile of ["/?f=constructor", "/?f=toString", "/?f=__proto__", "/?f=
 const traversal = fetchPage("/?f=../api/admin.js");
 assert.strictEqual(traversal.statusCode, 200);
 assert.ok(
-  !String(traversal.body).includes("duggalbadmoshnahirahalol"),
+  !String(traversal.body).includes("const DEV_PASSWORD"),
   "no query string can reach a file outside the baked set"
 );
 assert.ok(!String(fetchPage("/?f=../../.env").body).includes("TURSO"), "and not the environment either");
@@ -215,6 +223,12 @@ const overflowing = serverCard(
   2, [], now
 );
 assert.strictEqual(overflowing.chance.percent, 100, "odds never exceed 100%");
+assert.strictEqual(overflowing.chance.one_in, 1, "more winners than entrants means 1 in 1");
+assert.strictEqual(serverCard({ ...odd, entrant_count: 17 }, 0, [], now).entrants.count, 17, "ended snapshot survives entry wipe");
+assert.strictEqual(serverCard({ ...odd, entrant_count: null }, 3, [], now).entrants.count, 3, "NULL snapshot falls back to entries");
+assert.strictEqual(serverCard({ ...overflowing, entrant_count: 99 }, 2, [], now).entrants.count, 2, "live count ignores snapshot");
 console.log("card edge cases ok");
 
+await import("./smoke-api.js");
+await import("./smoke-browser.js");
 console.log("ALL OK");

@@ -103,7 +103,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_GIVEAWAYS} (
   host_name TEXT,
   created_at INTEGER NOT NULL,
   ended_at INTEGER,
-  winners_json TEXT NOT NULL DEFAULT '[]'
+  winners_json TEXT NOT NULL DEFAULT '[]',
+  entrant_count INTEGER
 );
 CREATE TABLE IF NOT EXISTS {TABLE_ENTRIES} (
   giveaway_id TEXT NOT NULL,
@@ -146,6 +147,15 @@ class Database:
                 "TURSO_DATABASE_URL is not set. This bot stores everything in Turso"
                 " so restarts never lose data — set TURSO_DATABASE_URL (and"
                 " TURSO_AUTH_TOKEN) and restart."
+            )
+        if self.settings.turso_url.startswith("file:"):
+            # A local file works on a laptop and silently loses every giveaway on
+            # Render, which wipes local files on each redeploy. The injected
+            # `connect` above is the only sanctioned local path (tests), so a
+            # file: URL through configuration is always a mistake.
+            raise RuntimeError(
+                "TURSO_DATABASE_URL must be a remote libsql:// (or https://) URL:"
+                " a file: database is wiped on every Render redeploy."
             )
         try:
             import libsql  # type: ignore[import-not-found]
@@ -204,6 +214,9 @@ class Database:
                 "created_at": "INTEGER NOT NULL DEFAULT 0",
                 "ended_at": "INTEGER",
                 "winners_json": "TEXT NOT NULL DEFAULT '[]'",
+                # Entries are wiped 5h after the end, so the count is frozen
+                # when a giveaway ends or is cancelled. NULL for older rows.
+                "entrant_count": "INTEGER",
             },
         )
         self._ensure_columns(
@@ -253,6 +266,19 @@ class Database:
   created_at INTEGER NOT NULL DEFAULT 0,
   updated_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (guild_id, user_id)
+)"""
+        )
+        # Every giveaway a penalty has been held against, per member. Only the
+        # first block on a giveaway spends a unit, and a giveaway listed here
+        # keeps refusing that member while it is still running — even after
+        # the penalty row above is gone. Not touched by the entry-wipe sweep.
+        self.execute(
+            """CREATE TABLE IF NOT EXISTS simple_giveaway_ban_hits (
+  guild_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  giveaway_id TEXT NOT NULL,
+  created_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (guild_id, user_id, giveaway_id)
 )"""
         )
         for stmt in [s.strip() for s in SCHEMA_INDEXES.split(";") if s.strip()]:

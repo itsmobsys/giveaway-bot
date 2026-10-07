@@ -32,3 +32,6 @@ data/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local agent working notes (untracked by design)
+agents.md

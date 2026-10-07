@@ -39,12 +39,17 @@ def cmd_doctor(_: argparse.Namespace) -> int:
             " never lose data — set it (plus TURSO_AUTH_TOKEN) and restart."
         )
     else:
-        if not settings.turso_url.startswith(("libsql://", "https://", "http://", "file:")):
-            notes.append(
-                "TURSO_DATABASE_URL does not start with libsql://, https:// or"
-                " file: — check for a stray space or a copy-paste slip."
+        if settings.turso_url.startswith("file:"):
+            problems.append(
+                "TURSO_DATABASE_URL is a file: URL, which Render wipes on every"
+                " redeploy. Point it at the remote Turso database instead."
             )
-        if not settings.turso_token and not settings.turso_url.startswith("file:"):
+        elif not settings.turso_url.startswith(("libsql://", "https://", "http://")):
+            notes.append(
+                "TURSO_DATABASE_URL does not start with libsql:// or https:// —"
+                " check for a stray space or a copy-paste slip."
+            )
+        if not settings.turso_token:
             notes.append(
                 "TURSO_AUTH_TOKEN is empty; a remote Turso URL needs one."
             )

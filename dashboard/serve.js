@@ -1,11 +1,13 @@
 // Serves public/ and mocks /api/giveaways with sample data, so the page can be
 // opened in a browser before Vercel exists. Run: node serve.js
+import { createHash, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { extname, join } from "node:path";
 
 const PUB = new URL("./public/", import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1");
 const TYPES = { ".html": "text/html", ".js": "text/javascript", ".css": "text/css" };
+const DEV_PASSWORD = process.env.ADMIN_PASSWORD || "local-preview-only";
 
 const now = Date.now();
 const sample = {
@@ -65,7 +67,12 @@ createServer(async (req, res) => {
       res.writeHead(code, { "Content-Type": "application/json" });
       res.end(JSON.stringify(obj));
     };
-    if (body.password !== "duggalbadmoshnahirahalol") return json(401, { error: "Wrong password" });
+    const supplied = createHash("sha256").update(String(body.password ?? "")).digest();
+    const expected = createHash("sha256").update(DEV_PASSWORD).digest();
+    if (!timingSafeEqual(supplied, expected)) {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      return json(401, { error: "Wrong password" });
+    }
     if (body.action === "list") {
       const offset = Number(body.offset) || 0;
       const limit = Number(body.limit) || 25;

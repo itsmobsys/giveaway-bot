@@ -52,8 +52,9 @@ export function placeholders(n) {
  */
 export function card(gw, entrantCount, usernames, now) {
   const winners = Math.max(1, Number(gw.winner_count) || 1);
-  const entrants = Math.max(0, entrantCount);
   const isLive = gw.status === "active";
+  const entrants = Math.max(0, Number(isLive || gw.entrant_count == null
+    ? entrantCount : gw.entrant_count) || 0);
   const endsAt = Number(gw.ends_at) || 0;
   const msRemaining = isLive ? Math.max(0, endsAt - now) : 0;
   const percent = entrants > 0 ? Math.min(100, (winners / entrants) * 100) : 0;
@@ -68,7 +69,7 @@ export function card(gw, entrantCount, usernames, now) {
       winners,
       entrants,
       percent: Math.round(percent * 100) / 100,
-      one_in: entrants > 0 ? Math.round((entrants / winners) * 10) / 10 : null,
+      one_in: entrants > 0 ? Math.max(1, Math.round((entrants / winners) * 10) / 10) : null,
       text:
         entrants > 0
           ? `${winners} winner${winners === 1 ? "" : "s"} / ${entrants} entrant${entrants === 1 ? "" : "s"}`

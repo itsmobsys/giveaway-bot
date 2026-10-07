@@ -37,7 +37,7 @@ Details: [bot/README.md](bot/README.md).
 
 Read-only view over the **same Turso DB** the bot writes. Shows only
 **live + previous** giveaways, 4 fields per card: prize, entrants, win chance, timer.
-No framework, no build step — `public/` is served as-is, `api/` runs as Node 20
+No framework or bundler — `public/` is baked into `api/page.js`; `api/` runs as Node 20
 functions (`framework: null` in `vercel.json` forces the "Other" preset, so
 Vercel never asks for Next.js).
 
@@ -51,8 +51,8 @@ Vercel never asks for Next.js).
 Query params: `guild_id` (optional filter), `previous_limit` (1–10, default 5).
 
 Privacy: usernames only, capped at 100 — **user ids never leave the DB**.
-Entry rows are wiped 5h after end by the bot, so old `entrants.count` decays
-to 0 by design.
+Entry rows are wiped 5h after end by the bot. Finished giveaways keep
+their final `entrants.count`; older rows without a stored count use live entries.
 
 Behaviour notes:
 
@@ -79,12 +79,14 @@ after editing anything in `public/`, run `node build-page.js` (from
 finished giveaways. Live ones can't be deleted there — end them in Discord
 first. It pages through the whole table (the public API only returns the last
 10), with search, status filters, multi-select and bulk delete behind a
-confirm dialog. The password defaults to the one in `api/admin.js` and can be
-overridden with the `ADMIN_PASSWORD` env var; anyone with repo access can see
-it, so it only keeps casual visitors out.
+confirm dialog. Configure `ADMIN_PASSWORD` before deploying; without a nonempty
+value every admin API request returns 503. The local `node serve.js` mock uses
+`ADMIN_PASSWORD` if supplied, otherwise a non-secret preview-only password
+(`local-preview-only`) that is not used by the deployed API.
 
 Deploy: import the repo on Vercel with **Root Directory = `dashboard`**,
-set env vars `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN` (same as the bot), deploy.
+set env vars `TURSO_DATABASE_URL` + `TURSO_AUTH_TOKEN` (same as the bot)
+and a strong, unique `ADMIN_PASSWORD` (required for admin access), then deploy.
 
 ## Quick start
 
@@ -113,6 +115,7 @@ schema, constraints and upserts are exercised without a Turso account.
 | `DISCORD_BOT_TOKEN` | yes | Bot token |
 | `TURSO_DATABASE_URL` | yes | `libsql://...` — the only database |
 | `TURSO_AUTH_TOKEN` | yes | Turso auth token |
+| `ADMIN_PASSWORD` | dashboard admin | Required to enable `/api/admin`; unset/empty disables it (503) |
 | `DISCORD_GIVEAWAY_CHANNEL_ID` | no | Force all giveaways into one channel |
 | `TICK_SECONDS` | no | Embed refresh + due checks (default 30) |
 | `EMBED_COLOR` | no | e.g. `0x7C5CFF`, `#7C5CFF` or `7C5CFF`; masked to 24 bits |

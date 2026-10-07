@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import signal
 
 import discord
 from discord import app_commands
@@ -38,21 +39,28 @@ def _can_manage(member: object) -> bool:
 CONTENT_LIMIT = 2000
 MENTION_CHARS = 23
 
+#: Cap on the per-user fallback messages when the entrants role is missing.
+#: Five messages cover ~400 mentions; beyond that the command would stall for
+#: minutes inside a rate-limited send loop, so it says what it did not cover.
+MAX_MENTION_MESSAGES = 5
 
-def _mention_chunks(ids: list[str], head: str) -> list[str]:
+
+def _split_mentions(ids: list[str], head: str) -> list[tuple[str, int]]:
     """Split mentions into messages that fit Discord's content cap.
 
     The first chunk carries the announcement text, so its budget is smaller.
     Sizing chunks on a fixed 80 mentions ignored that: a 256-character prize
     pushed the first message past 2000, Discord answered 400, and the whole ping
-    was dropped instead of being split.
+    was dropped instead of being split. Returns (message, mentions) pairs so
+    callers can report exactly how many members a capped send reached.
     """
     per = max(1, (CONTENT_LIMIT - len(head) - 1) // MENTION_CHARS)
-    chunks: list[str] = []
+    out: list[tuple[str, int]] = []
     for start in range(0, len(ids), per):
-        block = " ".join(f"<@{uid}>" for uid in ids[start : start + per])
-        chunks.append(f"{head}\n{block}" if start == 0 else block)
-    return chunks
+        block_ids = ids[start : start + per]
+        block = " ".join(f"<@{uid}>" for uid in block_ids)
+        out.append((f"{head}\n{block}" if start == 0 else block, len(block_ids)))
+    return out
 
 
 def _still_in_guild(guild: discord.Guild, user_id: str) -> bool:
@@ -263,7 +271,7 @@ class GiveawayBot(commands.Bot):
         return head + extra
 
     async def _refresh_embed(self, gw: Giveaway) -> None:
-        if not gw.message_id:
+        if not gw.active or not gw.message_id:
             return
         try:
             channel = self.get_channel(int(gw.channel_id))
@@ -613,9 +621,15 @@ class GiveawayBot(commands.Bot):
             await self._safe_followup(interaction, f"⚠️ {exc.message}")
             if exc.kind == TIMEOUT_BAN_KIND:
                 # The gate dropped the entry they already had, so the entrants
-                # role it earned has to go too — otherwise a blocked member
-                # keeps the ping-everyone role until the giveaway ends.
-                await self._take_entrants_role(gw, uid)
+                # role it earned has to go too — in every active giveaway
+                # whose entries the service dropped, not just this one.
+                try:
+                    active = await asyncio.to_thread(self.service.list_active, gw.guild_id)
+                except Exception:
+                    log.exception("timeout role lookup failed for %s", uid)
+                else:
+                    for live in active:
+                        await self._take_entrants_role(live, uid)
             return
         except Exception:
             log.exception("join failed for %s", giveaway_id)
@@ -680,6 +694,10 @@ class GiveawayBot(commands.Bot):
             return
         pages = max(1, (len(entrants) + 9) // 10)
         color = self.settings.embed_color
+        # The panel is a bounded window, not the whole table: say so when the
+        # giveaway is bigger than the window, or the header total looks like a
+        # lie next to a pager that stops early.
+        windowed = len(entrants) if total > len(entrants) else None
 
         def render(page: int) -> discord.Embed:
             start = page * 10
@@ -692,6 +710,7 @@ class GiveawayBot(commands.Bot):
                 mine=mine,
                 winner_count=gw.winner_count,
                 color=color,
+                shown=windowed,
             )
 
         view = ParticipantsPages(render=render, pages=pages)
@@ -748,8 +767,14 @@ class GiveawayBot(commands.Bot):
             except Exception:
                 log.exception("end failed for %s", gw.id)
                 continue
-            await self._announce(ended, winners)
-            await self._strip_entrants_role(ended)
+            try:
+                await self._announce(ended, winners)
+            except Exception:
+                log.exception("announcement failed for %s", gw.id)
+            try:
+                await self._strip_entrants_role(ended)
+            except Exception:
+                log.exception("role strip failed for %s", gw.id)
         # Live timer: re-render active embeds every tick so the countdown
         # visibly ticks down. The soonest deadlines always get a slot; the rest
         # rotate, so no running giveaway is left showing a stale count.
@@ -774,6 +799,12 @@ class GiveawayBot(commands.Bot):
             else:
                 if wiped:
                     log.info("wiped %d stale entry row(s)", wiped)
+
+    @tick.error
+    async def _tick_error(self, error: Exception) -> None:
+        log.error("tick loop crashed; restarting", exc_info=error)
+        if not self.is_closed():
+            self.tick.restart()
 
     @tick.before_loop
     async def _before_tick(self) -> None:
@@ -810,7 +841,9 @@ class GiveawayBot(commands.Bot):
     async def _before_heartbeat(self) -> None:
         await self.wait_until_ready()
 
-    async def _announce(self, gw: Giveaway, winners: list[str]) -> None:
+    async def _announce(
+        self, gw: Giveaway, winners: list[str], *, reroll: bool = False
+    ) -> None:
         """Winner celebration. Runs BEFORE the entrants role is stripped so the
         role mention below still reaches everyone who joined."""
         try:
@@ -824,6 +857,8 @@ class GiveawayBot(commands.Bot):
         except Exception:
             entries = 0
         embed = embeds.winner_embed(gw, winners, entries, self.settings.embed_color)
+        if reroll:
+            embed.title = "Giveaway Rerolled"
         parts: list[str] = []
         if winners:
             parts.append("🎉 " + " ".join(f"<@{w}>" for w in winners))
@@ -836,18 +871,20 @@ class GiveawayBot(commands.Bot):
         elif not winners:
             parts.append("No valid entries — no winners this time.")
         content = "\n".join(parts) or None
-        mentions = discord.AllowedMentions(users=True, roles=True)
+        mentions = discord.AllowedMentions(everyone=False, users=True, roles=True)
         try:
-            if gw.message_id:
+            if gw.message_id and not reroll:
                 try:
                     msg = await channel.fetch_message(int(gw.message_id))
                     await msg.edit(embed=embed, view=None)
+                except discord.HTTPException:
+                    pass
+                else:
+                    # An unsuccessful reply must not send a second winner embed.
                     if content:
                         await msg.reply(content, allowed_mentions=mentions)
                     return
-                except discord.HTTPException:
-                    pass
-            await channel.send(embed=embed, content=content)
+            await channel.send(embed=embed, content=content, allowed_mentions=mentions)
         except discord.HTTPException:
             log.warning("announce failed for %s", gw.id)
 
@@ -997,7 +1034,7 @@ def wire_commands(bot: GiveawayBot) -> None:
                 content=create_content,
                 embed=embeds.giveaway_embed(gw, 0, bot.settings.embed_color),
                 view=GiveawayView(gw.id, bot.settings.dashboard_url),
-                allowed_mentions=discord.AllowedMentions(roles=True),
+                allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True),
             )
         except (discord.Forbidden, discord.HTTPException) as exc:
             # The row already exists. Leaving it would run a giveaway nobody can
@@ -1011,7 +1048,12 @@ def wire_commands(bot: GiveawayBot) -> None:
                 " there (or set the DISCORD_GIVEAWAY_CHANNEL_ID env var) and try again.",
             )
             return
-        await asyncio.to_thread(svc.set_message, gw.id, str(msg.id))
+        message_note = ""
+        try:
+            await asyncio.to_thread(svc.set_message, gw.id, str(msg.id))
+        except Exception:
+            log.exception("could not save message id for giveaway %s", gw.id)
+            message_note = " (message tracking could not be saved)"
         role_note = ""
         if interaction.guild is not None:
             try:
@@ -1020,11 +1062,17 @@ def wire_commands(bot: GiveawayBot) -> None:
                     mentionable=True,
                     reason=f"Entrants role for giveaway {gw.id}",
                 )
-                await asyncio.to_thread(svc.set_entrants_role, gw.id, str(role.id))
+                try:
+                    await asyncio.to_thread(svc.set_entrants_role, gw.id, str(role.id))
+                except Exception:
+                    role_note = " (entrants role could not be saved)"
+                    log.exception("could not save entrants role for giveaway %s", gw.id)
             except (discord.Forbidden, discord.HTTPException):
                 role_note = " (no entrants role — I need **Manage Roles**)"
                 log.warning("could not create entrants role in %s", interaction.guild.id)
-        await bot._safe_followup(interaction, f"✅ Giveaway started: {msg.jump_url}{role_note}")
+        await bot._safe_followup(
+            interaction, f"✅ Giveaway started: {msg.jump_url}{message_note}{role_note}"
+        )
 
     @bot.tree.command(name="giveaway_end", description="End a giveaway now and draw")
     @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
@@ -1066,7 +1114,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
-        await bot._announce(ended, fresh)
+        await bot._announce(ended, fresh, reroll=True)
         await bot._safe_followup(interaction, "🔁 Rerolled.")
 
     @bot.tree.command(name="giveaway_cancel", description="Cancel an active giveaway")
@@ -1091,11 +1139,24 @@ def wire_commands(bot: GiveawayBot) -> None:
         # longer than the 3 seconds Discord allows for the first response, and
         # the old order made a successful cancel look like a broken command.
         await bot._safe_followup(interaction, f"🚫 Cancelled **{ended.prize}**.")
-        await bot._strip_entrants_role(ended)
         try:
             channel = bot.get_channel(int(ended.channel_id))
         except (TypeError, ValueError):
             channel = None
+        if isinstance(channel, discord.TextChannel) and ended.message_id:
+            cancelled = discord.Embed(
+                title="Giveaway Cancelled",
+                description=f"🚫 **{ended.prize}** — this giveaway was cancelled.",
+                colour=bot.settings.embed_color,
+            )
+            cancelled.set_footer(text=f"ID: {ended.id}")
+            try:
+                await channel.get_partial_message(int(ended.message_id)).edit(
+                    embed=cancelled, view=None
+                )
+            except (discord.HTTPException, TypeError, ValueError):
+                log.warning("could not close cancelled giveaway message %s", ended.id)
+        await bot._strip_entrants_role(ended)
         if isinstance(channel, discord.TextChannel):
             notify = await bot._notify_mention(str(interaction.guild.id))
             text = f"🚫 Giveaway **{ended.prize}** was cancelled."
@@ -1103,7 +1164,10 @@ def wire_commands(bot: GiveawayBot) -> None:
                 text += f" {notify}"
             try:
                 await channel.send(
-                    text, allowed_mentions=discord.AllowedMentions(roles=True)
+                    text,
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=False, users=False, roles=True
+                    ),
                 )
             except (discord.Forbidden, discord.HTTPException):
                 pass
@@ -1157,13 +1221,26 @@ def wire_commands(bot: GiveawayBot) -> None:
             if role is not None:
                 await channel.send(
                     f"{notice}\n{role.mention}",
-                    allowed_mentions=discord.AllowedMentions(roles=True),
+                    allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True),
                 )
             else:
                 ids = [str(row["user_id"]) for row in entrants]
-                for chunk in _mention_chunks(ids, notice):
+                pairs = _split_mentions(ids, notice)
+                capped = pairs[:MAX_MENTION_MESSAGES]
+                for chunk, _ in capped:
                     await channel.send(
-                        chunk, allowed_mentions=discord.AllowedMentions(users=True)
+                        chunk,
+                        allowed_mentions=discord.AllowedMentions(
+                            everyone=False, users=True, roles=False
+                        ),
+                    )
+                if len(pairs) > len(capped):
+                    reached = sum(n for _, n in capped)
+                    await bot._safe_followup(
+                        interaction,
+                        f"⏳ Extended, but only {reached}"
+                        f" of {len(ids)} entrants could be pinged — recreate the"
+                        " entrants role (delete it and re-run the command) to ping the rest.",
                     )
         except (discord.Forbidden, discord.HTTPException) as exc:
             log.warning("extend notice failed for %s (%s)", fresh.id, exc)
@@ -1329,25 +1406,40 @@ def wire_commands(bot: GiveawayBot) -> None:
         if not isinstance(channel, discord.TextChannel):
             await bot._safe_followup(interaction, "Run this in a text channel.")
             return
+        pairs: list[tuple[str, int]] = []
         try:
             if role is not None:
                 await channel.send(
                     f"{body}\n{role.mention}",
-                    allowed_mentions=discord.AllowedMentions(roles=True),
+                    allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True),
                 )
             else:
                 ids = [str(row["user_id"]) for row in entrants]
-                for chunk in _mention_chunks(ids, body):
+                pairs = _split_mentions(ids, body)
+                sent = 0
+                for chunk, n in pairs[:MAX_MENTION_MESSAGES]:
                     await channel.send(
-                        chunk, allowed_mentions=discord.AllowedMentions(users=True)
+                        chunk,
+                        allowed_mentions=discord.AllowedMentions(
+                            everyone=False, users=True, roles=False
+                        ),
                     )
+                    sent += n
         except (discord.Forbidden, discord.HTTPException) as exc:
             log.warning("ping failed for %s (%s)", gw.id, exc)
             await bot._safe_followup(interaction, "⚠️ I cannot send messages there.")
             return
-        await bot._safe_followup(
-            interaction, f"📢 Pinged {len(entrants)} entrant(s)."
-        )
+        if role is None and len(pairs) > MAX_MENTION_MESSAGES:
+            await bot._safe_followup(
+                interaction,
+                f"📢 Pinged {sent} of {len(entrants)} entrant(s) — capped at"
+                f" {MAX_MENTION_MESSAGES} messages without an entrants role."
+                " Re-run once the role exists to reach the rest.",
+            )
+        else:
+            await bot._safe_followup(
+                interaction, f"📢 Pinged {len(entrants)} entrant(s)."
+            )
 
     @bot.tree.command(name="giveaway_blacklist_add", description="Block a user from all giveaways")
     @app_commands.describe(user="The member to block")
@@ -1417,6 +1509,10 @@ def wire_commands(bot: GiveawayBot) -> None:
             await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
             return
         try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        try:
             ids = await asyncio.to_thread(
                 svc.blacklist_list, str(interaction.guild.id)
             )
@@ -1425,14 +1521,12 @@ def wire_commands(bot: GiveawayBot) -> None:
             )
         except Exception:
             log.exception("blacklist list failed")
-            await interaction.response.send_message(
-                "⚠️ Could not load the blacklist. Try again.", ephemeral=True
+            await bot._safe_followup(
+                interaction, "⚠️ Could not load the blacklist. Try again."
             )
             return
         if not ids:
-            await interaction.response.send_message(
-                "Blacklist is empty — nobody is blocked.", ephemeral=True
-            )
+            await bot._safe_followup(interaction, "Blacklist is empty — nobody is blocked.")
             return
         # A mention is 21 characters and Discord rejects a message over 2000,
         # so the body stops at 80 — the same chunk size /giveaway_ping uses —
@@ -1440,9 +1534,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         shown = ids[:80]
         lines = "\n".join(f"<@{uid}>" for uid in shown)
         extra = f"\n…plus {total - len(shown)} more." if total > len(shown) else ""
-        await interaction.response.send_message(
-            f"🚫 **Blocked ({total}):**\n{lines}{extra}", ephemeral=True
-        )
+        await bot._safe_followup(interaction, f"🚫 **Blocked ({total}):**\n{lines}{extra}")
 
     @bot.tree.command(
         name="giveaway_timeout_bans",
@@ -1519,8 +1611,24 @@ async def amain(settings: Settings) -> None:
     db.init_schema()
     bot = GiveawayBot(settings, db)
     wire_commands(bot)
-    async with bot:
-        await bot.start(settings.bot_token)
+    loop = asyncio.get_running_loop()
+    shutdown_task: asyncio.Task | None = None
+
+    def shutdown() -> None:
+        nonlocal shutdown_task
+        if shutdown_task is None:
+            shutdown_task = asyncio.create_task(bot.close())
+
+    try:
+        loop.add_signal_handler(signal.SIGTERM, shutdown)
+    except NotImplementedError:  # Windows event loops do not support add_signal_handler.
+        signal.signal(signal.SIGTERM, lambda *_: loop.call_soon_threadsafe(shutdown))
+    try:
+        async with bot:
+            await bot.start(settings.bot_token)
+    finally:
+        if shutdown_task is not None:
+            await shutdown_task
 
 
 def run_forever(settings: Settings) -> None:

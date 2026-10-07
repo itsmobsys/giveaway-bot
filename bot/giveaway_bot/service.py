@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
 
-from .db import Database
+from .db import Database, _is_ambiguous_loss
+
+log = logging.getLogger("giveaway_bot.service")
 
 DAY = 86_400_000
 
@@ -379,6 +382,11 @@ class GiveawayService:
         applied = 0
         for start in range(0, len(rows), self.MESSAGE_FLUSH_CHUNK):
             chunk = rows[start : start + self.MESSAGE_FLUSH_CHUNK]
+            # Snapshot first: if this chunk later fails ambiguously (a mid-write
+            # "connection reset" db.execute will not replay), the snapshot
+            # lets the retry requeue only what is still missing instead of the
+            # whole chunk. One extra read per chunk, not per key.
+            before = self._read_counts(chunk)
             values = ", ".join("(?, ?, ?)" for _ in chunk)
             params: list[Any] = []
             for guild_id, user_id, count in chunk:
@@ -393,9 +401,75 @@ class GiveawayService:
                     params,
                 )
             except Exception as exc:
+                if _is_ambiguous_loss(str(exc).lower()):
+                    # The write may have landed before the response was lost.
+                    # applied counts whole chunks and the caller requeues
+                    # rows[applied:], so the reconciled shortfall replaces the
+                    # chunk in place (padded with zero-deltas to keep the list
+                    # length stable) and the retry adds each key once.
+                    short = self._reconcile_chunk(chunk, before)
+                    filler = [(g, u, 0) for g, u, _ in chunk[len(short):]]
+                    rows[start : start + len(chunk)] = short + filler
                 raise PartialFlush(applied, exc) from exc
             applied += len(chunk)
         return applied
+
+    def _read_counts(
+        self, chunk: list[tuple[str, str, int]]
+    ) -> dict[tuple[str, str], int]:
+        """Stored count per key before a flush chunk runs.
+
+        Static per-key reads (no interpolated SQL): this runs once per chunk,
+        and only its result matters when the chunk later fails ambiguously.
+        Keys that cannot be read are left out — _reconcile_chunk requeues
+        those whole rather than risking silent loss.
+        """
+        out: dict[tuple[str, str], int] = {}
+        for guild_id, user_id, _ in chunk:
+            try:
+                row = self.db.query_one(
+                    "SELECT count AS n FROM simple_message_counts"
+                    " WHERE guild_id = ? AND user_id = ?",
+                    (guild_id, user_id),
+                )
+            except Exception:
+                log.warning("flush snapshot read failed for %s/%s", guild_id, user_id)
+                continue
+            out[(guild_id, user_id)] = int((row or {}).get("n") or 0)
+        return out
+
+    def _reconcile_chunk(
+        self, chunk: list[tuple[str, str, int]], before: dict[tuple[str, str], int]
+    ) -> list[tuple[str, str, int]]:
+        """Shortfall per key after an ambiguous chunk failure.
+
+        `before` holds each key's count read just before the chunk ran. Whatever
+        is already reflected in the table is not requeued, so retrying the flush
+        cannot double-add the failed chunk. Keys that cannot be re-read are
+        requeued whole: over-counting beats silently losing messages.
+        """
+        shortfall: list[tuple[str, str, int]] = []
+        for guild_id, user_id, delta in chunk:
+            try:
+                row = self.db.query_one(
+                    "SELECT count AS n FROM simple_message_counts"
+                    " WHERE guild_id = ? AND user_id = ?",
+                    (guild_id, user_id),
+                )
+            except Exception:
+                shortfall.append((guild_id, user_id, delta))
+                continue
+            stored = int((row or {}).get("n") or 0)
+            if (guild_id, user_id) not in before:
+                # No snapshot for this key (the pre-read failed): the stored
+                # value cannot be compared, so requeue the whole delta rather
+                # than risk silently losing messages.
+                shortfall.append((guild_id, user_id, delta))
+                continue
+            missing = before[(guild_id, user_id)] + delta - stored
+            if missing > 0:
+                shortfall.append((guild_id, user_id, missing))
+        return shortfall
 
     def join(
         self,
@@ -428,7 +502,10 @@ class GiveawayService:
             )
         except Exception as exc:
             msg = str(exc).upper()
-            if "UNIQUE" in msg or "PRIMARY" in msg or "CONSTRAINT" in msg:
+            # Only the duplicate-entry constraint means "already entered". Any
+            # other constraint failure (NOT NULL, CHECK, ...) is a real bug and
+            # must surface instead of being reported as a harmless duplicate.
+            if "UNIQUE" in msg or "PRIMARY" in msg:
                 raise ServiceError("You are already entered.") from None
             raise
         try:
@@ -443,8 +520,16 @@ class GiveawayService:
         return self.entry_count(gw.id)
 
     def leave(self, giveaway_id: str, user_id: str) -> bool:
+        """Drop this member's entry. Only while the giveaway is running.
+
+        Leaving an ended giveaway would rewrite who took part after the draw (and
+        a cancelled one keeps its entries on purpose), so it reads as "not
+        entered" there: the caller already reports False that way.
+        """
         cur = self.db.execute(
-            "DELETE FROM simple_entries WHERE giveaway_id = ? AND user_id = ?", (giveaway_id, user_id)
+            "DELETE FROM simple_entries WHERE giveaway_id = ? AND user_id = ? AND EXISTS ("
+            " SELECT 1 FROM simple_giveaways WHERE id = ? AND status = 'active')",
+            (giveaway_id, user_id, giveaway_id),
         )
         try:
             return (cur.rowcount or 0) > 0
@@ -468,34 +553,38 @@ class GiveawayService:
     def end(self, giveaway_id: str) -> tuple[Giveaway, list[str]]:
         """End a running giveaway and draw its winners.
 
-        The status flip is the gate, and it happens before the draw with
-        "status = 'active'" in the WHERE clause: the auto-draw tick and
-        /giveaway_end can fire in the same second, and without a claim both would
-        sample their own winners and announce different names. Whoever loses the
-        claim is told the giveaway is already over, like cancel().
+        The draw happens first, then one UPDATE writes status, ended_at, the
+        winners and the entrant count together, with "status = 'active'" in the
+        WHERE clause as the claim: the auto-draw tick and /giveaway_end can fire
+        in the same second, and only one of them may store (and announce) its
+        draw. Whoever loses the claim is told the giveaway is already over. One
+        statement also means a failure can no longer strand a giveaway as
+        'ended' with no winners and no announcement.
         """
         gw = self.get(giveaway_id)
         if not gw.active:
             raise ServiceError("This giveaway has already ended.")
+        pool = [str(row["user_id"]) for row in self.entries(gw.id)]
+        winners = self._rand.sample(pool, min(gw.winner_count, len(pool))) if pool else []
         cur = self.db.execute(
-            "UPDATE simple_giveaways SET status = 'ended', ended_at = ?"
-            " WHERE id = ? AND status = 'active'",
-            (now_ms(), gw.id),
+            "UPDATE simple_giveaways SET status = 'ended', ended_at = ?, winners_json = ?,"
+            " entrant_count = ? WHERE id = ? AND status = 'active'",
+            (now_ms(), json.dumps(winners), len(pool), gw.id),
         )
         if not _changed(cur):
             raise ServiceError("This giveaway has already ended.")
-        winners = self._pick(gw.id, gw.winner_count)
-        self.db.execute(
-            "UPDATE simple_giveaways SET winners_json = ? WHERE id = ?",
-            (json.dumps(winners), gw.id),
-        )
         # Fresh grind for the next giveaway *in this server*: message counts go
         # back to zero here, so the next min-messages requirement measures
         # activity after this giveaway rather than lifetime activity. Scoped by
         # guild — wiping the whole table would silently zero every other
-        # server's counts and disable their min-messages requirement.
+        # server's counts — and skipped while another running giveaway here
+        # still has a min-messages requirement, which would otherwise be reset
+        # under the members already grinding for it.
         self.db.execute(
-            "DELETE FROM simple_message_counts WHERE guild_id = ?", (gw.guild_id,)
+            "DELETE FROM simple_message_counts WHERE guild_id = ? AND NOT EXISTS ("
+            " SELECT 1 FROM simple_giveaways WHERE guild_id = ? AND status = 'active'"
+            " AND min_messages > 0)",
+            (gw.guild_id, gw.guild_id),
         )
         return self.get(gw.id), winners
 
@@ -519,8 +608,10 @@ class GiveawayService:
             )
         wanted = max(1, min(int(count or gw.winner_count), room))
         fresh = self._pick(gw.id, wanted, exclude=prev)
-        if not fresh:  # not enough fresh entrants left; draw from everyone
-            fresh = self._pick(gw.id, wanted)
+        if not fresh:
+            # Redrawing from everyone would announce earlier winners as new
+            # ones (or nobody at all once the entries were wiped): say so.
+            raise ServiceError("No other entrants left to reroll")
         combined = prev + [w for w in fresh if w not in prev]
         self.db.execute(
             "UPDATE simple_giveaways SET winners_json = ? WHERE id = ?", (json.dumps(combined), gw.id)
@@ -541,10 +632,16 @@ class GiveawayService:
         gw = self.get(giveaway_id)
         if not gw.active:
             raise ServiceError("Only an active giveaway can be cancelled.")
-        self.db.execute(
-            "UPDATE simple_giveaways SET status = 'cancelled', ended_at = ? WHERE id = ?",
-            (now_ms(), gw.id),
+        # Guarded like end(): an end() or a second cancel landing between the
+        # read above and this write must not be overwritten.
+        cur = self.db.execute(
+            "UPDATE simple_giveaways SET status = 'cancelled', ended_at = ?,"
+            " entrant_count = (SELECT COUNT(*) FROM simple_entries WHERE giveaway_id = ?)"
+            " WHERE id = ? AND status = 'active'",
+            (now_ms(), gw.id, gw.id),
         )
+        if not _changed(cur):
+            raise ServiceError("Only an active giveaway can be cancelled.")
         return self.get(gw.id)
 
     def set_message(self, giveaway_id: str, message_id: str) -> None:
@@ -559,10 +656,12 @@ class GiveawayService:
             raise ServiceError("Only a running giveaway can be extended.")
         if extra_seconds < 60 or extra_seconds > 60 * 86400:
             raise ServiceError("Extend by 1 minute to 60 days at a time.")
-        self.db.execute(
-            "UPDATE simple_giveaways SET ends_at = ends_at + ? WHERE id = ?",
+        cur = self.db.execute(
+            "UPDATE simple_giveaways SET ends_at = ends_at + ? WHERE id = ? AND status = 'active'",
             (extra_seconds * 1000, gw.id),
         )
+        if not _changed(cur):
+            raise ServiceError("Only a running giveaway can be extended.")
         return self.get(gw.id)
 
     def set_entrants_role(self, giveaway_id: str, role_id: str | None) -> None:
@@ -699,6 +798,17 @@ class GiveawayService:
         """
         count = max(1, int(giveaways))
         ts = now_ms()
+        # Hits from giveaways that are over can never refuse anyone again, so
+        # each new penalty starts by dropping this member's stale ones.
+        self.db.execute(
+            "DELETE FROM simple_giveaway_ban_hits WHERE guild_id = ? AND user_id = ?"
+            " AND giveaway_id NOT IN (SELECT id FROM simple_giveaways WHERE status = 'active')",
+            (guild_id, user_id),
+        )
+        if giveaway_id:
+            # The trigger giveaway is recorded but never spends a unit, which is
+            # what keeps hammering its Join button from burning the penalty.
+            self._record_ban_hit(guild_id, user_id, giveaway_id)
         self.db.execute(
             "INSERT INTO simple_giveaway_bans"
             " (guild_id, user_id, giveaways_remaining, last_blocked_giveaway_id, created_at, updated_at)"
@@ -711,20 +821,49 @@ class GiveawayService:
         )
         return self.timeout_ban_remaining(guild_id, user_id)
 
+    def _record_ban_hit(self, guild_id: str, user_id: str, giveaway_id: str) -> bool:
+        """Remember a giveaway this member was blocked from. True when new.
+
+        The primary key makes it idempotent, and rowcount says whether this
+        call was the one that inserted it: that is the "count once" test, safe
+        against two clicks racing each other.
+        """
+        cur = self.db.execute(
+            "INSERT OR IGNORE INTO simple_giveaway_ban_hits (guild_id, user_id, giveaway_id, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (guild_id, user_id, giveaway_id, now_ms()),
+        )
+        return _changed(cur)
+
+    def _was_blocked_from(self, guild_id: str, user_id: str, giveaway_id: str) -> bool:
+        return (
+            self.db.query_one(
+                "SELECT 1 AS one FROM simple_giveaway_ban_hits"
+                " WHERE guild_id = ? AND user_id = ? AND giveaway_id = ?",
+                (guild_id, user_id, giveaway_id),
+            )
+            is not None
+        )
+
     def consume_timeout_ban(self, guild_id: str, user_id: str, giveaway_id: str) -> int:
         """Spend one giveaway of the penalty. Returns what is left (0 = lifted).
 
-        Guarded on the giveaway id so a repeated click counts once, and the row
-        is deleted as soon as the counter reaches zero: the restriction ends
-        with the last blocked giveaway, and no sweeper has to expire it later.
+        Every giveaway already held against this member is remembered (not just
+        the last one), so only a giveaway never seen before spends a unit:
+        alternating A, B, A cannot burn the penalty down. The penalty row is
+        deleted as soon as the counter reaches zero; the remembered giveaways
+        stay, so the ones they sat out keep refusing them while still running.
         """
-        self.db.execute(
-            "UPDATE simple_giveaway_bans SET giveaways_remaining = giveaways_remaining - 1,"
-            " last_blocked_giveaway_id = ?, updated_at = ?"
-            " WHERE guild_id = ? AND user_id = ? AND giveaways_remaining > 0"
-            " AND (last_blocked_giveaway_id IS NULL OR last_blocked_giveaway_id != ?)",
-            (giveaway_id, now_ms(), guild_id, user_id, giveaway_id),
-        )
+        if self._record_ban_hit(guild_id, user_id, giveaway_id):
+            # last_blocked_giveaway_id is still honoured for rows written before
+            # the hits table existed, whose trigger giveaway has no hit row.
+            self.db.execute(
+                "UPDATE simple_giveaway_bans SET giveaways_remaining = giveaways_remaining - 1,"
+                " last_blocked_giveaway_id = ?, updated_at = ?"
+                " WHERE guild_id = ? AND user_id = ? AND giveaways_remaining > 0"
+                " AND (last_blocked_giveaway_id IS NULL OR last_blocked_giveaway_id != ?)",
+                (giveaway_id, now_ms(), guild_id, user_id, giveaway_id),
+            )
         left = self.timeout_ban_remaining(guild_id, user_id)
         if left > 0:
             return left
@@ -797,6 +936,14 @@ class GiveawayService:
             return
         left = self.timeout_ban_remaining(gw.guild_id, user_id)
         if left <= 0 and not timed_out:
+            # The penalty is over, but a giveaway it was served on is still one
+            # they sat out: rejoining it (say, the one that spent the last unit)
+            # would hand the penalty straight back.
+            if self._was_blocked_from(gw.guild_id, user_id, gw.id):
+                raise ServiceError(
+                    "You sat out this giveaway as part of your timed-out penalty.",
+                    kind=TIMEOUT_BAN_KIND,
+                )
             return
         # Blocked, so they must not be in a giveaway at all: entries made before
         # Discord timed them out (or before the penalty started) are dropped from

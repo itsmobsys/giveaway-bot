@@ -1,5 +1,5 @@
 /* Admin panel: password gate, then a paged/filterable list of finished
-   giveaways with single + bulk delete. No framework, no build step. */
+   giveaways with single + bulk delete. No framework, no client build tooling. */
 import { ago, esc } from "./format.js";
 
 const $ = (id) => document.getElementById(id);
@@ -18,6 +18,7 @@ const state = {
   query: "",
   selected: new Set(),
   busy: false,
+  pending: false,
 };
 
 const ICON_TRASH =
@@ -34,7 +35,7 @@ async function api(body) {
     body: JSON.stringify({ password, ...body }),
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+  if (!res.ok) throw new Error(data.error || data.failed?.[0]?.error || `Request failed (${res.status})`);
   return data;
 }
 
@@ -53,7 +54,7 @@ function toast(message, kind = "ok") {
     kind === "ok"
       ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>'
       : ICON_TRASH;
-  box.append(esc(message));
+  box.append(message);
   box.hidden = false;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
@@ -110,7 +111,10 @@ function showPanel() {
 /* -- data -- */
 
 async function load() {
-  if (state.busy) return;
+  if (state.busy) {
+    state.pending = true;
+    return;
+  }
   state.busy = true;
   $("err").hidden = true;
   setStatus("Syncing", "loading");
@@ -119,6 +123,14 @@ async function load() {
     state.items = data.previous || [];
     state.total = Number(data.total) || 0;
     state.live = Number(data.live) || 0;
+    if (!state.items.length && state.offset > 0) {
+      const lastPage = state.total ? Math.floor((state.total - 1) / PAGE) * PAGE : 0;
+      if (lastPage !== state.offset) {
+        state.offset = lastPage;
+        state.pending = true;
+        return;
+      }
+    }
     // Anything selected may have just been deleted server-side.
     const present = new Set(state.items.map((g) => g.id));
     for (const id of [...state.selected]) if (!present.has(id)) state.selected.delete(id);
@@ -129,6 +141,10 @@ async function load() {
     showError(err);
   } finally {
     state.busy = false;
+    if (state.pending) {
+      state.pending = false;
+      void load();
+    }
   }
 }
 
@@ -239,13 +255,14 @@ async function deleteIds(ids) {
     const data = await api({ action: "delete", ids });
     ids.forEach((id) => state.selected.delete(id));
     const failed = data.failed || [];
-    if (failed.length) toast(`${data.deleted} deleted · ${failed.length} failed`, "bad");
+    if (failed.length) toast(`${data.deleted} deleted · ${failed.length} failed: ${failed[0].error}`, "bad");
     else toast(`${data.deleted} giveaway${data.deleted === 1 ? "" : "s"} deleted`);
-    await load();
   } catch (err) {
     rows.forEach((r) => r.classList.remove("going"));
     showError(err);
     toast(err.message, "bad");
+  } finally {
+    await load();
   }
 }
 
@@ -275,11 +292,11 @@ $("login").addEventListener("submit", async (e) => {
     showPanel();
     setStatus("Online", "ok");
     await load();
-  } catch {
+  } catch (err) {
     password = "";
     sessionStorage.removeItem(KEY);
     const box = $("login-err");
-    box.textContent = "Wrong password.";
+    box.textContent = err.message;
     box.hidden = false;
     showLogin();
   } finally {

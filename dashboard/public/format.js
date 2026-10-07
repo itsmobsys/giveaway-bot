@@ -74,7 +74,7 @@ export function cardHTML(g, now) {
     ? `<img class="card-img" src="${esc(g.image_url)}" alt="" width="570" height="148" loading="lazy" decoding="async" />`
     : "";
 
-  const clockText = live ? fmtDuration(Number(g.timer?.ms_remaining) || 0) : ago(now - (endedAt || now));
+  const clockText = live ? fmtDuration(Number(g.timer?.ms_remaining) || 0) : endedAt ? ago(now - endedAt) : "—";
   const timeLabel = stamp
     ? `<span class="sr-only">${live ? "Ends" : "Finished"}
          <time datetime="${new Date(stamp).toISOString()}">${new Date(stamp).toLocaleString()}</time></span>`

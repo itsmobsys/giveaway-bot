@@ -3,7 +3,8 @@ import { card, cors, db, placeholders, send } from "./_lib/turso.js";
 /** How many usernames one card may show (privacy + payload size). */
 const NAME_LIMIT = 100;
 
-const CARD_COLUMNS = `id, guild_id, prize, winner_count, ends_at, ended_at, status,
+const CARD_COLUMNS = `id, guild_id, prize, winner_count, ends_at,
+         COALESCE(ended_at, created_at) AS ended_at, entrant_count, status,
          image_url, host_name`;
 
 const LIVE_SQL = `
@@ -16,7 +17,7 @@ const PREV_SQL = `
   SELECT ${CARD_COLUMNS}
   FROM simple_giveaways
   WHERE status != 'active' AND ($guild = '' OR guild_id = $guild)
-  ORDER BY ended_at DESC LIMIT $limit`;
+  ORDER BY COALESCE(ended_at, created_at) DESC, id DESC LIMIT $limit`;
 
 const ONE_SQL = `
   SELECT ${CARD_COLUMNS}
@@ -73,10 +74,17 @@ export default async function handler(req, res) {
   const now = Date.now();
   try {
     const q = req.query || {};
-    const guild = String(q.guild_id || q.guildId || "");
+    const guild = q.guild_id ?? q.guildId ?? "";
+    if (typeof guild !== "string" || (guild && !/^\d{1,20}$/.test(guild))) {
+      return send(res, 400, { error: "Invalid guild_id" }, "no-store");
+    }
     // Single-card detail for deep links: /api/giveaways?id=gw_xxx
-    if (q.id) {
-      const rs = await db().execute({ sql: ONE_SQL, args: [String(q.id)] });
+    if (q.id !== undefined) {
+      const id = q.id;
+      if (typeof id !== "string" || !/^gw_[A-Za-z0-9_-]+$/.test(id)) {
+        return send(res, 400, { error: "Invalid giveaway id" }, "no-store");
+      }
+      const rs = await db().execute({ sql: ONE_SQL, args: [id] });
       const gw = rs.rows?.[0];
       if (!gw) return send(res, 404, { error: "Giveaway not found" }, "no-store");
       const hydrated = await hydrateMany([gw.id]);
@@ -101,6 +109,7 @@ export default async function handler(req, res) {
       previous: cards.filter((c) => c.status !== "active"),
     });
   } catch (err) {
-    return send(res, err.statusCode || 500, { error: err.message || "DB error" }, "no-store");
+    console.error("Giveaways API error:", err);
+    return send(res, 500, { error: "Internal server error" }, "no-store");
   }
 }

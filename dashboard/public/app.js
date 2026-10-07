@@ -45,7 +45,7 @@ async function load(first = false) {
     const res = await fetch("/api/giveaways", { headers: { Accept: "application/json" } });
     if (!res.ok) throw new Error(`API ${res.status}`);
     const data = await res.json();
-    clockSkew = (data.now ?? Date.now()) - Date.now();
+    clockSkew = (data.now ?? Date.now()) + Number(res.headers.get("Age") || 0) * 1000 - Date.now();
 
     render("live-grid", data.live ?? [], "live-empty");
     render("prev-grid", data.previous ?? [], "prev-empty");

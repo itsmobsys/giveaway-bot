@@ -33,7 +33,7 @@ const CACHE = {
   "admin.js": "public, s-maxage=86400, immutable",
   "format.js": "public, s-maxage=86400, immutable",
 };
-// Only these 4 names are ever servable — anything else 404s.
+// Only the six baked public assets are servable — anything else 404s.
 const BY_PATH = {
   "/": "index.html",
   "/index.html": "index.html",
