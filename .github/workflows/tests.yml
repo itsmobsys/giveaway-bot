@@ -1,0 +1,46 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  bot:
+    name: bot tests + lint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bot
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: bot/pyproject.toml
+      - name: Install bot dependencies
+        run: pip install -e ".[turso,dev]"
+      - name: Run bot test suite
+        run: python -m unittest discover -s tests -t .
+      - name: Run ruff
+        run: python -m ruff check .
+
+  dashboard:
+    name: dashboard smoke
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - name: Install dashboard dependencies
+        run: npm ci
+      - name: Check baked page bundle is fresh
+        run: node build-page.js && git diff --exit-code -- api/page.js
+      - name: Run dashboard smoke test
+        run: node smoke.js
