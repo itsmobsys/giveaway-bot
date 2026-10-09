@@ -80,10 +80,16 @@ class Giveaway:
     host_id: str | None
     host_name: str | None
     winners: list[str]
+    #: Optional winner-claim window in seconds. 0 = disabled (legacy default).
+    claim_timeout_seconds: int = 0
 
     @property
     def active(self) -> bool:
         return self.status == "active"
+
+    @property
+    def claim_enabled(self) -> bool:
+        return self.claim_timeout_seconds > 0
 
     @classmethod
     def from_row(cls, row: dict) -> Giveaway:
@@ -122,6 +128,7 @@ class Giveaway:
             host_id=str(row["host_id"]) if row.get("host_id") else None,
             host_name=str(row["host_name"]) if row.get("host_name") else None,
             winners=[str(w) for w in winners] if isinstance(winners, list) else [],
+            claim_timeout_seconds=int(row.get("claim_timeout_seconds") or 0),
         )
 
 
@@ -152,10 +159,14 @@ class GiveawayService:
         image_url: str | None = None,
         host_id: str | None = None,
         host_name: str | None = None,
+        claim_timeout_seconds: int = 0,
     ) -> Giveaway:
         prize = prize.strip()
         if not prize or len(prize) > 256:
             raise ServiceError("Prize must be 1-256 characters.")
+        claim_timeout_seconds = int(claim_timeout_seconds or 0)
+        if claim_timeout_seconds < 0 or claim_timeout_seconds > 60 * 86400:
+            raise ServiceError("Claim window must be 0 (off) or up to 60 days in seconds.")
         if winner_count < 1 or winner_count > self.MAX_WINNERS:
             raise ServiceError(f"Winner count must be 1-{self.MAX_WINNERS}.")
         if duration_seconds < 30 or duration_seconds > 60 * 86400:
@@ -176,14 +187,16 @@ class GiveawayService:
         self.db.execute(
             "INSERT INTO simple_giveaways (id, guild_id, channel_id, prize, winner_count, ends_at,"
             " status, required_role_id, required_role_ids, blocked_role_id, min_account_age_days,"
-            " min_messages, image_url, created_by, created_at, host_id, host_name)"
-            " VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " min_messages, image_url, created_by, created_at, host_id, host_name,"
+            " claim_timeout_seconds)"
+            " VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 gid, guild_id, channel_id, prize, winner_count, created + duration_seconds * 1000,
                 role_ids[0] if role_ids else None, json.dumps(role_ids),
                 blocked_role_id or None, max(0, min_account_age_days),
                 max(0, min_messages), image_url, created_by, created,
                 host_id or created_by, (host_name or "")[:64] or None,
+                claim_timeout_seconds,
             ),
         )
         return self.get(gid)
@@ -586,7 +599,11 @@ class GiveawayService:
             " AND min_messages > 0)",
             (gw.guild_id, gw.guild_id),
         )
-        return self.get(gw.id), winners
+        ended = self.get(gw.id)
+        # Claim windows open here so the deadline survives restarts: rows are
+        # durable, and the tick picks them up even if the process dies first.
+        self.start_claims(ended, winners)
+        return ended, winners
 
     def reroll(self, giveaway_id: str, count: int = 1) -> tuple[Giveaway, list[str]]:
         gw = self.get(giveaway_id)
@@ -607,7 +624,16 @@ class GiveawayService:
                 " announcement can hold."
             )
         wanted = max(1, min(int(count or gw.winner_count), room))
-        fresh = self._pick(gw.id, wanted, exclude=prev)
+        # Claim-aware exclusion: winners_json holds every manual draw,
+        # simple_claims holds every auto draw (expired/claimed/skipped). Union
+        # both so a manual /reroll can never re-pick someone the claim timer
+        # already drew, and a later expiry can never re-pick this reroll.
+        drawn: set[str] = set(prev)
+        for r in self.db.query(
+            "SELECT user_id FROM simple_claims WHERE giveaway_id = ?", (gw.id,)
+        ):
+            drawn.add(str(r.get("user_id")))
+        fresh = self._pick(gw.id, wanted, exclude=sorted(drawn))
         if not fresh:
             # Redrawing from everyone would announce earlier winners as new
             # ones (or nobody at all once the entries were wiped): say so.
@@ -616,7 +642,175 @@ class GiveawayService:
         self.db.execute(
             "UPDATE simple_giveaways SET winners_json = ? WHERE id = ?", (json.dumps(combined), gw.id)
         )
-        return self.get(gw.id), fresh
+        ended = self.get(gw.id)
+        # Open a claim window for the fresh winners. No-op when the giveaway
+        # has no claim timer; INSERT OR IGNORE keeps a retried announce safe.
+        # The old winner's pending row is left alone: a manual reroll is
+        # additive, and its own deadline still expires/skips independently.
+        self.start_claims(ended, fresh)
+        return ended, fresh
+
+    # -- winner claims (optional claim timer) -----------------------------
+    #: Claim row statuses. `pending` rows hold a deadline; the rest are final.
+    CLAIM_PENDING = "pending"
+    CLAIM_CLAIMED = "claimed"
+    CLAIM_EXPIRED = "expired"
+    CLAIM_SKIPPED = "skipped"
+
+    def start_claims(self, gw: Giveaway, winners: list[str], now: int | None = None) -> None:
+        """Open a claim window for freshly drawn winners. Idempotent.
+
+        Called once per draw (end, and each claim-timeout replacement). Rows
+        are INSERT OR IGNORE so a retried announce never doubles a deadline.
+        No-op when the giveaway has no claim window configured.
+        """
+        if not gw.claim_enabled or not winners:
+            return
+        ts = now if now is not None else now_ms()
+        deadline = ts + gw.claim_timeout_seconds * 1000
+        for user_id in winners:
+            self.db.execute(
+                "INSERT OR IGNORE INTO simple_claims"
+                " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
+                " VALUES (?, ?, 0, 'pending', ?, ?)",
+                (gw.id, str(user_id), deadline, ts),
+            )
+
+    def pending_claims(self, giveaway_id: str) -> list[dict]:
+        """Pending claim rows for a giveaway, oldest deadline first."""
+        return self.db.query(
+            "SELECT giveaway_id, user_id, round, status, deadline_ms, claimed_at,"
+            " skipped_by, skipped_at, created_at FROM simple_claims"
+            " WHERE giveaway_id = ? AND status = 'pending' ORDER BY deadline_ms ASC",
+            (giveaway_id,),
+        )
+
+    def claim_status(self, giveaway_id: str) -> list[dict]:
+        """Every claim row for a giveaway (for the dashboard/admin view)."""
+        return self.db.query(
+            "SELECT giveaway_id, user_id, round, status, deadline_ms, claimed_at,"
+            " skipped_by, skipped_at, created_at FROM simple_claims"
+            " WHERE giveaway_id = ? ORDER BY created_at ASC",
+            (giveaway_id,),
+        )
+
+    def due_claims(self, now: int | None = None, limit: int = 25) -> list[dict]:
+        """Pending claims past their deadline. Tick feeds on this."""
+        ts = now if now is not None else now_ms()
+        return self.db.query(
+            "SELECT giveaway_id, user_id, round, status, deadline_ms, claimed_at,"
+            " skipped_by, skipped_at, created_at FROM simple_claims"
+            " WHERE status = 'pending' AND deadline_ms <= ?"
+            " ORDER BY deadline_ms ASC LIMIT ?",
+            (ts, max(1, min(int(limit), 100))),
+        )
+
+    def claim(self, giveaway_id: str, user_id: str) -> dict:
+        """Claim a prize as its drawn winner. Returns the claim row.
+
+        Guarded UPDATE: only a pending row for this exact (giveaway, winner)
+        flips, so double-clicks and two processes racing both collapse into one
+        success and one "already claimed" refusal.
+        """
+        cur = self.db.execute(
+            "UPDATE simple_claims SET status = 'claimed', claimed_at = ?"
+            " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
+            (now_ms(), giveaway_id, str(user_id)),
+        )
+        if not _changed(cur):
+            row = self.db.query_one(
+                "SELECT status FROM simple_claims WHERE giveaway_id = ? AND user_id = ?"
+                " ORDER BY round DESC LIMIT 1",
+                (giveaway_id, str(user_id)),
+            )
+            if row is None:
+                raise ServiceError("Only the drawn winner can claim this prize.")
+            status = str(row.get("status") or "")
+            if status == self.CLAIM_CLAIMED:
+                raise ServiceError("This prize was already claimed.")
+            if status == self.CLAIM_SKIPPED:
+                raise ServiceError("This prize was already verified by staff.")
+            raise ServiceError("This claim window has closed.")
+        row = self.db.query_one(
+            "SELECT * FROM simple_claims WHERE giveaway_id = ? AND user_id = ?"
+            " AND status = 'claimed' ORDER BY round DESC LIMIT 1",
+            (giveaway_id, str(user_id)),
+        )
+        return dict(row or {})
+
+    def skip_claim(self, giveaway_id: str, user_id: str, staff_id: str) -> dict:
+        """Mark a pending claim manually verified (ticket path). No replacement.
+
+        Guarded like claim(): only a pending row flips, so a second /skipclaim
+        (or a claim racing it) gets a clear refusal instead of a double write.
+        """
+        if not staff_id:
+            raise ServiceError("A staff member must verify the claim.")
+        cur = self.db.execute(
+            "UPDATE simple_claims SET status = 'skipped', skipped_by = ?, skipped_at = ?"
+            " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
+            (str(staff_id), now_ms(), giveaway_id, str(user_id)),
+        )
+        if not _changed(cur):
+            row = self.db.query_one(
+                "SELECT status FROM simple_claims WHERE giveaway_id = ? AND user_id = ?"
+                " ORDER BY round DESC LIMIT 1",
+                (giveaway_id, str(user_id)),
+            )
+            if row is None:
+                raise ServiceError("No pending claim for that member in this giveaway.")
+            status = str(row.get("status") or "")
+            if status == self.CLAIM_CLAIMED:
+                raise ServiceError("That prize was already claimed.")
+            if status == self.CLAIM_SKIPPED:
+                raise ServiceError("That claim was already verified by staff.")
+            raise ServiceError("That claim window has already closed.")
+        row = self.db.query_one(
+            "SELECT * FROM simple_claims WHERE giveaway_id = ? AND user_id = ?"
+            " AND status = 'skipped' ORDER BY round DESC LIMIT 1",
+            (giveaway_id, str(user_id)),
+        )
+        return dict(row or {})
+
+    def expire_claim(
+        self, giveaway_id: str, user_id: str, now: int | None = None
+    ) -> tuple[Giveaway, list[str]]:
+        """Expire one pending claim and draw its replacement. Atomic-ish.
+
+        The guarded UPDATE is the concurrency gate: whoever flips pending ->
+        expired owns the replacement draw, and a racing tick/claim/skip sees a
+        non-pending row and stops. The replacement reuses _pick with every
+        ever-drawn user excluded, so nobody is ever selected twice. Returns the
+        giveaway and the (possibly empty) replacement list.
+        """
+        gw = self.get(giveaway_id)
+        if gw.active:
+            raise ServiceError("This giveaway is still running.")
+        ts = now if now is not None else now_ms()
+        cur = self.db.execute(
+            "UPDATE simple_claims SET status = 'expired'"
+            " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending' AND deadline_ms <= ?",
+            (giveaway_id, str(user_id), ts),
+        )
+        if not _changed(cur):
+            raise ServiceError("That claim is no longer pending.")
+        drawn = [
+            str(r.get("user_id"))
+            for r in self.db.query(
+                "SELECT user_id FROM simple_claims WHERE giveaway_id = ?", (giveaway_id,)
+            )
+        ]
+        fresh = self._pick(gw.id, 1, exclude=drawn)
+        if not fresh:
+            return self.get(gw.id), []
+        combined = list(gw.winners) + [w for w in fresh if w not in gw.winners]
+        self.db.execute(
+            "UPDATE simple_giveaways SET winners_json = ? WHERE id = ?",
+            (json.dumps(combined), gw.id),
+        )
+        ended = self.get(gw.id)
+        self.start_claims(ended, fresh, now=ts)
+        return ended, fresh
 
     def discard(self, giveaway_id: str) -> None:
         """Drop a giveaway that never reached Discord.
@@ -625,6 +819,7 @@ class GiveawayService:
         otherwise stay 'active' forever, auto-end on schedule, and try to
         announce winners into a channel that already refused the bot.
         """
+        self.db.execute("DELETE FROM simple_claims WHERE giveaway_id = ?", (giveaway_id,))
         self.db.execute("DELETE FROM simple_entries WHERE giveaway_id = ?", (giveaway_id,))
         self.db.execute("DELETE FROM simple_giveaways WHERE id = ?", (giveaway_id,))
 
@@ -698,7 +893,12 @@ class GiveawayService:
             # is the fallback that still lets their entry rows expire.
             "DELETE FROM simple_entries WHERE giveaway_id IN"
             " (SELECT id FROM simple_giveaways WHERE status != 'active'"
-            " AND COALESCE(ended_at, created_at) <= ?)",
+            " AND COALESCE(ended_at, created_at) <= ?"
+            # A pending claim still needs its entry pool for the replacement
+            # draw, so its giveaway is exempt until the claim settles.
+            " AND NOT EXISTS (SELECT 1 FROM simple_claims"
+            " WHERE simple_claims.giveaway_id = simple_giveaways.id"
+            " AND simple_claims.status = 'pending'))",
             (cutoff,),
         )
         try:

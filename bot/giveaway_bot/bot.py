@@ -15,7 +15,7 @@ from . import embeds
 from .config import Settings
 from .db import Database
 from .service import TIMEOUT_BAN_KIND, Giveaway, GiveawayService, PartialFlush, ServiceError
-from .views import GiveawayView, ParticipantsPages
+from .views import ClaimView, GiveawayView, ParticipantsPages
 
 log = logging.getLogger("giveaway_bot")
 _SNOWFLAKE = re.compile(r"^\d{15,25}$")
@@ -170,6 +170,7 @@ class GiveawayBot(commands.Bot):
             join=self.handle_join,
             leave=self.handle_leave,
             participants=self.handle_participants,
+            claim=self.handle_claim,
         )
 
     def _cache_autocomplete(self, live: list[Giveaway]) -> None:
@@ -747,6 +748,23 @@ class GiveawayBot(commands.Bot):
         await self._take_entrants_role(fresh, str(interaction.user.id))
         await self._refresh_embed(fresh)
 
+    async def handle_claim(self, interaction: discord.Interaction, giveaway_id: str) -> None:
+        if not await self._safe_defer(interaction):
+            return
+        try:
+            await asyncio.to_thread(
+                self.service.claim, giveaway_id, str(interaction.user.id)
+            )
+        except ServiceError as exc:
+            await self._safe_followup(interaction, f"\u26a0\ufe0f {exc.message}")
+            return
+        except Exception:
+            log.exception("claim failed for %s", giveaway_id)
+            await self._safe_followup(interaction, "\u26a0\ufe0f Could not record your claim. Try again.")
+            return
+        log.info("claim recorded for %s/%s", giveaway_id, interaction.user.id)
+        await self._safe_followup(interaction, "\U0001f381 Prize claimed! A host will contact you.")
+
     # -- auto-draw timer -------------------------------------------------
     @tasks.loop(seconds=30)
     async def tick(self) -> None:
@@ -775,6 +793,35 @@ class GiveawayBot(commands.Bot):
                 await self._strip_entrants_role(ended)
             except Exception:
                 log.exception("role strip failed for %s", gw.id)
+        # Claim expiry: sweep due pending claims, expire + auto-reroll.
+        # Restart recovery lives here too: deadlines are durable rows, so a
+        # restart just picks up whatever is due on the next tick.
+        try:
+            due_claims = await asyncio.to_thread(self.service.due_claims)
+        except Exception:
+            log.exception("due claims check failed")
+            due_claims = []
+        for row in due_claims:
+            gid = str(row.get("giveaway_id") or "")
+            uid = str(row.get("user_id") or "")
+            if not gid or not uid:
+                continue
+            try:
+                ended_claim, fresh = await asyncio.to_thread(
+                    self.service.expire_claim, gid, uid
+                )
+            except ServiceError as exc:
+                log.info("could not expire claim %s/%s: %s", gid, uid, exc.message)
+                continue
+            except Exception:
+                log.exception("claim expiry failed for %s/%s", gid, uid)
+                continue
+            log.info("claim expired for %s/%s; replacement=%s", gid, uid, fresh)
+            if fresh:
+                try:
+                    await self._announce(ended_claim, fresh, reroll=True)
+                except Exception:
+                    log.exception("replacement announce failed for %s", gid)
         # Live timer: re-render active embeds every tick so the countdown
         # visibly ticks down. The soonest deadlines always get a slot; the rest
         # rotate, so no running giveaway is left showing a stale count.
@@ -856,7 +903,26 @@ class GiveawayBot(commands.Bot):
             entries = await asyncio.to_thread(self.service.entry_count, gw.id)
         except Exception:
             entries = 0
-        embed = embeds.winner_embed(gw, winners, entries, self.settings.embed_color)
+        claim_deadline_ms: int | None = None
+        claim_view = None
+        try:
+            if gw.claim_enabled and winners:
+                pending = await asyncio.to_thread(self.service.pending_claims, gw.id)
+                hits = [
+                    int(r.get("deadline_ms") or 0)
+                    for r in pending
+                    if str(r.get("user_id") or "") in winners and r.get("deadline_ms")
+                ]
+                if hits:
+                    claim_deadline_ms = min(hits)
+                    claim_view = ClaimView(gw.id)
+        except Exception:
+            log.exception("claim lookup failed for %s", gw.id)
+            claim_deadline_ms = None
+            claim_view = None
+        embed = embeds.winner_embed(
+            gw, winners, entries, self.settings.embed_color, claim_deadline_ms
+        )
         if reroll:
             embed.title = "Giveaway Rerolled"
         parts: list[str] = []
@@ -876,7 +942,7 @@ class GiveawayBot(commands.Bot):
             if gw.message_id and not reroll:
                 try:
                     msg = await channel.fetch_message(int(gw.message_id))
-                    await msg.edit(embed=embed, view=None)
+                    await msg.edit(embed=embed, view=claim_view)
                 except discord.HTTPException:
                     pass
                 else:
@@ -884,7 +950,7 @@ class GiveawayBot(commands.Bot):
                     if content:
                         await msg.reply(content, allowed_mentions=mentions)
                     return
-            await channel.send(embed=embed, content=content, allowed_mentions=mentions)
+            await channel.send(embed=embed, content=content, view=claim_view, allowed_mentions=mentions)
         except discord.HTTPException:
             log.warning("announce failed for %s", gw.id)
 
@@ -954,6 +1020,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         min_messages="Min messages sent in this server (optional)",
         host="The hoster shown on the embed — e.g. the prize giver (defaults to you)",
         image="Prize photo URL, e.g. a gift-card picture (optional)",
+        claim_minutes="Winner claim window in minutes, 0 = off (optional)",
     )
     async def giveaway_create(
         interaction: discord.Interaction,
@@ -970,6 +1037,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         min_messages: int = 0,
         host: discord.Member | None = None,
         image: str | None = None,
+        claim_minutes: int = 0,
     ) -> None:
         if interaction.guild is None or not _can_manage(interaction.user):
             await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
@@ -1007,6 +1075,7 @@ def wire_commands(bot: GiveawayBot) -> None:
                 image_url=image,
                 host_id=str(host.id) if host is not None else str(interaction.user.id),
                 host_name=host.display_name if host is not None else interaction.user.display_name,
+                claim_timeout_seconds=max(0, claim_minutes) * 60,
             )
         except ServiceError as exc:
             try:
@@ -1116,6 +1185,38 @@ def wire_commands(bot: GiveawayBot) -> None:
             return
         await bot._announce(ended, fresh, reroll=True)
         await bot._safe_followup(interaction, "🔁 Rerolled.")
+
+    @bot.tree.command(name="skipclaim", description="Mark a winner's claim verified (no replacement)")
+    @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
+    @app_commands.describe(giveaway_id="Ended giveaway with a claim window", user="The winner to verify")
+    async def giveaway_skipclaim(
+        interaction: discord.Interaction, giveaway_id: str, user: discord.Member
+    ) -> None:
+        if interaction.guild is None or not _can_manage(interaction.user):
+            await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
+            return
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        try:
+            gw = await asyncio.to_thread(
+                svc.resolve, str(interaction.guild.id), giveaway_id
+            )
+            await asyncio.to_thread(
+                svc.skip_claim, gw.id, str(user.id), str(interaction.user.id)
+            )
+        except ServiceError as exc:
+            await bot._safe_followup(interaction, f"⚠️ {exc.message}")
+            return
+        except Exception:
+            log.exception("skipclaim failed for %s", giveaway_id)
+            await bot._safe_followup(interaction, "⚠️ Could not verify. Try again.")
+            return
+        log.info("claim skipped for %s/%s by %s", gw.id, user.id, interaction.user.id)
+        await bot._safe_followup(
+            interaction, f"✅ {user.mention}'s claim verified — no replacement will be drawn."
+        )
 
     @bot.tree.command(name="giveaway_cancel", description="Cancel an active giveaway")
     @app_commands.autocomplete(giveaway_id=_gw_autocomplete)

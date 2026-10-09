@@ -42,7 +42,7 @@ class _ButtonPlumbing:
     """Shared button behaviour, mixed into each DynamicItem subclass.
 
     A plain mixin rather than a DynamicItem: discord.py requires a regex template
-    on every class that derives from DynamicItem, and only the three concrete
+    on every class that derives from DynamicItem, and only the concrete
     classes below have a real one.
     """
 
@@ -111,11 +111,25 @@ class ParticipantsButton(
     PREFIX = "gw_participants"
 
 
+class ClaimButton(
+    _ButtonPlumbing,
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=rf"gw_claim:{_ID}",
+):
+    """Gift button: the drawn winner claims their prize."""
+
+    LABEL = "Claim Prize"
+    EMOJI = "🎁"
+    STYLE = discord.ButtonStyle.primary
+    PREFIX = "gw_claim"
+
+
 #: Every dynamic component the bot listens for. Registered once per process.
 DYNAMIC_ITEMS: tuple[type[_ButtonPlumbing], ...] = (
     JoinButton,
     LeaveButton,
     ParticipantsButton,
+    ClaimButton,
 )
 
 
@@ -154,6 +168,7 @@ class GiveawayView(discord.ui.View):
         join: Handler,
         leave: Handler,
         participants: Handler,
+        claim: Handler | None = None,
     ) -> None:
         """Wire handlers and make every custom_id dispatchable.
 
@@ -163,7 +178,50 @@ class GiveawayView(discord.ui.View):
         _HANDLERS[JoinButton.PREFIX] = join
         _HANDLERS[LeaveButton.PREFIX] = leave
         _HANDLERS[ParticipantsButton.PREFIX] = participants
+        if claim is not None:
+            _HANDLERS[ClaimButton.PREFIX] = claim
         client.add_dynamic_items(*DYNAMIC_ITEMS)
+
+
+class ClaimView(discord.ui.View):
+    """Winner-only Claim Prize button on the ended message.
+
+    Stateless like GiveawayView: clicks dispatch via ClaimButton's dynamic
+    pattern, so a button posted before a restart still works.
+    """
+
+    def __init__(self, giveaway_id: str) -> None:
+        super().__init__(timeout=None)
+        self.giveaway_id = giveaway_id
+        self.add_item(ClaimButton(giveaway_id))
+
+    @classmethod
+    def register(cls, client: discord.Client, *, claim: Handler) -> None:
+        """Wire the claim handler (idempotent with GiveawayView.register)."""
+        _HANDLERS[ClaimButton.PREFIX] = claim
+        try:
+            client.add_dynamic_items(*DYNAMIC_ITEMS)
+        except Exception:
+            pass
+
+    @classmethod
+    def unregister(cls) -> None:
+        _HANDLERS.pop(ClaimButton.PREFIX, None)
+
+    @classmethod
+    def register_all(
+        cls,
+        client: discord.Client,
+        *,
+        join: Handler,
+        leave: Handler,
+        participants: Handler,
+        claim: Handler,
+    ) -> None:
+        """Wire all four handlers at once (convenience over GiveawayView)."""
+        GiveawayView.register(
+            client, join=join, leave=leave, participants=participants, claim=claim
+        )
 
 
 class ParticipantsPages(discord.ui.View):

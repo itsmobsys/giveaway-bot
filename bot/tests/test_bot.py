@@ -91,6 +91,7 @@ class WiringTests(BotTestCase):
         "giveaway_ping",
         "giveaway_reroll",
         "giveaway_timeout_bans",
+        "skipclaim",
     )
 
     def test_every_command_is_registered_once(self) -> None:

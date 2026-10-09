@@ -49,6 +49,9 @@ export function placeholders(n) {
  *  - entrants: people who joined (count + usernames, never user ids)
  *  - chance: chance of winning derived from winner_count / entrant_count
  *  - timer: ends_at + ms remaining (live) / ended_at (previous)
+ * Claim window (optional) rides along as `claim` so the wall can badge
+ * giveaways that need a winner to press Claim Prize. Missing column (legacy
+ * rows) reads as disabled.
  */
 export function card(gw, entrantCount, usernames, now) {
   const winners = Math.max(1, Number(gw.winner_count) || 1);
@@ -58,6 +61,7 @@ export function card(gw, entrantCount, usernames, now) {
   const endsAt = Number(gw.ends_at) || 0;
   const msRemaining = isLive ? Math.max(0, endsAt - now) : 0;
   const percent = entrants > 0 ? Math.min(100, (winners / entrants) * 100) : 0;
+  const claimTimeout = Number(gw.claim_timeout_seconds) || 0;
   return {
     id: gw.id,
     status: gw.status,
@@ -81,6 +85,10 @@ export function card(gw, entrantCount, usernames, now) {
       ms_remaining: msRemaining,
       seconds_remaining: Math.floor(msRemaining / 1000),
       is_live: isLive,
+    },
+    claim: {
+      enabled: claimTimeout > 0,
+      timeout_seconds: claimTimeout,
     },
   };
 }

@@ -89,6 +89,7 @@ export function cardHTML(g, now) {
     <div class="meta">
       ${statusTag}
       ${g.host_name ? `<span class="tag">by ${esc(g.host_name)}</span>` : ""}
+      ${g.claim?.enabled ? `<span class="tag">🎁 claim</span>` : ""}
     </div>
 
     <div class="odds">

@@ -104,7 +104,8 @@ CREATE TABLE IF NOT EXISTS {TABLE_GIVEAWAYS} (
   created_at INTEGER NOT NULL,
   ended_at INTEGER,
   winners_json TEXT NOT NULL DEFAULT '[]',
-  entrant_count INTEGER
+  entrant_count INTEGER,
+  claim_timeout_seconds INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS {TABLE_ENTRIES} (
   giveaway_id TEXT NOT NULL,
@@ -217,6 +218,9 @@ class Database:
                 # Entries are wiped 5h after the end, so the count is frozen
                 # when a giveaway ends or is cancelled. NULL for older rows.
                 "entrant_count": "INTEGER",
+                # Optional winner-claim window in seconds. 0/NULL = disabled;
+                # live databases gain it via this same migration map.
+                "claim_timeout_seconds": "INTEGER NOT NULL DEFAULT 0",
             },
         )
         self._ensure_columns(
@@ -279,6 +283,25 @@ class Database:
   giveaway_id TEXT NOT NULL,
   created_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (guild_id, user_id, giveaway_id)
+)"""
+        )
+        # Optional winner-claim state, one row per drawn winner. Survives
+        # restarts like everything else; never touched by the entry-wipe sweep
+        # (a pending claim keeps its giveaway's entries alive — see
+        # wipe_stale_entries in service.py). Statuses: pending -> claimed /
+        # expired / skipped. round distinguishes repeat draws of one slot.
+        self.execute(
+            """CREATE TABLE IF NOT EXISTS simple_claims (
+  giveaway_id TEXT NOT NULL,
+  user_id TEXT NOT NULL,
+  round INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  deadline_ms INTEGER NOT NULL DEFAULT 0,
+  claimed_at INTEGER,
+  skipped_by TEXT,
+  skipped_at INTEGER,
+  created_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (giveaway_id, user_id, round)
 )"""
         )
         for stmt in [s.strip() for s in SCHEMA_INDEXES.split(";") if s.strip()]:

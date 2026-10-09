@@ -5,7 +5,7 @@ const NAME_LIMIT = 100;
 
 const CARD_COLUMNS = `id, guild_id, prize, winner_count, ends_at,
          COALESCE(ended_at, created_at) AS ended_at, entrant_count, status,
-         image_url, host_name`;
+         image_url, host_name, claim_timeout_seconds`;
 
 const LIVE_SQL = `
   SELECT ${CARD_COLUMNS}

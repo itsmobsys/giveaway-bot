@@ -22,7 +22,7 @@ async function listPrevious(limit, offset, now) {
     db().execute({
       sql: `SELECT id, prize, winner_count, ends_at,
                    COALESCE(ended_at, created_at) AS ended_at, entrant_count,
-                   status, image_url, host_name
+                   status, image_url, host_name, claim_timeout_seconds
             FROM simple_giveaways
             WHERE status != 'active'
             ORDER BY COALESCE(ended_at, created_at) DESC, id DESC
@@ -60,7 +60,10 @@ async function listPrevious(limit, offset, now) {
  * Live giveaways are refused, and so is an id that does not exist. This used to
  * be three sequential round-trips per id, so a 100-row bulk delete spent 300
  * round-trips inside one serverless invocation and could time out halfway. It is
- * now one lookup and one transactional two-statement batch, whatever its size.
+ * now one lookup and one transactional three-statement batch, whatever its size.
+ * The first statement purges simple_claims so finished giveaways leave no
+ * orphaned claim rows behind (pending claims never reach here: live
+ * giveaways are refused above).
  */
 async function deleteMany(ids) {
   const unique = [...new Set(ids.map(String))].filter(Boolean);
@@ -85,7 +88,10 @@ async function deleteMany(ids) {
   const removable = results.filter((r) => r.ok).map((r) => r.id);
   if (removable.length) {
     const del = placeholders(removable.length);
-    const [, deleted] = await db().batch([
+    const [, , deleted] = await db().batch([
+      { sql: `DELETE FROM simple_claims WHERE giveaway_id IN (
+                SELECT id FROM simple_giveaways WHERE status != 'active' AND id IN (${del})
+              )`, args: removable },
       { sql: `DELETE FROM simple_entries WHERE giveaway_id IN (
                 SELECT id FROM simple_giveaways WHERE status != 'active' AND id IN (${del})
               )`, args: removable },

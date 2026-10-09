@@ -126,7 +126,10 @@ def timeout_bans_embed(
     )
 
 
-def winner_embed(gw: Giveaway, winners: list[str], entries: int, color: int) -> discord.Embed:
+def winner_embed(
+    gw: Giveaway, winners: list[str], entries: int, color: int,
+    claim_deadline_ms: int | None = None,
+) -> discord.Embed:
     if winners:
         # Discord caps a description at 4096 characters, so an old reroll row
         # holding hundreds of winners would lose the whole announcement: name
@@ -142,6 +145,9 @@ def winner_embed(gw: Giveaway, winners: list[str], entries: int, color: int) -> 
         )
     else:
         desc = f"## 🎊 {gw.prize} 🎊\n\nNo valid entries — no winners this time."
+    if claim_deadline_ms:
+        ts = int(claim_deadline_ms / 1000)
+        desc += f"\n\n🎁 Winners: claim by <t:{ts}:R> — press **Claim Prize** below."
     if gw.host_id:
         host_label = gw.host_name or "host"
         desc += f"\n🎤 Hosted by <@{gw.host_id}> ({host_label})"

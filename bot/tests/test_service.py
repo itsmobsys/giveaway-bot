@@ -982,6 +982,183 @@ class TimeoutBanTests(ServiceTestCase):
         self.assertEqual(len(self.svc.list_timeout_bans(self.guild, limit=1)), 1)
 
 
+class ClaimTests(ServiceTestCase):
+    def _three_entrant_ended(self, **kw):
+        gw = self.make(winner_count=1, claim_timeout_seconds=3600, **kw)
+        users = [str(10 ** 17 + i) for i in range(3)]
+        for u in users:
+            self.join(gw, user_id=u)
+        ended, winners = self.svc.end(gw.id)
+        self.assertEqual(len(winners), 1)
+        self.assertIn(winners[0], users)
+        return ended, winners[0], users
+
+    def test_create_validates_claim_window(self) -> None:
+        for bad in (-1, 60 * 86400 + 1):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ServiceError) as ctx:
+                    self.make(claim_timeout_seconds=bad)
+                self.assertIn("claim window", str(ctx.exception.message).lower())
+        gw = self.make(claim_timeout_seconds=60)
+        self.assertTrue(gw.claim_enabled)
+        self.assertEqual(gw.claim_timeout_seconds, 60)
+        legacy = self.make()
+        self.assertFalse(legacy.claim_enabled)
+
+    def test_end_opens_claims_when_enabled(self) -> None:
+        ended, winner, _users = self._three_entrant_ended()
+        pending = self.svc.pending_claims(ended.id)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(str(pending[0]["user_id"]), winner)
+        self.assertEqual(str(pending[0]["status"]), "pending")
+        self.assertGreater(int(pending[0]["deadline_ms"]), 0)
+        # Restart recovery: a fresh service on the same DB sees the same rows.
+        svc2 = GiveawayService(self.db)
+        again = svc2.pending_claims(ended.id)
+        self.assertEqual(len(again), 1)
+        self.assertEqual(str(again[0]["user_id"]), winner)
+
+    def test_end_creates_no_claims_when_disabled(self) -> None:
+        gw = self.make(winner_count=1)
+        self.join(gw)
+        ended, winners = self.svc.end(gw.id)
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(self.svc.pending_claims(ended.id), [])
+        self.assertEqual(self.svc.due_claims(now=now_ms() + 10 * DAY_MS), [])
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.claim(ended.id, winners[0])
+        self.assertIn("drawn winner", str(ctx.exception.message))
+
+    def test_claim_happy_path_and_double_claim_refused(self) -> None:
+        ended, winner, _users = self._three_entrant_ended()
+        row = self.svc.claim(ended.id, winner)
+        self.assertEqual(str(row["user_id"]), winner)
+        self.assertEqual(self.svc.pending_claims(ended.id), [])
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.claim(ended.id, winner)
+        self.assertIn("already claimed", str(ctx.exception.message))
+
+    def test_claim_by_non_winner_refused(self) -> None:
+        ended, winner, users = self._three_entrant_ended()
+        loser = next(u for u in users if u != winner)
+        # Loser never drew, so there is no row at all for them.
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.claim(ended.id, loser)
+        self.assertIn("drawn winner", str(ctx.exception.message))
+        with self.assertRaises(ServiceError):
+            self.svc.claim("gw_nope", winner)
+
+    def test_skip_claim_needs_staff_and_no_replacement(self) -> None:
+        ended, winner, _users = self._three_entrant_ended()
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.skip_claim(ended.id, winner, "")
+        self.assertIn("staff", str(ctx.exception.message).lower())
+        row = self.svc.skip_claim(ended.id, winner, "999999999999999999")
+        self.assertEqual(str(row["status"]), "skipped")
+        self.assertEqual(self.svc.pending_claims(ended.id), [])
+        # No replacement is drawn: the winners list is untouched.
+        self.assertEqual(self.svc.get(ended.id).winners, [winner])
+        with self.assertRaises(ServiceError) as ctx2:
+            self.svc.skip_claim(ended.id, winner, "999999999999999999")
+        self.assertIn("already verified", str(ctx2.exception.message))
+        with self.assertRaises(ServiceError) as ctx3:
+            self.svc.claim(ended.id, winner)
+        self.assertIn("verified", str(ctx3.exception.message))
+
+    def test_expire_draws_replacement_never_repeats(self) -> None:
+        ended, winner, users = self._three_entrant_ended()
+        deadline = int(self.svc.pending_claims(ended.id)[0]["deadline_ms"])
+        # Too early: the guarded UPDATE matches nothing.
+        with self.assertRaises(ServiceError):
+            self.svc.expire_claim(ended.id, winner, now=deadline - 1)
+        redrawn, fresh = self.svc.expire_claim(ended.id, winner, now=deadline + 1)
+        self.assertEqual(len(fresh), 1)
+        self.assertNotEqual(fresh[0], winner)
+        self.assertIn(fresh[0], users)
+        self.assertIn(fresh[0], redrawn.winners)
+        self.assertIn(winner, redrawn.winners, "expired winner stays named")
+        # The replacement gets its own pending window.
+        pending = self.svc.pending_claims(ended.id)
+        self.assertEqual([str(r["user_id"]) for r in pending], [fresh[0]])
+        # The expired slot can no longer be claimed.
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.claim(ended.id, winner)
+        self.assertIn("closed", str(ctx.exception.message))
+        # due_claims only fires past the deadline.
+        self.assertEqual(self.svc.due_claims(now=deadline - 1), [])
+        # Claiming the replacement works.
+        self.svc.claim(ended.id, fresh[0])
+        self.assertEqual(self.svc.pending_claims(ended.id), [])
+
+    def test_expire_with_empty_pool_returns_no_replacement(self) -> None:
+        gw = self.make(winner_count=1, claim_timeout_seconds=3600)
+        self.join(gw)
+        ended, winners = self.svc.end(gw.id)
+        deadline = int(self.svc.pending_claims(ended.id)[0]["deadline_ms"])
+        redrawn, fresh = self.svc.expire_claim(ended.id, winners[0], now=deadline + 1)
+        self.assertEqual(fresh, [])
+        self.assertEqual(redrawn.winners, winners)
+        self.assertEqual(self.svc.pending_claims(ended.id), [])
+
+    def test_multi_winner_claims_are_independent(self) -> None:
+        gw = self.make(winner_count=2, claim_timeout_seconds=3600)
+        users = [str(10 ** 17 + i) for i in range(4)]
+        for u in users:
+            self.join(gw, user_id=u)
+        ended, winners = self.svc.end(gw.id)
+        self.assertEqual(len(winners), 2)
+        self.svc.claim(ended.id, winners[0])
+        still = [str(r["user_id"]) for r in self.svc.pending_claims(ended.id)]
+        self.assertEqual(still, [winners[1]])
+        deadline = int(self.svc.pending_claims(ended.id)[0]["deadline_ms"])
+        redrawn, fresh = self.svc.expire_claim(ended.id, winners[1], now=deadline + 1)
+        self.assertEqual(len(fresh), 1)
+        self.assertNotIn(fresh[0], winners)
+        self.assertIn(fresh[0], users)
+        self.assertEqual(len(redrawn.winners), 3)
+
+    def test_start_claims_is_idempotent(self) -> None:
+        ended, winner, _users = self._three_entrant_ended()
+        before = self.svc.pending_claims(ended.id)
+        self.svc.start_claims(self.svc.get(ended.id), [winner])
+        after = self.svc.pending_claims(ended.id)
+        self.assertEqual(len(before), 1)
+        self.assertEqual(len(after), 1)
+
+    def test_manual_reroll_opens_claims_and_keeps_old_pending(self) -> None:
+        ended, winner, users = self._three_entrant_ended()
+        redrawn, fresh = self.svc.reroll(ended.id, 1)
+        self.assertEqual(len(fresh), 1)
+        self.assertNotEqual(fresh[0], winner)
+        self.assertIn(fresh[0], users)
+        # Additive: both the old winner and the reroll winner stay named.
+        self.assertIn(winner, redrawn.winners)
+        self.assertIn(fresh[0], redrawn.winners)
+        # Both hold a pending claim window; the old deadline still stands.
+        pending = {str(r["user_id"]) for r in self.svc.pending_claims(ended.id)}
+        self.assertEqual(pending, {winner, fresh[0]})
+        # The fresh winner can actually press Claim Prize.
+        self.svc.claim(ended.id, fresh[0])
+        still = [str(r["user_id"]) for r in self.svc.pending_claims(ended.id)]
+        self.assertEqual(still, [winner])
+
+    def test_manual_reroll_never_repeats_claim_draws(self) -> None:
+        ended, winner, users = self._three_entrant_ended()
+        deadline = int(self.svc.pending_claims(ended.id)[0]["deadline_ms"])
+        _redrawn, auto = self.svc.expire_claim(ended.id, winner, now=deadline + 1)
+        self.assertEqual(len(auto), 1)
+        _rerolled, fresh = self.svc.reroll(ended.id, 1)
+        self.assertEqual(len(fresh), 1)
+        # Neither the expired winner nor the auto replacement may reappear.
+        self.assertNotIn(fresh[0], [winner, auto[0]])
+        self.assertIn(fresh[0], users)
+        third = next(u for u in users if u not in (winner, auto[0]))
+        self.assertEqual(fresh[0], third)
+        # The pool is now exhausted: one more reroll must refuse.
+        with self.assertRaises(ServiceError):
+            self.svc.reroll(ended.id, 1)
+
+
 class GuildSettingTests(ServiceTestCase):
     def test_notify_role_upsert(self) -> None:
         self.assertIsNone(self.svc.get_notify_role(self.guild))

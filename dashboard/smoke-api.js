@@ -69,10 +69,18 @@ try {
   await client.execute(
     "CREATE TABLE simple_giveaways (id TEXT PRIMARY KEY, guild_id TEXT, prize TEXT, " +
     "winner_count INTEGER, created_at INTEGER, ends_at INTEGER, ended_at INTEGER, " +
-    "entrant_count INTEGER, status TEXT, image_url TEXT, host_name TEXT)"
+    "entrant_count INTEGER, status TEXT, image_url TEXT, host_name TEXT, " +
+    "claim_timeout_seconds INTEGER NOT NULL DEFAULT 0)"
   );
   await client.execute(
     "CREATE TABLE simple_entries (giveaway_id TEXT, username TEXT, entered_at INTEGER)"
+  );
+  await client.execute(
+    "CREATE TABLE simple_claims (giveaway_id TEXT NOT NULL, user_id TEXT NOT NULL, " +
+    "round INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending', " +
+    "deadline_ms INTEGER NOT NULL DEFAULT 0, claimed_at INTEGER, skipped_by TEXT, " +
+    "skipped_at INTEGER, created_at INTEGER NOT NULL DEFAULT 0, " +
+    "PRIMARY KEY (giveaway_id, user_id, round))"
   );
   const now = Date.now();
   const rows = [
