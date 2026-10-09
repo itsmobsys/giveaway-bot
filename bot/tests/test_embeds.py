@@ -144,6 +144,29 @@ class WinnerEmbedTests(unittest.TestCase):
         self.assertIn("Hosted by <@555555555555555555> (Mod)", embed.description)
         self.assertEqual(embed.image.url, "https://x/y.png")
 
+    def test_single_shared_deadline_renders_once(self) -> None:
+        gw = a_giveaway(winners=["1" * 18, "2" * 18])
+        dl = 1_700_000_000_000
+        embed = embeds.winner_embed(gw, ["1" * 18, "2" * 18], 4, COLOR, dl)
+        self.assertIn("Claim Prize", embed.description)
+        self.assertEqual(embed.description.count("Claim Prize"), 1)
+
+    def test_divergent_deadlines_render_per_winner(self) -> None:
+        gw = a_giveaway(winners=["1" * 18, "2" * 18])
+        dl1 = 1_700_000_000_000
+        dl2 = dl1 + 3_600_000
+        embed = embeds.winner_embed(
+            gw, ["1" * 18, "2" * 18], 4, COLOR, None,
+            {"1" * 18: dl1, "2" * 18: dl2},
+        )
+        self.assertIn(f"<@{'1' * 18}>:", embed.description)
+        self.assertIn(f"<@{'2' * 18}>:", embed.description)
+        self.assertIn("Claim Prize", embed.description)
+
+    def test_no_deadline_renders_no_claim_line(self) -> None:
+        embed = embeds.winner_embed(a_giveaway(winners=["1" * 18]), ["1" * 18], 7, COLOR)
+        self.assertNotIn("Claim Prize", embed.description)
+
 
 if __name__ == "__main__":
     unittest.main()

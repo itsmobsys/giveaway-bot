@@ -1223,6 +1223,157 @@ class ClaimTests(ServiceTestCase):
             self.svc.reroll(ended.id, 1)
 
 
+class ResolveEndedTests(ServiceTestCase):
+    def _ended(self, **kw):
+        gw = self.make(**kw)
+        self.join(gw)
+        ended, _winners = self.svc.end(gw.id)
+        return ended
+
+    def test_resolve_ended_returns_ended_by_id(self) -> None:
+        ended = self._ended()
+        self.assertEqual(self.svc.resolve_ended(self.guild, ended.id).id, ended.id)
+
+    def test_resolve_ended_refuses_live(self) -> None:
+        live = self.make()
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.resolve_ended(self.guild, live.id)
+        self.assertIn("not ended", str(ctx.exception.message).lower())
+
+    def test_resolve_ended_never_falls_back_to_live(self) -> None:
+        live = self.make(prize="live")
+        ended = self._ended(prize="ended")
+        # Typo id with a single ended row falls back to that ended row --
+        # same shape as resolve() -- and never to the running giveaway.
+        self.assertEqual(self.svc.resolve_ended(self.guild, "gw_typo").id, ended.id)
+        self.assertEqual(self.svc.resolve_ended(self.guild, "").id, ended.id)
+        self.assertNotEqual(self.svc.resolve_ended(self.guild, "gw_typo").id, live.id)
+        # Two ended rows -> needs an id, even though only one live exists.
+        other = self.make(prize="ended2")
+        self.join(other)
+        ended2, _w = self.svc.end(other.id)
+        with self.assertRaises(ServiceError) as ctx2:
+            self.svc.resolve_ended(self.guild, "")
+        self.assertIn("did not match", str(ctx2.exception.message))
+        self.assertEqual(self.svc.resolve_ended(self.guild, ended.id).id, ended.id)
+        self.assertEqual(self.svc.resolve_ended(self.guild, ended2.id).id, ended2.id)
+        self.assertEqual(live.id is not None, True)
+
+    def test_resolve_ended_single_fallback(self) -> None:
+        ended = self._ended()
+        self.assertEqual(self.svc.resolve_ended(self.guild, "").id, ended.id)
+        self.assertEqual(self.svc.resolve_ended(self.guild, "  ").id, ended.id)
+
+    def test_resolve_ended_refuses_another_guild(self) -> None:
+        other = self.make(guild_id="555")
+        self.join(other)
+        ended, _w = self.svc.end(other.id)
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.resolve_ended(self.guild, ended.id)
+        self.assertIn("another server", str(ctx.exception.message))
+
+    def test_resolve_ended_with_nothing_ended(self) -> None:
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.resolve_ended(self.guild, "gw_x")
+        self.assertIn("no ended", str(ctx.exception.message).lower())
+
+    def test_list_ended_is_guild_scoped(self) -> None:
+        mine = self._ended(prize="mine")
+        other = self.make(guild_id="555", prize="theirs")
+        self.join(other)
+        self.svc.end(other.id)
+        ids = [g.id for g in self.svc.list_ended(self.guild)]
+        self.assertEqual(ids, [mine.id])
+
+
+class RerollCasTests(ServiceTestCase):
+    def _three_entrant_ended(self, **kw):
+        gw = self.make(winner_count=1, **kw)
+        users = [str(10 ** 17 + i) for i in range(3)]
+        for u in users:
+            self.join(gw, user_id=u)
+        ended, winners = self.svc.end(gw.id)
+        return ended, winners[0], users
+
+    def test_reroll_preserves_racing_append(self) -> None:
+        ended, winner, users = self._three_entrant_ended()
+        external = "999999999999999999"  # not an entrant: _pick can never draw it
+        cur = self.svc.get(ended.id)
+        self.db.execute(
+            "UPDATE simple_giveaways SET winners_json = ? WHERE id = ?",
+            (json.dumps(cur.winners + [external]), ended.id),
+        )
+        _redrawn, fresh = self.svc.reroll(ended.id, 1)
+        final = self.svc.get(ended.id).winners
+        self.assertIn(external, final, "racing append must survive the CAS rebase")
+        self.assertIn(fresh[0], final)
+        self.assertEqual(len(final), 3)
+
+    def test_expire_preserves_racing_append(self) -> None:
+        ended, winner, users = self._three_entrant_ended(claim_timeout_seconds=3600)
+        external = "999999999999999999"
+        cur = self.svc.get(ended.id)
+        self.db.execute(
+            "UPDATE simple_giveaways SET winners_json = ? WHERE id = ?",
+            (json.dumps(cur.winners + [external]), ended.id),
+        )
+        deadline = int(self.svc.pending_claims(ended.id)[0]["deadline_ms"])
+        redrawn, fresh = self.svc.expire_claim(ended.id, winner, now=deadline + 1)
+        self.assertIn(external, redrawn.winners)
+        self.assertIn(winner, redrawn.winners, "expired winner stays named")
+        self.assertEqual(len(fresh), 1)
+
+    def test_read_winners_raw_round_trip(self) -> None:
+        ended, winner, _users = self._three_entrant_ended()
+        winners, raw = self.svc._read_winners_raw(ended.id)
+        self.assertEqual(winners, [winner])
+        self.assertEqual(json.loads(raw), [winner])
+
+
+class TargetedSettledGuardTests(ServiceTestCase):
+    def _four_entrant_three_winner_ended(self, **kw):
+        gw = self.make(winner_count=3, claim_timeout_seconds=3600, **kw)
+        users = [str(10 ** 17 + i) for i in range(4)]
+        for u in users:
+            self.join(gw, user_id=u)
+        ended, winners = self.svc.end(gw.id)
+        self.assertEqual(len(winners), 3)
+        return ended, winners, users
+
+    def test_targeted_replace_refuses_claimed(self) -> None:
+        ended, winners, _users = self._four_entrant_three_winner_ended()
+        old = winners[0]
+        self.svc.claim(ended.id, old)
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.reroll(ended.id, 1, old)
+        self.assertIn("already claimed", str(ctx.exception.message).lower())
+
+    def test_targeted_replace_refuses_skipped(self) -> None:
+        ended, winners, _users = self._four_entrant_three_winner_ended()
+        old = winners[0]
+        self.svc.skip_claim(ended.id, old, "999999999999999999")
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.reroll(ended.id, 1, old)
+        self.assertIn("already verified", str(ctx.exception.message).lower())
+
+    def test_targeted_replace_refuses_expired(self) -> None:
+        ended, winners, _users = self._four_entrant_three_winner_ended()
+        old = winners[0]
+        deadline = int(self.svc.pending_claims(ended.id)[0]["deadline_ms"])
+        self.svc.expire_claim(ended.id, old, now=deadline + 1)
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.reroll(ended.id, 1, old)
+        self.assertIn("already replaced", str(ctx.exception.message).lower())
+
+    def test_second_replace_of_same_slot_refused(self) -> None:
+        ended, winners, _users = self._four_entrant_three_winner_ended()
+        old = winners[0]
+        _redrawn, fresh = self.svc.reroll(ended.id, 1, old)
+        self.assertNotIn(old, self.svc.get(ended.id).winners)
+        with self.assertRaises(ServiceError):
+            self.svc.reroll(ended.id, 1, old)
+
+
 class GuildSettingTests(ServiceTestCase):
     def test_notify_role_upsert(self) -> None:
         self.assertIsNone(self.svc.get_notify_role(self.guild))

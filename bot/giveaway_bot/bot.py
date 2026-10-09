@@ -86,6 +86,10 @@ class GiveawayBot(commands.Bot):
         #: autocomplete after 3s and a Turso round-trip can exceed that, so
         #: suggestions come from this snapshot — never from the database.
         self._autocomplete_cache: dict[str, list[tuple[str, str]]] = {}
+        #: Same snapshot for ended giveaways. Reroll/skipclaim only work on
+        #: ended rows, and the live cache above never contains one — without
+        #: this they would suggest nothing usable.
+        self._ended_autocomplete_cache: dict[str, list[tuple[str, str]]] = {}
         #: Giveaway ids whose entrants-role delete is already scheduled.
         #: Stops end + cancel + tick racing to queue the same role twice.
         self._scheduled_role_deletes: set[str] = set()
@@ -123,6 +127,12 @@ class GiveawayBot(commands.Bot):
             live = []
         log.info("tracking %d active giveaway(s) from the database", len(live))
         self._cache_autocomplete(live)
+        try:
+            ended_pre = await asyncio.to_thread(self.service.list_all_ended, 200)
+        except Exception:
+            log.exception("could not preload ended giveaways")
+            ended_pre = []
+        self._cache_ended_autocomplete(ended_pre)
         # Restart recovery: finished giveaways whose entrants role was never
         # deleted (bot was down during the 5-minute window, or the delete
         # failed). Clean the pileup now instead of leaving roles forever.
@@ -183,6 +193,18 @@ class GiveawayBot(commands.Bot):
         for gw in live:
             cache.setdefault(gw.guild_id, []).append((gw.id, gw.prize))
         self._autocomplete_cache = cache
+
+    def _cache_ended_autocomplete(self, ended: list[Giveaway]) -> None:
+        """Rebuild the per-guild snapshot for ended giveaways.
+
+        Reroll/skipclaim only accept ended rows, and the live cache above
+        never holds one — without this twin they suggest nothing usable.
+        Same guild-keyed shape so one server cannot crowd out another.
+        """
+        cache: dict[str, list[tuple[str, str]]] = {}
+        for gw in ended:
+            cache.setdefault(gw.guild_id, []).append((gw.id, gw.prize))
+        self._ended_autocomplete_cache = cache
 
     def _pending_messages(self, guild_id: str, user_id: str) -> int:
         """Counts seen but not yet flushed to the database."""
@@ -833,6 +855,12 @@ class GiveawayBot(commands.Bot):
             log.exception("live list failed")
             return
         self._cache_autocomplete(live)
+        try:
+            ended_list = await asyncio.to_thread(self.service.list_all_ended, 200)
+        except Exception:
+            log.exception("ended list failed")
+            ended_list = []
+        self._cache_ended_autocomplete(ended_list)
         await self._refresh_embeds(self._refresh_window(live))
         # Privacy sweep: join data (who entered) older than 5h past the end
         # is wiped. Giveaway records + winner lists stay; message counts are
@@ -904,24 +932,30 @@ class GiveawayBot(commands.Bot):
         except Exception:
             entries = 0
         claim_deadline_ms: int | None = None
+        claim_deadlines: dict[str, int] = {}
         claim_view = None
         try:
             if gw.claim_enabled and winners:
                 pending = await asyncio.to_thread(self.service.pending_claims, gw.id)
-                hits = [
-                    int(r.get("deadline_ms") or 0)
-                    for r in pending
-                    if str(r.get("user_id") or "") in winners and r.get("deadline_ms")
-                ]
-                if hits:
-                    claim_deadline_ms = min(hits)
+                for r in pending:
+                    uid = str(r.get("user_id") or "")
+                    if uid in winners and r.get("deadline_ms"):
+                        try:
+                            claim_deadlines[uid] = int(r.get("deadline_ms") or 0)
+                        except (TypeError, ValueError):
+                            continue
+                claim_deadlines = {k: v for k, v in claim_deadlines.items() if v}
+                if claim_deadlines:
+                    claim_deadline_ms = min(claim_deadlines.values())
                     claim_view = ClaimView(gw.id)
         except Exception:
             log.exception("claim lookup failed for %s", gw.id)
             claim_deadline_ms = None
+            claim_deadlines = {}
             claim_view = None
         embed = embeds.winner_embed(
-            gw, winners, entries, self.settings.embed_color, claim_deadline_ms
+            gw, winners, entries, self.settings.embed_color,
+            claim_deadline_ms, claim_deadlines or None,
         )
         if reroll:
             embed.title = "Giveaway Rerolled"
@@ -980,6 +1014,30 @@ def wire_commands(bot: GiveawayBot) -> None:
             return choices[:25]
         except Exception:
             log.exception("autocomplete failed")
+            return []
+
+    async def _gw_ended_autocomplete(
+        interaction: discord.Interaction, current: str
+    ) -> list[app_commands.Choice[str]]:
+        """Suggest ended giveaways for reroll/skipclaim.
+
+        Same cache-never-database rule as above: the live cache never holds
+        an ended row, so without this twin those commands suggest nothing
+        usable and operators must paste raw ids.
+        """
+        try:
+            if interaction.guild is None:
+                return []
+            gid = str(interaction.guild.id)
+            needle = (current or "").lower()
+            choices = [
+                app_commands.Choice(name=f"🏆 {prize} ({gw_id})"[:100], value=gw_id)
+                for (gw_id, prize) in bot._ended_autocomplete_cache.get(gid, [])
+                if not needle or needle in prize.lower() or needle in gw_id.lower()
+            ]
+            return choices[:25]
+        except Exception:
+            log.exception("ended autocomplete failed")
             return []
 
     @bot.tree.error
@@ -1166,7 +1224,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         await bot._safe_followup(interaction, f"Ended with {len(winners)} winner(s).")
 
     @bot.tree.command(name="giveaway_reroll", description="Draw new winner(s)")
-    @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
+    @app_commands.autocomplete(giveaway_id=_gw_ended_autocomplete)
     @app_commands.describe(
         giveaway_id="Ended giveaway to reroll",
         count="How many new winners to draw (ignored when user is picked)",
@@ -1187,7 +1245,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             return
         try:
             gw = await asyncio.to_thread(
-                svc.resolve, str(interaction.guild.id), giveaway_id
+                svc.resolve_ended, str(interaction.guild.id), giveaway_id
             )
             if user is not None:
                 ended, fresh = await asyncio.to_thread(
@@ -1207,7 +1265,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             await bot._safe_followup(interaction, "🔁 Rerolled.")
 
     @bot.tree.command(name="skipclaim", description="Mark a winner's claim verified (no replacement)")
-    @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
+    @app_commands.autocomplete(giveaway_id=_gw_ended_autocomplete)
     @app_commands.describe(giveaway_id="Ended giveaway with a claim window", user="The winner to verify")
     async def giveaway_skipclaim(
         interaction: discord.Interaction, giveaway_id: str, user: discord.Member
@@ -1221,7 +1279,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             return
         try:
             gw = await asyncio.to_thread(
-                svc.resolve, str(interaction.guild.id), giveaway_id
+                svc.resolve_ended, str(interaction.guild.id), giveaway_id
             )
             await asyncio.to_thread(
                 svc.skip_claim, gw.id, str(user.id), str(interaction.user.id)

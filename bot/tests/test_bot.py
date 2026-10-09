@@ -208,6 +208,33 @@ class AutocompleteCacheTests(BotTestCase):
         self.bot._cache_autocomplete([])
         self.assertEqual(self.bot._autocomplete_cache, {})
 
+    def test_ended_snapshot_is_grouped_per_guild(self) -> None:
+        mine = self.make(prize="mine")
+        self.svc.end(mine.id)
+        theirs = self.make(prize="theirs", guild_id="555555555555555555")
+        self.svc.end(theirs.id)
+        self.bot._cache_ended_autocomplete([self.svc.get(mine.id), self.svc.get(theirs.id)])
+        self.assertEqual(self.bot._ended_autocomplete_cache[self.guild], [(mine.id, "mine")])
+        self.assertEqual(
+            self.bot._ended_autocomplete_cache["555555555555555555"], [(theirs.id, "theirs")]
+        )
+
+    def test_ended_snapshot_is_replaced_not_appended(self) -> None:
+        first = self.make(prize="first")
+        self.svc.end(first.id)
+        self.bot._cache_ended_autocomplete([self.svc.get(first.id)])
+        self.bot._cache_ended_autocomplete([])
+        self.assertEqual(self.bot._ended_autocomplete_cache, {})
+
+    def test_live_and_ended_caches_are_separate(self) -> None:
+        live = self.make(prize="live")
+        done = self.make(prize="done")
+        self.svc.end(done.id)
+        self.bot._cache_autocomplete([self.svc.get(live.id)])
+        self.bot._cache_ended_autocomplete([self.svc.get(done.id)])
+        self.assertEqual(self.bot._autocomplete_cache[self.guild], [(live.id, "live")])
+        self.assertEqual(self.bot._ended_autocomplete_cache[self.guild], [(done.id, "done")])
+
 
 class RoleTaskTests(BotTestCase):
     def test_scheduled_deletes_are_kept_alive_and_deduplicated(self) -> None:

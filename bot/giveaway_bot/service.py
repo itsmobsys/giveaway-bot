@@ -278,6 +278,57 @@ class GiveawayService:
             " or copy the ID from /giveaway_list."
         )
 
+    def list_ended(self, guild_id: str, limit: int = 25) -> list[Giveaway]:
+        """Ended giveaways in one server, most recently ended first."""
+        rows = self.db.query(
+            "SELECT * FROM simple_giveaways WHERE guild_id = ? AND status = 'ended'"
+            " ORDER BY ended_at DESC LIMIT ?",
+            (guild_id, max(1, min(int(limit), 100))),
+        )
+        return [Giveaway.from_row(r) for r in rows]
+
+    def list_all_ended(self, limit: int = 200) -> list[Giveaway]:
+        """Every ended giveaway, most recently ended first. Feeds the ended autocomplete cache."""
+        rows = self.db.query(
+            "SELECT * FROM simple_giveaways WHERE status = 'ended'"
+            " ORDER BY ended_at DESC LIMIT ?",
+            (max(1, min(int(limit), 200)),),
+        )
+        return [Giveaway.from_row(r) for r in rows]
+
+    def resolve_ended(self, guild_id: str, raw_id: str) -> Giveaway:
+        """Find an ended giveaway by id, falling back to the ended one.
+
+        Reroll/skipclaim only work on ended giveaways, so unlike resolve() this
+        never falls back to a live one: handing back a running giveaway here
+        would only fail one step later with a confusing message (or worse, act
+        on the wrong giveaway when the typed id was a typo).
+        """
+        raw_id = (raw_id or "").strip()
+        if raw_id:
+            try:
+                gw = self.get(raw_id)
+            except ServiceError:
+                # Unknown id: fall through to the ended-list errors below, so a
+                # typo says "did not match" (or "No ended giveaway") instead of
+                # a bare "Giveaway not found." Same shape as resolve().
+                pass
+            else:
+                if str(gw.guild_id) != str(guild_id):
+                    raise ServiceError("That giveaway belongs to another server.")
+                if gw.active or gw.status != "ended":
+                    raise ServiceError("That giveaway has not ended yet.")
+                return gw
+        ended = self.list_ended(guild_id)
+        if len(ended) == 1:
+            return ended[0]
+        if not ended:
+            raise ServiceError("No ended giveaway in this server.")
+        raise ServiceError(
+            "That ID did not match. Pick one from the suggestions as you type,"
+            " or copy the ID from /giveaway_list."
+        )
+
     def entry_count(self, giveaway_id: str) -> int:
         row = self.db.query_one(
             "SELECT COUNT(*) AS n FROM simple_entries WHERE giveaway_id = ?", (giveaway_id,)
@@ -563,6 +614,24 @@ class GiveawayService:
             return []
         return self._rand.sample(pool, min(n, len(pool)))
 
+    def _read_winners_raw(self, giveaway_id: str) -> tuple[list[str], str]:
+        """Current winners plus the stored raw JSON for a CAS update.
+
+        json.dumps has one canonical form here (no spaces), but comparing the
+        raw text instead of re-encoding avoids any mismatch tripping the
+        compare-and-swap in reroll/replace/expire.
+        """
+        row = self.db.query_one(
+            "SELECT winners_json FROM simple_giveaways WHERE id = ?", (giveaway_id,)
+        )
+        raw = str((row or {}).get("winners_json") or "[]")
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            parsed = []
+        winners = [str(w) for w in parsed] if isinstance(parsed, list) else []
+        return winners, raw
+
     def end(self, giveaway_id: str) -> tuple[Giveaway, list[str]]:
         """End a running giveaway and draw its winners.
 
@@ -642,17 +711,50 @@ class GiveawayService:
             # Redrawing from everyone would announce earlier winners as new
             # ones (or nobody at all once the entries were wiped): say so.
             raise ServiceError("No other entrants left to reroll")
-        combined = prev + [w for w in fresh if w not in prev]
-        self.db.execute(
-            "UPDATE simple_giveaways SET winners_json = ? WHERE id = ?", (json.dumps(combined), gw.id)
-        )
-        ended = self.get(gw.id)
-        # Open a claim window for the fresh winners. No-op when the giveaway
-        # has no claim timer; INSERT OR IGNORE keeps a retried announce safe.
-        # The old winner's pending row is left alone: a manual reroll is
-        # additive, and its own deadline still expires/skips independently.
-        self.start_claims(ended, fresh)
-        return ended, fresh
+        # CAS append: two rerolls/expiries racing both read the same
+        # winners_json and the loser would overwrite the winner's draw.
+        # Re-read + compare-and-swap so the loser rebases and retries.
+        for _ in range(5):
+            winners_now, raw_now = self._read_winners_raw(gw.id)
+            room_now = self.MAX_WINNERS - len(winners_now)
+            if room_now < 1:
+                raise ServiceError(
+                    f"This giveaway already names {len(winners_now)} winners, the most one"
+                    " announcement can hold."
+                )
+            # Fresh was picked against a possibly stale drawn set; drop any
+            # that landed while we were picking so we never duplicate.
+            use = [w for w in fresh if w not in winners_now]
+            if not use:
+                # Everything we drew is already named (a racing draw picked
+                # the same entrant): re-pick the shortfall, still excluding
+                # everyone ever drawn.
+                drawn_now: set[str] = set(winners_now)
+                for r in self.db.query(
+                    "SELECT user_id FROM simple_claims WHERE giveaway_id = ?", (gw.id,)
+                ):
+                    drawn_now.add(str(r.get("user_id")))
+                need = max(1, min(int(count or gw.winner_count), room_now))
+                repick = self._pick(gw.id, need, exclude=sorted(drawn_now))
+                use = [w for w in repick if w not in winners_now]
+                if not use:
+                    raise ServiceError("No other entrants left to reroll")
+                fresh = use
+            combined = winners_now + use
+            cur = self.db.execute(
+                "UPDATE simple_giveaways SET winners_json = ? WHERE id = ? AND winners_json = ?",
+                (json.dumps(combined), gw.id, raw_now),
+            )
+            if _changed(cur):
+                ended = self.get(gw.id)
+                # Open a claim window for the fresh winners. No-op when the
+                # giveaway has no claim timer; INSERT OR IGNORE keeps a
+                # retried announce safe. The old winner's pending row is left
+                # alone: a manual reroll is additive, and its own deadline
+                # still expires/skips independently.
+                self.start_claims(ended, use)
+                return ended, use
+        raise ServiceError("Reroll collided with another draw. Try again.")
 
     def _reroll_replace(self, gw: Giveaway, replace_user_id: str) -> tuple[Giveaway, list[str]]:
         """Swap one named winner for a fresh entrant. Returns (giveaway, [new]).
@@ -667,6 +769,24 @@ class GiveawayService:
         prev = list(gw.winners)
         if replace_user_id not in prev:
             raise ServiceError("That member is not a winner of this giveaway.")
+        # Settled claims cannot be replaced: a claimed/skipped prize is done,
+        # and an expired/replaced slot already drew its replacement. Only a
+        # pending (unclaimed) winner or a claims-disabled row may be swapped.
+        clash = self.db.query_one(
+            "SELECT status FROM simple_claims WHERE giveaway_id = ? AND user_id = ?"
+            " ORDER BY round DESC LIMIT 1",
+            (gw.id, replace_user_id),
+        )
+        if clash is not None:
+            settled = str(clash.get("status") or "")
+            if settled == self.CLAIM_CLAIMED:
+                raise ServiceError("That prize was already claimed.")
+            if settled == self.CLAIM_SKIPPED:
+                raise ServiceError("That claim was already verified by staff.")
+            if settled in (self.CLAIM_EXPIRED, self.CLAIM_REPLACED):
+                raise ServiceError("That winner was already replaced.")
+            if settled != self.CLAIM_PENDING:
+                raise ServiceError("That claim window has already closed.")
         drawn: set[str] = set(prev)
         for r in self.db.query(
             "SELECT user_id FROM simple_claims WHERE giveaway_id = ?", (gw.id,)
@@ -676,48 +796,70 @@ class GiveawayService:
         if not fresh:
             raise ServiceError("No other entrants left to reroll")
         new_user = fresh[0]
-        # Swap in place: first matching slot only, order preserved.
-        combined = [new_user if w == replace_user_id else w for w in prev]
-        # Defensive: if the winners list somehow held the old id twice, only
-        # the first slot swaps and the rest stay (never duplicate the new id).
-        seen_new = False
-        fixed: list[str] = []
-        for w in combined:
-            if w == new_user:
-                if seen_new:
-                    fixed.append(replace_user_id)
-                    continue
-                seen_new = True
-            fixed.append(w)
-        combined = fixed
-        self.db.execute(
-            "UPDATE simple_giveaways SET winners_json = ? WHERE id = ?", (json.dumps(combined), gw.id)
-        )
-        # Close the old slot's pending claim so a later tick cannot expire it
-        # into a second replacement for the same slot. Any status counts as
-        # "ever drawn", so the exclusion holds even after the swap.
-        self.db.execute(
-            "UPDATE simple_claims SET status = ?"
-            " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
-            (self.CLAIM_REPLACED, gw.id, replace_user_id),
-        )
-        row = self.db.query_one(
-            "SELECT user_id FROM simple_claims WHERE giveaway_id = ? AND user_id = ? LIMIT 1",
-            (gw.id, replace_user_id),
-        )
-        if row is None:
-            # No claim row at all (e.g. claims disabled): leave a `replaced`
-            # marker so this user stays excluded from every future draw.
-            self.db.execute(
-                "INSERT OR IGNORE INTO simple_claims"
-                " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
-                " VALUES (?, ?, 0, ?, 0, ?)",
-                (gw.id, replace_user_id, self.CLAIM_REPLACED, now_ms()),
+        # CAS swap with retry: a racing reroll/expire may rewrite winners_json
+        # between our read and write; the loser rebases instead of overwriting.
+        for _ in range(5):
+            winners_now, raw_now = self._read_winners_raw(gw.id)
+            if replace_user_id not in winners_now:
+                raise ServiceError("That member is not a winner of this giveaway.")
+            if new_user in winners_now:
+                # Racing draw picked the same entrant: re-pick, still excluding
+                # everyone ever drawn.
+                drawn_now: set[str] = set(winners_now)
+                for r in self.db.query(
+                    "SELECT user_id FROM simple_claims WHERE giveaway_id = ?", (gw.id,)
+                ):
+                    drawn_now.add(str(r.get("user_id")))
+                repick = self._pick(gw.id, 1, exclude=sorted(drawn_now))
+                if not repick:
+                    raise ServiceError("No other entrants left to reroll")
+                new_user = repick[0]
+            # Swap in place: first matching slot only, order preserved.
+            swapped = [new_user if w == replace_user_id else w for w in winners_now]
+            # Defensive: if the winners list somehow held the old id twice,
+            # only the first slot swaps and the rest stay (never duplicate).
+            seen_new = False
+            fixed: list[str] = []
+            for w in swapped:
+                if w == new_user:
+                    if seen_new:
+                        fixed.append(replace_user_id)
+                        continue
+                    seen_new = True
+                fixed.append(w)
+            combined = fixed
+            cur = self.db.execute(
+                "UPDATE simple_giveaways SET winners_json = ? WHERE id = ? AND winners_json = ?",
+                (json.dumps(combined), gw.id, raw_now),
             )
-        ended = self.get(gw.id)
-        # Fresh winner's own claim window. No-op when claims are disabled.
-        self.start_claims(ended, [new_user])
-        return ended, [new_user]
+            if not _changed(cur):
+                continue
+            # Close the old slot's pending claim so a later tick cannot expire
+            # it into a second replacement for the same slot. Any status counts
+            # as "ever drawn", so the exclusion holds even after the swap.
+            self.db.execute(
+                "UPDATE simple_claims SET status = ?"
+                " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
+                (self.CLAIM_REPLACED, gw.id, replace_user_id),
+            )
+            row = self.db.query_one(
+                "SELECT user_id FROM simple_claims WHERE giveaway_id = ? AND user_id = ? LIMIT 1",
+                (gw.id, replace_user_id),
+            )
+            if row is None:
+                # No claim row at all (e.g. claims disabled): leave a marker
+                # so this user stays excluded from every future draw.
+                self.db.execute(
+                    "INSERT OR IGNORE INTO simple_claims"
+                    " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
+                    " VALUES (?, ?, 0, ?, 0, ?)",
+                    (gw.id, replace_user_id, self.CLAIM_REPLACED, now_ms()),
+                )
+            ended = self.get(gw.id)
+            # Fresh winner's own claim window. No-op when claims are disabled.
+            self.start_claims(ended, [new_user])
+            return ended, [new_user]
+        raise ServiceError("Reroll collided with another draw. Try again.")
 
     # -- winner claims (optional claim timer) -----------------------------
     #: Claim row statuses. `pending` rows hold a deadline; the rest are final.
@@ -878,14 +1020,37 @@ class GiveawayService:
         fresh = self._pick(gw.id, 1, exclude=drawn)
         if not fresh:
             return self.get(gw.id), []
-        combined = list(gw.winners) + [w for w in fresh if w not in gw.winners]
-        self.db.execute(
-            "UPDATE simple_giveaways SET winners_json = ? WHERE id = ?",
-            (json.dumps(combined), gw.id),
-        )
-        ended = self.get(gw.id)
-        self.start_claims(ended, fresh, now=ts)
-        return ended, fresh
+        # CAS append with retry: a racing additive reroll may rewrite
+        # winners_json between our pick and write; the loser rebases instead
+        # of overwriting the other draw.
+        for _ in range(5):
+            winners_now, raw_now = self._read_winners_raw(gw.id)
+            use = [w for w in fresh if w not in winners_now]
+            if not use:
+                # Racing draw took the same entrant: pick another, still
+                # excluding everyone ever drawn.
+                redrawn: set[str] = set(winners_now)
+                for r in self.db.query(
+                    "SELECT user_id FROM simple_claims WHERE giveaway_id = ?",
+                    (giveaway_id,),
+                ):
+                    redrawn.add(str(r.get("user_id")))
+                repick = self._pick(gw.id, 1, exclude=sorted(redrawn))
+                if not repick:
+                    return self.get(gw.id), []
+                fresh = repick
+                continue
+            combined = winners_now + use
+            cur2 = self.db.execute(
+                "UPDATE simple_giveaways SET winners_json = ? WHERE id = ? AND winners_json = ?",
+                (json.dumps(combined), gw.id, raw_now),
+            )
+            if not _changed(cur2):
+                continue
+            ended = self.get(gw.id)
+            self.start_claims(ended, use, now=ts)
+            return ended, use
+        raise ServiceError("Reroll collided with another draw. Try again.")
 
     def discard(self, giveaway_id: str) -> None:
         """Drop a giveaway that never reached Discord.

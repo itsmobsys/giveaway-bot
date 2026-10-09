@@ -129,6 +129,7 @@ def timeout_bans_embed(
 def winner_embed(
     gw: Giveaway, winners: list[str], entries: int, color: int,
     claim_deadline_ms: int | None = None,
+    claim_deadlines: dict[str, int] | None = None,
 ) -> discord.Embed:
     if winners:
         # Discord caps a description at 4096 characters, so an old reroll row
@@ -145,9 +146,28 @@ def winner_embed(
         )
     else:
         desc = f"## 🎊 {gw.prize} 🎊\n\nNo valid entries — no winners this time."
-    if claim_deadline_ms:
-        ts = int(claim_deadline_ms / 1000)
-        desc += f"\n\n🎁 Winners: claim by <t:{ts}:R> — press **Claim Prize** below."
+    deadlines: dict[str, int] = dict(claim_deadlines or {})
+    if claim_deadline_ms and winners:
+        # Back-compat: callers that only know the earliest deadline fill every
+        # announced winner with it; callers with per-winner data pass the map.
+        for w in winners:
+            deadlines.setdefault(str(w), int(claim_deadline_ms))
+    if deadlines and winners:
+        uniq = sorted({int(v) for v in deadlines.values() if v})
+        if len(uniq) == 1:
+            ts = int(uniq[0] / 1000)
+            desc += f"\n\n🎁 Winners: claim by <t:{ts}:R> — press **Claim Prize** below."
+        else:
+            # Divergent windows (expiry replacements land later): one line per
+            # winner so nobody misses their own deadline. Capped at the named
+            # fifty so a huge reroll history cannot blow the 4096-char limit.
+            lines = []
+            for w in winners[:WINNERS_NAMED]:
+                dl = deadlines.get(str(w))
+                if dl:
+                    lines.append(f"<@{w}>: <t:{int(dl / 1000)}:R>")
+            if lines:
+                desc += "\n\n🎁 Claim by — press **Claim Prize** below:\n" + "\n".join(lines)
     if gw.host_id:
         host_label = gw.host_name or "host"
         desc += f"\n🎤 Hosted by <@{gw.host_id}> ({host_label})"
