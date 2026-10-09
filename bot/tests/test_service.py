@@ -1158,6 +1158,70 @@ class ClaimTests(ServiceTestCase):
         with self.assertRaises(ServiceError):
             self.svc.reroll(ended.id, 1)
 
+    def _four_entrant_three_winner_ended(self, **kw):
+        gw = self.make(winner_count=3, claim_timeout_seconds=3600, **kw)
+        users = [str(10 ** 17 + i) for i in range(4)]
+        for u in users:
+            self.join(gw, user_id=u)
+        ended, winners = self.svc.end(gw.id)
+        self.assertEqual(len(winners), 3)
+        return ended, winners, users
+
+    def test_targeted_reroll_replaces_one_slot_in_place(self) -> None:
+        ended, winners, users = self._four_entrant_three_winner_ended()
+        old = winners[0]
+        expected = next(u for u in users if u not in winners)
+        redrawn, fresh = self.svc.reroll(ended.id, 1, old)
+        self.assertEqual(fresh, [expected])
+        # Same length, order preserved: only the picked slot swaps.
+        self.assertEqual(len(redrawn.winners), 3)
+        self.assertEqual(redrawn.winners[0], fresh[0])
+        self.assertEqual(redrawn.winners[1:], winners[1:])
+        self.assertNotIn(old, redrawn.winners)
+        # The old pending is closed as replaced; the fresh winner gets one.
+        statuses = {str(r["user_id"]): str(r["status"]) for r in self.svc.claim_status(ended.id)}
+        self.assertEqual(statuses[old], "replaced")
+        self.assertEqual(statuses[fresh[0]], "pending")
+        pending = {str(r["user_id"]) for r in self.svc.pending_claims(ended.id)}
+        self.assertEqual(pending, set(redrawn.winners))
+        # The fresh winner can press Claim Prize; the old one gets a clear no.
+        self.svc.claim(ended.id, fresh[0])
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.claim(ended.id, old)
+        self.assertIn("replaced", str(ctx.exception.message).lower())
+
+    def test_targeted_reroll_rejects_non_winner_and_exhausted_pool(self) -> None:
+        ended, winners, _users = self._four_entrant_three_winner_ended()
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.reroll(ended.id, 1, "999999999999999999")
+        self.assertIn("not a winner", str(ctx.exception.message).lower())
+        # One swap exhausts the 4-entrant pool: every user is now ever-drawn.
+        _redrawn, _fresh = self.svc.reroll(ended.id, 1, winners[0])
+        with self.assertRaises(ServiceError) as ctx2:
+            self.svc.reroll(ended.id, 1, winners[1])
+        self.assertIn("no other entrants", str(ctx2.exception.message).lower())
+        with self.assertRaises(ServiceError):
+            self.svc.reroll(ended.id, 1)
+
+    def test_targeted_reroll_without_claims_still_excludes(self) -> None:
+        gw = self.make(winner_count=1)
+        users = [str(10 ** 17 + i) for i in range(2)]
+        for u in users:
+            self.join(gw, user_id=u)
+        ended, winners = self.svc.end(gw.id)
+        old = winners[0]
+        redrawn, fresh = self.svc.reroll(ended.id, 1, old)
+        self.assertEqual(len(fresh), 1)
+        self.assertNotEqual(fresh[0], old)
+        self.assertEqual(redrawn.winners, fresh)
+        # A replaced marker keeps the old winner out of every future draw.
+        rows = self.svc.claim_status(ended.id)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(str(rows[0]["user_id"]), old)
+        self.assertEqual(str(rows[0]["status"]), "replaced")
+        with self.assertRaises(ServiceError):
+            self.svc.reroll(ended.id, 1)
+
 
 class GuildSettingTests(ServiceTestCase):
     def test_notify_role_upsert(self) -> None:

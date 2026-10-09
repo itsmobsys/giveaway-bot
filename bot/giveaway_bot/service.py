@@ -605,7 +605,9 @@ class GiveawayService:
         self.start_claims(ended, winners)
         return ended, winners
 
-    def reroll(self, giveaway_id: str, count: int = 1) -> tuple[Giveaway, list[str]]:
+    def reroll(
+        self, giveaway_id: str, count: int = 1, replace_user_id: str | None = None
+    ) -> tuple[Giveaway, list[str]]:
         gw = self.get(giveaway_id)
         if gw.active:
             raise ServiceError("End the giveaway before rerolling.")
@@ -613,6 +615,8 @@ class GiveawayService:
             # A cancelled giveaway keeps its entries, so without this a reroll
             # would hand out prizes for a giveaway the server called off.
             raise ServiceError("A cancelled giveaway cannot be rerolled.")
+        if replace_user_id is not None:
+            return self._reroll_replace(gw, str(replace_user_id))
         # The whole list has to stay inside MAX_WINNERS. create() bounds the first
         # draw, but a reroll only ever adds, so repeated rerolls used to grow the
         # announcement past what Discord will accept — and the post then failed.
@@ -650,12 +654,79 @@ class GiveawayService:
         self.start_claims(ended, fresh)
         return ended, fresh
 
+    def _reroll_replace(self, gw: Giveaway, replace_user_id: str) -> tuple[Giveaway, list[str]]:
+        """Swap one named winner for a fresh entrant. Returns (giveaway, [new]).
+
+        Targeted /reroll: the admin picks which winner loses their slot (e.g.
+        C never claimed while A and B did). The old winner is swapped out in
+        place so the winners list never grows, and their pending claim (if any)
+        is closed as `replaced` so the tick can never expire it into a duplicate
+        slot. The replacement gets its own claim window. Never re-picks anyone
+        ever drawn (winners_json + every simple_claims row, any status).
+        """
+        prev = list(gw.winners)
+        if replace_user_id not in prev:
+            raise ServiceError("That member is not a winner of this giveaway.")
+        drawn: set[str] = set(prev)
+        for r in self.db.query(
+            "SELECT user_id FROM simple_claims WHERE giveaway_id = ?", (gw.id,)
+        ):
+            drawn.add(str(r.get("user_id")))
+        fresh = self._pick(gw.id, 1, exclude=sorted(drawn))
+        if not fresh:
+            raise ServiceError("No other entrants left to reroll")
+        new_user = fresh[0]
+        # Swap in place: first matching slot only, order preserved.
+        combined = [new_user if w == replace_user_id else w for w in prev]
+        # Defensive: if the winners list somehow held the old id twice, only
+        # the first slot swaps and the rest stay (never duplicate the new id).
+        seen_new = False
+        fixed: list[str] = []
+        for w in combined:
+            if w == new_user:
+                if seen_new:
+                    fixed.append(replace_user_id)
+                    continue
+                seen_new = True
+            fixed.append(w)
+        combined = fixed
+        self.db.execute(
+            "UPDATE simple_giveaways SET winners_json = ? WHERE id = ?", (json.dumps(combined), gw.id)
+        )
+        # Close the old slot's pending claim so a later tick cannot expire it
+        # into a second replacement for the same slot. Any status counts as
+        # "ever drawn", so the exclusion holds even after the swap.
+        self.db.execute(
+            "UPDATE simple_claims SET status = ?"
+            " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
+            (self.CLAIM_REPLACED, gw.id, replace_user_id),
+        )
+        row = self.db.query_one(
+            "SELECT user_id FROM simple_claims WHERE giveaway_id = ? AND user_id = ? LIMIT 1",
+            (gw.id, replace_user_id),
+        )
+        if row is None:
+            # No claim row at all (e.g. claims disabled): leave a `replaced`
+            # marker so this user stays excluded from every future draw.
+            self.db.execute(
+                "INSERT OR IGNORE INTO simple_claims"
+                " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
+                " VALUES (?, ?, 0, ?, 0, ?)",
+                (gw.id, replace_user_id, self.CLAIM_REPLACED, now_ms()),
+            )
+        ended = self.get(gw.id)
+        # Fresh winner's own claim window. No-op when claims are disabled.
+        self.start_claims(ended, [new_user])
+        return ended, [new_user]
+
     # -- winner claims (optional claim timer) -----------------------------
     #: Claim row statuses. `pending` rows hold a deadline; the rest are final.
     CLAIM_PENDING = "pending"
     CLAIM_CLAIMED = "claimed"
     CLAIM_EXPIRED = "expired"
     CLAIM_SKIPPED = "skipped"
+    #: A pending claim closed by a targeted /reroll (replaced, not expired).
+    CLAIM_REPLACED = "replaced"
 
     def start_claims(self, gw: Giveaway, winners: list[str], now: int | None = None) -> None:
         """Open a claim window for freshly drawn winners. Idempotent.
@@ -730,6 +801,8 @@ class GiveawayService:
                 raise ServiceError("This prize was already claimed.")
             if status == self.CLAIM_SKIPPED:
                 raise ServiceError("This prize was already verified by staff.")
+            if status == self.CLAIM_REPLACED:
+                raise ServiceError("This winner was replaced by a reroll.")
             raise ServiceError("This claim window has closed.")
         row = self.db.query_one(
             "SELECT * FROM simple_claims WHERE giveaway_id = ? AND user_id = ?"
@@ -764,6 +837,8 @@ class GiveawayService:
                 raise ServiceError("That prize was already claimed.")
             if status == self.CLAIM_SKIPPED:
                 raise ServiceError("That claim was already verified by staff.")
+            if status == self.CLAIM_REPLACED:
+                raise ServiceError("That winner was replaced by a reroll.")
             raise ServiceError("That claim window has already closed.")
         row = self.db.query_one(
             "SELECT * FROM simple_claims WHERE giveaway_id = ? AND user_id = ?"

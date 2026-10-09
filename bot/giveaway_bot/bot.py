@@ -1167,7 +1167,17 @@ def wire_commands(bot: GiveawayBot) -> None:
 
     @bot.tree.command(name="giveaway_reroll", description="Draw new winner(s)")
     @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
-    async def giveaway_reroll(interaction: discord.Interaction, giveaway_id: str, count: int = 1) -> None:
+    @app_commands.describe(
+        giveaway_id="Ended giveaway to reroll",
+        count="How many new winners to draw (ignored when user is picked)",
+        user="Replace only this winner (e.g. the one who never claimed)",
+    )
+    async def giveaway_reroll(
+        interaction: discord.Interaction,
+        giveaway_id: str,
+        count: int = 1,
+        user: discord.Member | None = None,
+    ) -> None:
         if interaction.guild is None or not _can_manage(interaction.user):
             await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
             return
@@ -1179,12 +1189,22 @@ def wire_commands(bot: GiveawayBot) -> None:
             gw = await asyncio.to_thread(
                 svc.resolve, str(interaction.guild.id), giveaway_id
             )
-            ended, fresh = await asyncio.to_thread(svc.reroll, gw.id, max(1, count))
+            if user is not None:
+                ended, fresh = await asyncio.to_thread(
+                    svc.reroll, gw.id, 1, str(user.id)
+                )
+            else:
+                ended, fresh = await asyncio.to_thread(svc.reroll, gw.id, max(1, count))
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
         await bot._announce(ended, fresh, reroll=True)
-        await bot._safe_followup(interaction, "🔁 Rerolled.")
+        if user is not None and fresh:
+            await bot._safe_followup(
+                interaction, f"🔁 Replaced {user.mention} with <@{fresh[0]}>."
+            )
+        else:
+            await bot._safe_followup(interaction, "🔁 Rerolled.")
 
     @bot.tree.command(name="skipclaim", description="Mark a winner's claim verified (no replacement)")
     @app_commands.autocomplete(giveaway_id=_gw_autocomplete)
