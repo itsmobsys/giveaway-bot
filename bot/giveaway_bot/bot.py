@@ -284,14 +284,24 @@ class GiveawayBot(commands.Bot):
         log.info("tracking %d active giveaway(s) from the database", len(live))
         # P1-1 warmup: spin all 64 pool threads now so the first real burst
         # never pays thread-spawn + TLS + Turso-auth per cold lane (~342ms).
-        # One cheap SELECT per lane; failures only log (first burst warms it).
+        # One cheap SELECT per lane, every lane: a partial warm left most lanes
+        # cold, so the first burst still paid ~340ms+ on them. Failures only
+        # log (first burst warms it).
         try:
             pool = self._pool()
             warm = asyncio.get_running_loop()
-            await asyncio.gather(*(
-                warm.run_in_executor(pool, self.db.query_one, "SELECT 1", ())
-                for _ in range(16)
-            ))
+            # return_exceptions=True: one flaky lane must not fail the other
+            # 63 warms, and a single reconnect storm must not read as fatal.
+            results = await asyncio.gather(
+                *(
+                    warm.run_in_executor(pool, self.db.query_one, "SELECT 1", ())
+                    for _ in range(64)
+                ),
+                return_exceptions=True,
+            )
+            failed = sum(1 for r in results if isinstance(r, Exception))
+            if failed:
+                log.warning("db pool warmup: %d/64 lane(s) failed", failed)
         except Exception:
             log.exception("db pool warmup failed")
         self._cache_autocomplete(live)
@@ -2304,6 +2314,16 @@ def wire_commands(bot: GiveawayBot) -> None:
             return
         t0 = time.perf_counter()
         try:
+            # Reference only: one sleep(0) round-trip through the event loop.
+            # A healthy loop answers in ~0.01ms; milliseconds here mean the loop
+            # was stalled (blocked callback / CPU steal), and that same stall
+            # sits inside the ack number below. Never in the slowest-leg race.
+            t_lag = time.perf_counter()
+            await asyncio.sleep(0)
+            loop_lag_ms: float | None = (time.perf_counter() - t_lag) * 1000.0
+        except Exception:
+            loop_lag_ms = None
+        try:
             t_ack = time.perf_counter()
             await interaction.response.defer(ephemeral=True, thinking=True)
             ack_ms: float | None = (time.perf_counter() - t_ack) * 1000.0
@@ -2321,27 +2341,40 @@ def wire_commands(bot: GiveawayBot) -> None:
         except Exception:
             gateway_ms = None
         ping_ms: float | None = None
+        ping_note = ""
+        lookup_ms: float | None = None
+        lookup_note = ""
         read_ms: float | None = None
         read_note = ""
         write_ms: float | None = None
         write_note = ""
         rest_ms: float | None = None
         # Leg 1: minimal Turso round-trip on the same gated lane Join uses.
+        # "Ping" is one SELECT 1 query + row fetch, not ICMP: warm it costs
+        # ~1 RTT, while a cold/stale lane pays TLS + Turso auth inside this
+        # same number (that is the cold-vs-warm gap, not server slowness).
         try:
             t_leg = time.perf_counter()
             await bot._db_call(bot.db.query_one, "SELECT 1", ())
             ping_ms = (time.perf_counter() - t_leg) * 1000.0
+            ping_note = "SELECT 1 round-trip (warm ~= 1 RTT; cold lane adds TLS+auth)"
         except Exception:
             log.exception("request-time ping probe failed")
+            ping_note = "ping probe failed"
         # Leg 2: the exact pre-ack read the Join button runs. With a live
         # giveaway that is join_snapshot (row + 4 eligibility subqueries, one
         # trip); without one, the same-shaped eligibility SELECT, labelled so
         # nobody mistakes a synthetic read for a live one.
         try:
             try:
+                t_lookup = time.perf_counter()
                 live = await bot._db_call(svc.list_active, gid)
+                lookup_ms = (time.perf_counter() - t_lookup) * 1000.0
+                lookup_note = f"{len(live)} live giveaway(s) listed"
             except Exception:
                 live = []
+                lookup_ms = None
+                lookup_note = "lookup failed"
             t_leg = time.perf_counter()
             if live:
                 target = live[0]
@@ -2363,19 +2396,26 @@ def wire_commands(bot: GiveawayBot) -> None:
         probe_uid = "gw_request_time_probe"
         try:
             t_leg = time.perf_counter()
+            t_ins = time.perf_counter()
             await bot._db_call(
                 bot.db.execute,
                 "INSERT INTO simple_message_counts (guild_id, user_id, count)"
                 " VALUES (?, ?, 0) ON CONFLICT (guild_id, user_id) DO NOTHING",
                 (gid, probe_uid),
             )
+            insert_ms = (time.perf_counter() - t_ins) * 1000.0
+            t_del = time.perf_counter()
             await bot._db_call(
                 bot.db.execute,
                 "DELETE FROM simple_message_counts WHERE guild_id = ? AND user_id = ?",
                 (gid, probe_uid),
             )
+            delete_ms = (time.perf_counter() - t_del) * 1000.0
             write_ms = (time.perf_counter() - t_leg) * 1000.0
-            write_note = "insert + delete of one probe row"
+            write_note = (
+                f"insert {insert_ms:.0f}ms + delete {delete_ms:.0f}ms of one probe"
+                " row (2 writes x execute+commit)"
+            )
         except Exception:
             log.exception("request-time write probe failed")
             write_note = "write probe failed"
@@ -2426,12 +2466,14 @@ def wire_commands(bot: GiveawayBot) -> None:
             ("Discord ack", ack_ms),
             ("Discord reply", rest_ms),
             ("Turso ping", ping_ms),
+            ("Turso lookup", lookup_ms),
             ("Turso read", read_ms),
             ("Turso write", write_ms),
         ]
         known = [(name, value) for name, value in short if value is not None]
         slowest = max(known, key=lambda item: item[1])[0] if known else "n/a"
         gw_txt = f"{gateway_ms:.0f}ms" if gateway_ms is not None else "n/a (offline)"
+        lag_txt = f"{loop_lag_ms:.2f}ms" if loop_lag_ms is not None else "n/a"
         try:
             sess = f"{int(stats.get('reads', 0))} reads / {int(stats.get('writes', 0))} writes"
         except Exception:
@@ -2441,10 +2483,12 @@ def wire_commands(bot: GiveawayBot) -> None:
             "Request-time breakdown — live legs, timed just now:",
             f"• Discord ack (defer): **{_fmt(ack_ms)}**",
             f"• Discord reply (REST send): **{_fmt(rest_ms)}**",
-            f"• Turso ping: **{_fmt(ping_ms)}**",
+            f"• Turso ping: **{_fmt(ping_ms)}** — {ping_note or 'n/a'}",
+            f"• Turso lookup (list_active): **{_fmt(lookup_ms)}** — {lookup_note or 'n/a'}",
             f"• Turso read: **{_fmt(read_ms)}** — {read_note or 'n/a'}",
             f"• Turso write: **{_fmt(write_ms)}** — {write_note or 'n/a'}",
             f"• Gateway heartbeat: **{gw_txt}** (websocket, for reference)",
+            f"• Event-loop lag: **{lag_txt}** (sleep(0) sample, for reference)",
             f"• Total measured: **{total_ms:.0f}ms** (excludes this message's edit)",
             f"• Slowest leg: **{slowest}**",
             f"• Backend: `{backend}`{where} · db lanes free: {lanes} · session: {sess}",

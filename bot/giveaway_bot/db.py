@@ -195,10 +195,14 @@ class Database:
             conn = self._factory()
             with contextlib.suppress(Exception):
                 conn.isolation_level = None  # autocommit, where the driver offers it
-            try:
-                conn.execute("PRAGMA busy_timeout=10000")
-            except Exception:
-                pass
+            if getattr(self, "backend", "") != "turso":
+                # Local-only: busy_timeout governs file locking, which a remote
+                # Turso stream has none of. Running it there costs a full extra
+                # round-trip (~40-100ms warm) on every cold thread for nothing.
+                try:
+                    conn.execute("PRAGMA busy_timeout=10000")
+                except Exception:
+                    pass
             self._local.conn = conn
             with self._lock:
                 self._connections.append(conn)

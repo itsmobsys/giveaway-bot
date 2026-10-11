@@ -1853,6 +1853,22 @@ class RequestTimeTests(BotTestCase):
         )
         self.assertEqual(rows, [])
 
+    def test_probe_times_lookup_and_splits_write(self) -> None:
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        report = self.run_command(interaction)
+        if isinstance(report, dict):
+            text = report.get("content") or ""
+        else:
+            text = getattr(report, "content", "") or ""
+        for leg in (
+            "Turso lookup",
+            "Event-loop lag",
+            "SELECT 1 round-trip",
+            "insert",
+            "delete",
+        ):
+            self.assertIn(leg, text)
+
     def test_dm_says_to_use_a_server(self) -> None:
         interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
         interaction.guild = None
