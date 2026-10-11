@@ -376,11 +376,25 @@ class GiveawayService:
         user_id: str = "",
         pending_messages: int = 0,
         timed_out: bool = False,
+        snapshot: tuple[bool, int, int, bool] | None = None,
     ) -> None:
+        snap_bl: bool | None = None
+        snap_ban: int | None = None
+        snap_msgs: int | None = None
+        snap_hit: bool | None = None
+        if snapshot is not None:
+            snap_bl, snap_ban, snap_msgs, snap_hit = snapshot
         if not gw.active:
             raise ServiceError("This giveaway has ended.")
-        if user_id and self.is_blacklisted(gw.guild_id, user_id):
-            raise ServiceError("🚫 You are blocked from giveaways in this server.")
+        if user_id and snap_bl:
+            # Snapshot says blocked: confirm live before refusing, so a
+            # blacklist_remove landing between the snapshot and this thread
+            # cannot falsely refuse. Snapshot-False proceeds: the INSERT
+            # guard below still blocks a racing blacklist_add.
+            if self.is_blacklisted(gw.guild_id, user_id):
+                raise ServiceError(self.ban_message(gw.guild_id, user_id))
+        elif user_id and snap_bl is None and self.is_blacklisted(gw.guild_id, user_id):
+            raise ServiceError(self.ban_message(gw.guild_id, user_id))
         if gw.ends_at <= now_ms():
             raise ServiceError("This giveaway has ended.")
         # Discord's native timeout (/mute), and anyone still sitting out the
@@ -388,7 +402,10 @@ class GiveawayService:
         # giveaway still joinable" checks, so a stale button on an ended one
         # cannot hand out a penalty. This is the only check here that writes:
         # it also drops an entry the blocked member already had.
-        self.check_timeout_ban(gw, user_id=user_id, timed_out=timed_out)
+        self.check_timeout_ban(
+            gw, user_id=user_id, timed_out=timed_out,
+            _snap_ban=snap_ban, _snap_hit=snap_hit,
+        )
         roles = set(member_roles)
         if gw.required_role_ids and not (set(gw.required_role_ids) & roles):
             raise ServiceError("You need one of the required roles to enter.")
@@ -407,11 +424,21 @@ class GiveawayService:
             # pending_messages adds the rows still sitting in the bot's in-memory
             # buffer, so nobody is told they sent fewer messages than they did
             # since the last flush.
-            sent = self.message_count(gw.guild_id, user_id) + max(0, pending_messages)
+            if snap_msgs is not None:
+                sent = snap_msgs + max(0, pending_messages)
+            else:
+                sent = self.message_count(gw.guild_id, user_id) + max(0, pending_messages)
             if sent < gw.min_messages:
-                raise ServiceError(
-                    f"You need {gw.min_messages}+ messages in this server ({sent} counted)."
-                )
+                # Snapshot staleness: the tuple was read before this thread
+                # started, so a flush landing in between reads low and would
+                # falsely refuse. Re-read live once before refusing; the happy
+                # path (snapshot already sufficient) costs nothing extra.
+                if snap_msgs is not None:
+                    sent = self.message_count(gw.guild_id, user_id) + max(0, pending_messages)
+                if sent < gw.min_messages:
+                    raise ServiceError(
+                        f"You need {gw.min_messages}+ messages in this server ({sent} counted)."
+                    )
 
     def message_count(self, guild_id: str, user_id: str) -> int:
         row = self.db.query_one(
@@ -419,6 +446,162 @@ class GiveawayService:
             (guild_id, user_id),
         )
         return int(row["count"]) if row else 0
+
+    def get_status(self, giveaway_id: str) -> str | None:
+        """Lightweight post-join liveness check: status only, no full row.
+
+        handle_join already holds the Giveaway it joined; re-reading the whole
+        row just to decide grant-vs-take + refresh would cost a second full
+        SELECT. Status is all the race needs (ended/cancelled vs active).
+        """
+        row = self.db.query_one(
+            "SELECT status FROM simple_giveaways WHERE id = ?", (giveaway_id,)
+        )
+        return str(row["status"]) if row and row.get("status") else None
+
+    def refresh_snapshot(self, giveaway_id: str) -> tuple[str | None, int]:
+        """Status + entry count in one round-trip for the post-ack refresh.
+
+        handle_join used to pay get_status() then entry_count() sequentially
+        (2 waves, ~200ms warm) just to decide grant-vs-take and render the
+        embed. One SELECT with scalar subqueries returns both; a dead read
+        returns (None, 0) so the caller skips background work fail-closed
+        instead of mis-rendering.
+        """
+        try:
+            row = self.db.query_one(
+                "SELECT "
+                "(SELECT status FROM simple_giveaways WHERE id = ?) AS status, "
+                "(SELECT COUNT(*) FROM simple_entries WHERE giveaway_id = ?) AS n",
+                (giveaway_id, giveaway_id),
+            )
+        except Exception:
+            return None, 0
+        if not row:
+            return None, 0
+        try:
+            status = row.get("status")
+            status_s = str(status) if status else None
+        except Exception:
+            status_s = None
+        try:
+            count = int(row.get("n") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        return status_s, count
+
+    def join_snapshot(
+        self, giveaway_id: str, guild_id: str, user_id: str
+    ) -> tuple[Giveaway, tuple[bool, int, int, bool] | None]:
+        """Giveaway row + eligibility tuple in one round-trip (fast-path).
+
+        handle_join used to gather(get, eligibility_snapshot) in parallel:
+        2 threads + 2 Turso streams per click. At 100 simultaneous joins the
+        default to_thread pool (~8 threads on Render free) queued ~200 tasks
+        for ~2.4s of pure queueing. One SELECT returns the giveaway columns
+        plus the 4 snapshot subqueries, so the pre-ack phase costs 1 wave on
+        1 thread. Snapshot parse failures return None (fail-closed to the
+        individual checks); a missing giveaway raises ServiceError.
+        """
+        snap_now = now_ms()
+        try:
+            row = self.db.query_one(
+                "SELECT g.*, "
+                "(SELECT 1 FROM simple_blacklist WHERE guild_id = ?"
+                " AND user_id = ? AND (expires_at IS NULL OR expires_at > ?)) AS bl, "
+                "(SELECT giveaways_remaining FROM simple_giveaway_bans"
+                " WHERE guild_id = ? AND user_id = ?) AS ban, "
+                "(SELECT count FROM simple_message_counts"
+                " WHERE guild_id = ? AND user_id = ?) AS msgs, "
+                "(SELECT 1 FROM simple_giveaway_ban_hits WHERE guild_id = ?"
+                " AND user_id = ? AND giveaway_id = ?) AS hit "
+                "FROM simple_giveaways AS g WHERE g.id = ?",
+                (guild_id, user_id, snap_now, guild_id, user_id,
+                 guild_id, user_id, guild_id, user_id, giveaway_id, giveaway_id),
+            )
+        except Exception:
+            # Read failed ambiguously: fall back to the two-query path so a
+            # dead stream can never look like "giveaway not found".
+            gw = self.get(giveaway_id)
+            try:
+                snap = self.eligibility_snapshot(guild_id, user_id, giveaway_id)
+            except Exception:
+                snap = None
+            return gw, snap
+        if row is None:
+            raise ServiceError("Giveaway not found.")
+        gw = Giveaway.from_row(row)
+        try:
+            bl = row.get("bl") is not None
+        except Exception:
+            return gw, None
+        try:
+            ban = max(0, int(row.get("ban") or 0))
+        except (TypeError, ValueError):
+            ban = 0
+        try:
+            msgs = int(row.get("msgs") or 0)
+        except (TypeError, ValueError):
+            msgs = 0
+        try:
+            hit = row.get("hit") is not None
+        except Exception:
+            hit = False
+        return gw, (bl, ban, msgs, hit)
+
+    def eligibility_snapshot(
+        self, guild_id: str, user_id: str, giveaway_id: str | None = None
+    ) -> tuple[bool, int, int, bool] | None:
+        """Blacklist + timeout-ban + message count + ban-hit in one round-trip.
+
+        The happy path used to spend four sequential Turso reads here
+        (is_blacklisted, timeout_ban_remaining, _was_blocked_from,
+        message_count). One SELECT with scalar subqueries returns all four;
+        each subquery hits its own PK so no new index is needed. Returns
+        (blacklisted, ban_remaining, msg_count, was_blocked), or None when
+        the read itself failed: None forces the caller back onto the
+        individual checks (fail-closed), so a dead stream can never look
+        like "not blacklisted, no penalty".
+        """
+        if not guild_id or not user_id:
+            return False, 0, 0, False
+        snap_now = now_ms()
+        try:
+            row = self.db.query_one(
+                "SELECT "
+                " (SELECT 1 FROM simple_blacklist"
+                " WHERE guild_id = ? AND user_id = ?"
+                " AND (expires_at IS NULL OR expires_at > ?)) AS bl, "
+                " (SELECT giveaways_remaining FROM simple_giveaway_bans"
+                " WHERE guild_id = ? AND user_id = ?) AS ban, "
+                " (SELECT count FROM simple_message_counts"
+                " WHERE guild_id = ? AND user_id = ?) AS msgs, "
+                " (SELECT 1 FROM simple_giveaway_ban_hits WHERE guild_id = ?"
+                " AND user_id = ? AND giveaway_id = ?) AS hit",
+                (guild_id, user_id, snap_now, guild_id, user_id, guild_id, user_id,
+                 guild_id, user_id, giveaway_id or ""),
+            )
+        except Exception:
+            return None
+        if not row:
+            return None
+        try:
+            bl = row.get("bl") is not None
+        except Exception:
+            bl = False
+        try:
+            ban = max(0, int(row.get("ban") or 0))
+        except (TypeError, ValueError):
+            ban = 0
+        try:
+            msgs = int(row.get("msgs") or 0)
+        except (TypeError, ValueError):
+            msgs = 0
+        try:
+            hit = row.get("hit") is not None
+        except Exception:
+            hit = False
+        return bl, ban, msgs, hit
 
     def record_message(self, guild_id: str, user_id: str) -> None:
         self.db.execute(
@@ -545,24 +728,48 @@ class GiveawayService:
         account_created_ts: float | None,
         pending_messages: int = 0,
         timed_out: bool = False,
+        snapshot: tuple[bool, int, int, bool] | None = None,
+        fetch_count: bool = True,
     ) -> int:
         self.check_eligible(
             gw, member_roles=member_roles, account_created_ts=account_created_ts,
             user_id=user_id, pending_messages=pending_messages, timed_out=timed_out,
+            snapshot=snapshot,
         )
-        # The giveaway and the blacklist are re-checked inside the statement
-        # itself. check_eligible above reads rows fetched moments earlier, so an
-        # end() or a blacklist_add landing in between would otherwise let the
-        # entry through; this makes both impossible without a second round-trip.
+        # The giveaway, its deadline, the blacklist, the timeout-ban row and
+        # the ban-hit row are re-checked inside the statement itself.
+        # check_eligible above reads rows fetched moments earlier (the snapshot
+        # is older still: read in parallel with get, before this thread even
+        # started), so an end() / blacklist_add / penalty landing in between
+        # would otherwise let the entry through. The statement makes each of
+        # those impossible without a second round-trip. Roles / account age /
+        # message counts need no guard here: roles and age come from the live
+        # Discord member object (not the database), and message counts only
+        # move fail-closed (a stale low count refuses; a wipe is skipped while
+        # an active min-messages giveaway exists -- see end()).
+        # A currently-timed-out member (timed_out=True) never reaches this
+        # statement: check_eligible above always refuses them first. The bans
+        # guard below therefore covers the penalty-row race only.
+        now = now_ms()
         try:
             cur = self.db.execute(
                 "INSERT INTO simple_entries (giveaway_id, user_id, username, entered_at)"
                 " SELECT ?, ?, ?, ? WHERE EXISTS ("
-                "   SELECT 1 FROM simple_giveaways WHERE id = ? AND status = 'active'"
+                "   SELECT 1 FROM simple_giveaways"
+                "   WHERE id = ? AND status = 'active' AND ends_at > ?"
                 " ) AND NOT EXISTS ("
                 "   SELECT 1 FROM simple_blacklist WHERE guild_id = ? AND user_id = ?"
+                "   AND (expires_at IS NULL OR expires_at > ?)"
+                " ) AND NOT EXISTS ("
+                "   SELECT 1 FROM simple_giveaway_bans"
+                "   WHERE guild_id = ? AND user_id = ? AND giveaways_remaining > 0"
+                " ) AND NOT EXISTS ("
+                "   SELECT 1 FROM simple_giveaway_ban_hits"
+                "   WHERE guild_id = ? AND user_id = ? AND giveaway_id = ?"
                 " )",
-                (gw.id, user_id, username[:64], now_ms(), gw.id, gw.guild_id, user_id),
+                (gw.id, user_id, username[:64], now, gw.id, now,
+                 gw.guild_id, user_id, now, gw.guild_id, user_id,
+                 gw.guild_id, user_id, gw.id),
             )
         except Exception as exc:
             msg = str(exc).upper()
@@ -571,16 +778,79 @@ class GiveawayService:
             # must surface instead of being reported as a harmless duplicate.
             if "UNIQUE" in msg or "PRIMARY" in msg:
                 raise ServiceError("You are already entered.") from None
+            # Ambiguous mid-write loss: the server may have applied the INSERT
+            # before the response was lost. Disambiguate by entry age without
+            # weakening duplicate protection: a row written within seconds is
+            # this attempt (idempotent success); an older row is a duplicate
+            # that raced the network failure ("already entered"); absent ->
+            # surface so the caller can retry deliberately.
+            if _is_ambiguous_loss(str(exc).lower()):
+                try:
+                    row = self.db.query_one(
+                        "SELECT entered_at FROM simple_entries"
+                        " WHERE giveaway_id = ? AND user_id = ?",
+                        (gw.id, user_id),
+                    )
+                    if row is not None and row.get("entered_at") is not None:
+                        try:
+                            age = now_ms() - int(row.get("entered_at"))
+                        except (TypeError, ValueError):
+                            age = None
+                        if age is not None and age < 15000:
+                            return self.entry_count(gw.id) if fetch_count else -1
+                        raise ServiceError("You are already entered.") from None
+                except ServiceError:
+                    raise
+                except Exception:
+                    pass
             raise
         try:
             inserted = int(cur.rowcount or 0)
         except (TypeError, ValueError):
-            inserted = 1
-        if inserted == 0:
-            # The guard can refuse for two reasons now, so say which one bit.
+            # Unreadable rowcount: diagnose live below instead of assuming
+            # success -- the row may pre-date this attempt.
+            inserted = 0
+        # Some drivers report -1 when the affected count is unknown: treat
+        # any non-positive value as "guard refused" so a blocked join can
+        # never read as success. Guards are diagnosed first (live, ended ->
+        # blacklist -> timeout); only when every guard passes does a present
+        # entry mean "the INSERT landed but the count is unknown".
+        if inserted <= 0:
+            # The statement guard can refuse for several reasons; diagnose with
+            # live reads (no snapshot) so a stale snapshot cannot mislabel the
+            # refusal. Ended/deadline first (no side effects, and a timed-out
+            # member must never earn a penalty from a stale button on an ended
+            # giveaway), then blacklist, then the timeout-ban gate live (it
+            # consumes the penalty and drops entries, exactly as the non-race
+            # path would have).
+            try:
+                fresh = self.get(gw.id)
+            except ServiceError:
+                raise ServiceError("This giveaway has ended.") from None
+            if not fresh.active or fresh.ends_at <= now_ms():
+                raise ServiceError("This giveaway has ended.")
             if self.is_blacklisted(gw.guild_id, user_id):
-                raise ServiceError("🚫 You are blocked from giveaways in this server.")
-            raise ServiceError("This giveaway has ended.")
+                raise ServiceError(self.ban_message(gw.guild_id, user_id))
+            try:
+                self.check_timeout_ban(
+                    fresh, user_id=user_id, timed_out=timed_out
+                )
+            except ServiceError:
+                raise
+            # Every guard passes yet nothing inserted: either the block raced
+            # away between the statement and this re-check (retry honestly) or
+            # the driver hid a successful INSERT (confirm by entry).
+            try:
+                if self.has_entry(gw.id, user_id):
+                    return self.entry_count(gw.id) if fetch_count else -1
+            except Exception:
+                pass
+            raise ServiceError("Could not enter you. Try again.")
+        # fetch_count=False skips the COUNT so the ack never waits on it:
+        # the post-ack refresh_snapshot() supplies the count for the embed.
+        # -1 means "committed, count unknown"; callers must not print it.
+        if not fetch_count:
+            return -1
         return self.entry_count(gw.id)
 
     def leave(self, giveaway_id: str, user_id: str) -> bool:
@@ -632,7 +902,9 @@ class GiveawayService:
         winners = [str(w) for w in parsed] if isinstance(parsed, list) else []
         return winners, raw
 
-    def end(self, giveaway_id: str) -> tuple[Giveaway, list[str]]:
+    def end(
+        self, giveaway_id: str, *, now: int | None = None, require_due: bool = False
+    ) -> tuple[Giveaway, list[str]]:
         """End a running giveaway and draw its winners.
 
         The draw happens first, then one UPDATE writes status, ended_at, the
@@ -642,18 +914,50 @@ class GiveawayService:
         draw. Whoever loses the claim is told the giveaway is already over. One
         statement also means a failure can no longer strand a giveaway as
         'ended' with no winners and no announcement.
+        Claim windows open right after the flip as separate statements (no
+        migration, no cross-driver transaction), but a crash in between cannot
+        strand winners: start_claims is idempotent (INSERT OR IGNORE), post-flip
+        failures return instead of raising (the draw is stored, so the caller
+        still announces it), and repair_missing_claims — also run by every
+        claim read — recreates any lost rows with the same deadline.
+        B04: the auto-draw tick must not beat a concurrent extend. due() is a
+        snapshot, so a stale due row plus a status-only claim would end a
+        giveaway whose deadline just moved. Tick callers pass require_due=True
+        and the flip gains "AND ends_at <= ?": the statement itself re-checks
+        the deadline, so a win means still-due at flip time and a loss means
+        extended (or already ended). Manual /giveaway_end leaves require_due
+        off and keeps the early-end behavior.
         """
         gw = self.get(giveaway_id)
         if not gw.active:
             raise ServiceError("This giveaway has already ended.")
+        # One timestamp for the due check, the flip and the claim windows: the
+        # repair sweep rebuilds deadlines as ended_at + timeout, so both must
+        # share a base, and the tick test needs a deterministic clock.
+        ts = now if now is not None else now_ms()
+        if require_due and gw.ends_at > ts:
+            raise ServiceError("This giveaway is not due to end yet.")
         pool = [str(row["user_id"]) for row in self.entries(gw.id)]
         winners = self._rand.sample(pool, min(gw.winner_count, len(pool))) if pool else []
-        cur = self.db.execute(
-            "UPDATE simple_giveaways SET status = 'ended', ended_at = ?, winners_json = ?,"
-            " entrant_count = ? WHERE id = ? AND status = 'active'",
-            (now_ms(), json.dumps(winners), len(pool), gw.id),
-        )
+        if require_due:
+            cur = self.db.execute(
+                "UPDATE simple_giveaways SET status = 'ended', ended_at = ?, winners_json = ?,"
+                " entrant_count = ? WHERE id = ? AND status = 'active' AND ends_at <= ?",
+                (ts, json.dumps(winners), len(pool), gw.id, ts),
+            )
+        else:
+            cur = self.db.execute(
+                "UPDATE simple_giveaways SET status = 'ended', ended_at = ?, winners_json = ?,"
+                " entrant_count = ? WHERE id = ? AND status = 'active'",
+                (ts, json.dumps(winners), len(pool), gw.id),
+            )
         if not _changed(cur):
+            try:
+                live = self.get(gw.id)
+            except ServiceError:
+                raise ServiceError("This giveaway has already ended.") from None
+            if live.active and require_due and live.ends_at > ts:
+                raise ServiceError("This giveaway is not due to end yet.")
             raise ServiceError("This giveaway has already ended.")
         # Fresh grind for the next giveaway *in this server*: message counts go
         # back to zero here, so the next min-messages requirement measures
@@ -662,17 +966,32 @@ class GiveawayService:
         # server's counts — and skipped while another running giveaway here
         # still has a min-messages requirement, which would otherwise be reset
         # under the members already grinding for it.
-        self.db.execute(
-            "DELETE FROM simple_message_counts WHERE guild_id = ? AND NOT EXISTS ("
-            " SELECT 1 FROM simple_giveaways WHERE guild_id = ? AND status = 'active'"
-            " AND min_messages > 0)",
-            (gw.guild_id, gw.guild_id),
-        )
+        # Post-flip failures must not strand the announcement: the draw is
+        # stored, so wipe/claim errors are logged and healed (repair sweep
+        # below + every claim read) while the caller still announces. Only the
+        # guarded flip above may raise.
+        try:
+            self.db.execute(
+                "DELETE FROM simple_message_counts WHERE guild_id = ? AND NOT EXISTS ("
+                " SELECT 1 FROM simple_giveaways WHERE guild_id = ? AND status = 'active'"
+                " AND min_messages > 0)",
+                (gw.guild_id, gw.guild_id),
+            )
+        except Exception:
+            log.warning("end cleanup wipe failed for %s", gw.id)
         ended = self.get(gw.id)
         # Claim windows open here so the deadline survives restarts: rows are
         # durable, and the tick picks them up even if the process dies first.
-        self.start_claims(ended, winners)
-        return ended, winners
+        # Shared ts above keeps flip and inserts on one deadline.
+        try:
+            self.start_claims(ended, winners, now=ts)
+        except Exception:
+            log.warning("end claim insert failed for %s; repairing", gw.id)
+            try:
+                self.repair_missing_claims(gw.id, now=ts)
+            except Exception:
+                pass
+        return self.get(gw.id), winners
 
     def reroll(
         self, giveaway_id: str, count: int = 1, replace_user_id: str | None = None
@@ -746,14 +1065,22 @@ class GiveawayService:
                 (json.dumps(combined), gw.id, raw_now),
             )
             if _changed(cur):
-                ended = self.get(gw.id)
-                # Open a claim window for the fresh winners. No-op when the
-                # giveaway has no claim timer; INSERT OR IGNORE keeps a
-                # retried announce safe. The old winner's pending row is left
-                # alone: a manual reroll is additive, and its own deadline
-                # still expires/skips independently.
-                self.start_claims(ended, use)
-                return ended, use
+                # The CAS above stored the draw; a crash before the inserts
+                # must not strand the fresh winners. start_claims is idempotent
+                # (INSERT OR IGNORE), failures are logged and healed by the
+                # repair sweep, and the stored draw is still returned for the
+                # announce. The old winners' rows are left alone: a manual
+                # reroll is additive, and each deadline still expires/skips
+                # independently.
+                try:
+                    self.start_claims(self.get(gw.id), use)
+                except Exception:
+                    log.warning("reroll claim insert failed for %s; repairing", gw.id)
+                    try:
+                        self.repair_missing_claims(gw.id)
+                    except Exception:
+                        pass
+                return self.get(gw.id), use
         raise ServiceError("Reroll collided with another draw. Try again.")
 
     def _reroll_replace(self, gw: Giveaway, replace_user_id: str) -> tuple[Giveaway, list[str]]:
@@ -837,28 +1164,37 @@ class GiveawayService:
             # Close the old slot's pending claim so a later tick cannot expire
             # it into a second replacement for the same slot. Any status counts
             # as "ever drawn", so the exclusion holds even after the swap.
-            self.db.execute(
-                "UPDATE simple_claims SET status = ?"
-                " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
-                (self.CLAIM_REPLACED, gw.id, replace_user_id),
-            )
-            row = self.db.query_one(
-                "SELECT user_id FROM simple_claims WHERE giveaway_id = ? AND user_id = ? LIMIT 1",
-                (gw.id, replace_user_id),
-            )
-            if row is None:
-                # No claim row at all (e.g. claims disabled): leave a marker
-                # so this user stays excluded from every future draw.
+            # Settle/start failures after the CAS are logged and healed (the
+            # repair sweep settles the old slot and opens the fresh window)
+            # while the stored swap is still returned for the announce.
+            try:
                 self.db.execute(
-                    "INSERT OR IGNORE INTO simple_claims"
-                    " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
-                    " VALUES (?, ?, 0, ?, 0, ?)",
-                    (gw.id, replace_user_id, self.CLAIM_REPLACED, now_ms()),
+                    "UPDATE simple_claims SET status = ?"
+                    " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
+                    (self.CLAIM_REPLACED, gw.id, replace_user_id),
                 )
-            ended = self.get(gw.id)
-            # Fresh winner's own claim window. No-op when claims are disabled.
-            self.start_claims(ended, [new_user])
-            return ended, [new_user]
+                row = self.db.query_one(
+                    "SELECT user_id FROM simple_claims WHERE giveaway_id = ? AND user_id = ? LIMIT 1",
+                    (gw.id, replace_user_id),
+                )
+                if row is None:
+                    # No claim row at all (e.g. claims disabled): leave a marker
+                    # so this user stays excluded from every future draw.
+                    self.db.execute(
+                        "INSERT OR IGNORE INTO simple_claims"
+                        " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
+                        " VALUES (?, ?, 0, ?, 0, ?)",
+                        (gw.id, replace_user_id, self.CLAIM_REPLACED, now_ms()),
+                    )
+                # Fresh winner's own claim window. No-op when claims are disabled.
+                self.start_claims(self.get(gw.id), [new_user])
+            except Exception:
+                log.warning("reroll-replace settle failed for %s; repairing", gw.id)
+                try:
+                    self.repair_missing_claims(gw.id)
+                except Exception:
+                    pass
+            return self.get(gw.id), [new_user]
         raise ServiceError("Reroll collided with another draw. Try again.")
 
     # -- winner claims (optional claim timer) -----------------------------
@@ -889,8 +1225,140 @@ class GiveawayService:
                 (gw.id, str(user_id), deadline, ts),
             )
 
+    def repair_missing_claims(self, giveaway_id: str, now: int | None = None) -> int:
+        """Recreate claim rows lost between a draw and its inserts. Idempotent.
+
+        end()/reroll()/expire_claim() store winners first and open the claim
+        windows right after as separate statements (one timestamp shared by
+        the flip and the inserts, no migration, no cross-driver transaction),
+        so a crash in between strands winners with no rows. Every insert here
+        is INSERT OR IGNORE: winners holding any claim row (any status) are
+        left alone and only winners with no row at all gain a fresh pending
+        window. Pending rows for users no longer named (a targeted reroll that
+        died before settling the old slot) flip to replaced so the tick can
+        never expire them into a duplicate slot. Returns rows written.
+        """
+        try:
+            gw = self.get(giveaway_id)
+        except ServiceError:
+            return 0
+        if not gw.claim_enabled or not gw.winners:
+            return 0
+        try:
+            rows = self.db.query(
+                "SELECT user_id, status, deadline_ms FROM simple_claims WHERE giveaway_id = ?",
+                (gw.id,),
+            )
+        except Exception:
+            return 0
+        have: set[str] = set()
+        latest = 0
+        for r in rows:
+            try:
+                uid = str(r.get("user_id"))
+            except Exception:
+                log.warning("claim repair row skipped for %s", gw.id)
+                continue
+            have.add(uid)
+            try:
+                latest = max(latest, int(r.get("deadline_ms") or 0))
+            except (TypeError, ValueError):
+                log.warning("claim repair deadline skipped for %s", gw.id)
+                continue
+        ts = now if now is not None else now_ms()
+        if latest > 0:
+            # Never hand a repaired winner an already-past deadline: a later
+            # draw (reroll/expire) must start its own window at repair time,
+            # while a partially inserted initial batch simply gains a few ms.
+            deadline = max(latest, ts + gw.claim_timeout_seconds * 1000)
+        else:
+            try:
+                erow = self.db.query_one(
+                    "SELECT ended_at FROM simple_giveaways WHERE id = ?", (gw.id,)
+                )
+            except Exception:
+                erow = None
+            try:
+                base = int((erow or {}).get("ended_at") or ts)
+            except (TypeError, ValueError):
+                base = ts
+            deadline = base + gw.claim_timeout_seconds * 1000
+        winners = [str(w) for w in dict.fromkeys(str(w) for w in gw.winners)]
+        written = 0
+        for uid in winners:
+            if uid in have:
+                continue
+            try:
+                self.db.execute(
+                    "INSERT OR IGNORE INTO simple_claims"
+                    " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
+                    " VALUES (?, ?, 0, 'pending', ?, ?)",
+                    (gw.id, uid, deadline, ts),
+                )
+            except Exception:
+                log.warning("claim repair insert failed for %s/%s", gw.id, uid)
+                continue
+            written += 1
+        if winners:
+            marks = ", ".join("?" for _ in winners)
+            try:
+                cur = self.db.execute(
+                    "UPDATE simple_claims SET status = ? WHERE giveaway_id = ?"  # noqa: S608
+                    f" AND status = 'pending' AND user_id NOT IN ({marks})",  # noqa: S608
+                    (self.CLAIM_REPLACED, gw.id, *winners),
+                )
+            except Exception:
+                log.warning("claim repair settle failed for %s", gw.id)
+            else:
+                try:
+                    written += int(cur.rowcount or 0)
+                except (TypeError, ValueError):
+                    pass
+        return written
+
+    def repair_all_missing_claims(self, now: int | None = None, limit: int = 25) -> int:
+        """Heal every stranded claim window. due_claims() runs this per tick.
+
+        A giveaway stranded with zero pending rows never appears in due_claims,
+        so per-giveaway repair alone would never visit it: this bounded sweep
+        (oldest ended first) recreates those windows, and the tick then picks
+        them up like any restart recovery. Idempotent; failures heal on a
+        later tick. Returns rows written.
+        """
+        ts = now if now is not None else now_ms()
+        try:
+            rows = self.db.query(
+                "SELECT id FROM simple_giveaways WHERE status = 'ended'"
+                " AND claim_timeout_seconds > 0 AND winners_json != '[]'"
+                " ORDER BY COALESCE(ended_at, 0) ASC LIMIT ?",
+                (max(1, min(int(limit), 100)),),
+            )
+        except Exception:
+            return 0
+        total = 0
+        for r in rows:
+            try:
+                gid = str(r.get("id"))
+            except Exception:
+                log.warning("claim repair sweep row skipped")
+                continue
+            try:
+                total += self.repair_missing_claims(gid, now=ts)
+            except Exception:
+                log.warning("claim repair sweep failed for a giveaway")
+                continue
+        return total
+
     def pending_claims(self, giveaway_id: str) -> list[dict]:
-        """Pending claim rows for a giveaway, oldest deadline first."""
+        """Pending claim rows for a giveaway, oldest deadline first.
+
+        Heals stranded windows first, so a crash between a draw and its
+        inserts never reads as "no claims".
+        """
+        try:
+            self.repair_missing_claims(giveaway_id)
+        except Exception:
+            pass
         return self.db.query(
             "SELECT giveaway_id, user_id, round, status, deadline_ms, claimed_at,"
             " skipped_by, skipped_at, created_at FROM simple_claims"
@@ -908,8 +1376,16 @@ class GiveawayService:
         )
 
     def due_claims(self, now: int | None = None, limit: int = 25) -> list[dict]:
-        """Pending claims past their deadline. Tick feeds on this."""
+        """Pending claims past their deadline. Tick feeds on this.
+
+        Heals stranded windows first (bounded sweep, oldest ended first), so a
+        crash between a draw and its inserts never hides as "no due claims".
+        """
         ts = now if now is not None else now_ms()
+        try:
+            self.repair_all_missing_claims(now=ts)
+        except Exception:
+            pass
         return self.db.query(
             "SELECT giveaway_id, user_id, round, status, deadline_ms, claimed_at,"
             " skipped_by, skipped_at, created_at FROM simple_claims"
@@ -930,6 +1406,24 @@ class GiveawayService:
             " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
             (now_ms(), giveaway_id, str(user_id)),
         )
+        if not _changed(cur):
+            # A crash between a draw and its inserts strands winners with no
+            # row: heal once, then retry so the rightful winner still claims.
+            try:
+                self.repair_missing_claims(giveaway_id)
+            except Exception:
+                pass
+            else:
+                try:
+                    retry = self.db.execute(
+                        "UPDATE simple_claims SET status = 'claimed', claimed_at = ?"
+                        " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
+                        (now_ms(), giveaway_id, str(user_id)),
+                    )
+                except Exception:
+                    retry = None
+                if retry is not None and _changed(retry):
+                    cur = retry
         if not _changed(cur):
             row = self.db.query_one(
                 "SELECT status FROM simple_claims WHERE giveaway_id = ? AND user_id = ?"
@@ -966,6 +1460,25 @@ class GiveawayService:
             " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
             (str(staff_id), now_ms(), giveaway_id, str(user_id)),
         )
+        if not _changed(cur):
+            # Same stranded-window heal as claim(): a missing row may just be
+            # a draw whose inserts never landed.
+            try:
+                self.repair_missing_claims(giveaway_id)
+            except Exception:
+                pass
+            else:
+                try:
+                    retry = self.db.execute(
+                        "UPDATE simple_claims SET status = 'skipped',"
+                        " skipped_by = ?, skipped_at = ?"
+                        " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
+                        (str(staff_id), now_ms(), giveaway_id, str(user_id)),
+                    )
+                except Exception:
+                    retry = None
+                if retry is not None and _changed(retry):
+                    cur = retry
         if not _changed(cur):
             row = self.db.query_one(
                 "SELECT status FROM simple_claims WHERE giveaway_id = ? AND user_id = ?"
@@ -1047,9 +1560,18 @@ class GiveawayService:
             )
             if not _changed(cur2):
                 continue
-            ended = self.get(gw.id)
-            self.start_claims(ended, use, now=ts)
-            return ended, use
+            # Stored above; a crash before the inserts must not strand the
+            # replacement. Idempotent inserts plus the repair sweep heal it,
+            # and the stored draw is still returned for the announce.
+            try:
+                self.start_claims(self.get(gw.id), use, now=ts)
+            except Exception:
+                log.warning("expire claim insert failed for %s; repairing", gw.id)
+                try:
+                    self.repair_missing_claims(gw.id, now=ts)
+                except Exception:
+                    pass
+            return self.get(gw.id), use
         raise ServiceError("Reroll collided with another draw. Try again.")
 
     def discard(self, giveaway_id: str) -> None:
@@ -1146,29 +1668,125 @@ class GiveawayService:
         except (TypeError, ValueError):
             return 0
 
-    # -- blacklist ------------------------------------------------------
-    def is_blacklisted(self, guild_id: str, user_id: str) -> bool:
+    # -- blacklist (timed + permanent bans) ---------------------------------
+    #: Max timed-ban duration in hours. 0 = permanent (the original
+    #: blacklist_add() had no expiry, so the default stays permanent).
+    BAN_MAX_HOURS = 720
+
+    def _ban_now(self, now: int | None) -> int:
+        return now if now is not None else now_ms()
+
+    def ban_info(
+        self, guild_id: str, user_id: str, now: int | None = None
+    ) -> dict[str, object] | None:
+        """Active ban row, or None when not banned / expired.
+
+        Permanent = expires_at NULL. Timed = expires_at > now. Expired rows
+        are treated as absent (lazy expiry, no extra write on the hot path).
+        """
+        if not guild_id or not user_id:
+            return None
+        ts = self._ban_now(now)
+        row = self.db.query_one(
+            "SELECT expires_at, reason, banned_by, created_at FROM simple_blacklist"
+            " WHERE guild_id = ? AND user_id = ?"
+            " AND (expires_at IS NULL OR expires_at > ?)",
+            (guild_id, user_id, ts),
+        )
+        if row is None:
+            return None
+        try:
+            raw_exp = row.get("expires_at")
+            expires_at = None if raw_exp is None else int(raw_exp)
+        except (TypeError, ValueError):
+            expires_at = None
+        reason = str(row.get("reason") or "")
+        banned_by = str(row.get("banned_by") or "")
+        permanent = expires_at is None
+        remaining = 0 if permanent else max(0, expires_at - ts)
+        return {
+            "expires_at": expires_at,
+            "reason": reason,
+            "banned_by": banned_by,
+            "permanent": permanent,
+            "remaining_ms": remaining,
+        }
+
+    def ban_message(self, guild_id: str, user_id: str, now: int | None = None) -> str:
+        """Refusal text for a banned member. Always contains "blocked".
+
+        Shown both to the refused member (join path) and reused by staff
+        confirmations. Reason appears in both places when set.
+        """
+        base = "\U0001F6AB You are blocked from giveaways in this server."
+        info = self.ban_info(guild_id, user_id, now)
+        if info is None:
+            return base
+        parts = [base]
+        reason = str(info.get("reason") or "").strip()
+        if reason:
+            parts.append(f"Reason: {reason[:256]}")
+        if not info.get("permanent"):
+            try:
+                exp = int(info.get("expires_at") or 0)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                exp = 0
+            if exp:
+                parts.append(f"Ban expires <t:{exp // 1000}:R>.")
+        else:
+            parts.append("This ban is permanent.")
+        return " ".join(parts)
+
+    def is_blacklisted(
+        self, guild_id: str, user_id: str, now: int | None = None
+    ) -> bool:
         if not guild_id or not user_id:
             return False
-        return (
-            self.db.query_one(
-                "SELECT user_id FROM simple_blacklist WHERE guild_id = ? AND user_id = ?",
-                (guild_id, user_id),
-            )
-            is not None
-        )
+        return self.ban_info(guild_id, user_id, now) is not None
 
-    def blacklist_add(self, guild_id: str, user_id: str) -> None:
-        """Block a user, and purge their entries from running giveaways."""
+    def blacklist_add(
+        self,
+        guild_id: str,
+        user_id: str,
+        *,
+        hours: int = 0,
+        reason: str = "",
+        banned_by: str = "",
+        now: int | None = None,
+    ) -> dict[str, object]:
+        """Block a user for N hours (0 = permanent), purge running entries.
+
+        hours 0..720 enforced; reason trimmed to 256 chars. Re-ban overwrites
+        the previous expiry/reason (upsert). Returns the active ban_info.
+        """
+        try:
+            hours_int = int(hours)
+        except (TypeError, ValueError):
+            raise ServiceError("Ban duration must be 0-720 hours (0 = permanent).") from None
+        if hours_int < 0 or hours_int > self.BAN_MAX_HOURS:
+            raise ServiceError(
+                f"Ban duration must be 0-{self.BAN_MAX_HOURS} hours (0 = permanent)."
+            )
+        clean_reason = (reason or "").strip()[:256]
+        clean_by = (banned_by or "").strip()[:64]
+        ts = self._ban_now(now)
+        expires_at = None if hours_int == 0 else ts + hours_int * 3600 * 1000
         self.db.execute(
-            "INSERT OR IGNORE INTO simple_blacklist (guild_id, user_id) VALUES (?, ?)",
-            (guild_id, user_id),
+            "INSERT INTO simple_blacklist"
+            " (guild_id, user_id, expires_at, reason, banned_by, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT (guild_id, user_id) DO UPDATE SET"
+            " expires_at = excluded.expires_at, reason = excluded.reason,"
+            " banned_by = excluded.banned_by, created_at = excluded.created_at",
+            (guild_id, user_id, expires_at, clean_reason, clean_by, ts),
         )
         self.db.execute(
             "DELETE FROM simple_entries WHERE user_id = ? AND giveaway_id IN"
             " (SELECT id FROM simple_giveaways WHERE guild_id = ? AND status = 'active')",
             (user_id, guild_id),
         )
+        info = self.ban_info(guild_id, user_id, ts)
+        return info or {"permanent": hours_int == 0, "reason": clean_reason}
 
     def blacklist_remove(self, guild_id: str, user_id: str) -> bool:
         cur = self.db.execute(
@@ -1180,24 +1798,70 @@ class GiveawayService:
         except Exception:
             return True
 
-    def count_blacklisted(self, guild_id: str) -> int:
+    def purge_expired_bans(self, now: int | None = None) -> int:
+        """Delete timed bans already past expiry. Returns rows removed."""
+        ts = self._ban_now(now)
+        cur = self.db.execute(
+            "DELETE FROM simple_blacklist WHERE expires_at IS NOT NULL AND expires_at <= ?",
+            (ts,),
+        )
+        try:
+            return int(cur.rowcount or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def count_blacklisted(self, guild_id: str, now: int | None = None) -> int:
         """How many members of this guild are blocked from giveaways.
 
-        The listing is capped, so this is what keeps a caller from reporting the
-        size of the page set as if it were the whole blacklist.
+        Counts active bans only (permanent + unexpired timed). The listing is
+        capped, so this is what keeps a caller from reporting the size of the
+        page set as if it were the whole blacklist.
         """
+        ts = self._ban_now(now)
         row = self.db.query_one(
-            "SELECT COUNT(*) AS n FROM simple_blacklist WHERE guild_id = ?", (guild_id,)
+            "SELECT COUNT(*) AS n FROM simple_blacklist WHERE guild_id = ?"
+            " AND (expires_at IS NULL OR expires_at > ?)",
+            (guild_id, ts),
         )
         return int(row["n"]) if row and row.get("n") is not None else 0
 
-    def blacklist_list(self, guild_id: str, limit: int = 100) -> list[str]:
+    def blacklist_list(self, guild_id: str, limit: int = 100, now: int | None = None) -> list[str]:
+        ts = self._ban_now(now)
         rows = self.db.query(
             "SELECT user_id FROM simple_blacklist WHERE guild_id = ?"
+            " AND (expires_at IS NULL OR expires_at > ?)"
             " ORDER BY user_id ASC LIMIT ?",
-            (guild_id, limit),
+            (guild_id, ts, limit),
         )
         return [str(r["user_id"]) for r in rows]
+
+    def blacklist_list_detailed(
+        self, guild_id: str, limit: int = 100, now: int | None = None
+    ) -> list[dict[str, object]]:
+        """Active bans with expiry + reason for the staff list."""
+        ts = self._ban_now(now)
+        rows = self.db.query(
+            "SELECT user_id, expires_at, reason, banned_by, created_at"
+            " FROM simple_blacklist WHERE guild_id = ?"
+            " AND (expires_at IS NULL OR expires_at > ?)"
+            " ORDER BY user_id ASC LIMIT ?",
+            (guild_id, ts, max(1, min(int(limit), 500))),
+        )
+        out: list[dict[str, object]] = []
+        for r in rows:
+            try:
+                raw = r.get("expires_at")
+                exp = None if raw is None else int(raw)
+            except (TypeError, ValueError):
+                exp = None
+            out.append({
+                "user_id": str(r.get("user_id")),
+                "expires_at": exp,
+                "permanent": exp is None,
+                "reason": str(r.get("reason") or ""),
+                "banned_by": str(r.get("banned_by") or ""),
+            })
+        return out
 
     # -- timed-out penalty (Discord's native /mute) ----------------------
     #: Giveaways a member sits out after being caught timed out while joining.
@@ -1360,7 +2024,10 @@ class GiveawayService:
             )
         return banned
 
-    def check_timeout_ban(self, gw: Giveaway, *, user_id: str, timed_out: bool = False) -> None:
+    def check_timeout_ban(
+        self, gw: Giveaway, *, user_id: str, timed_out: bool = False,
+        _snap_ban: int | None = None, _snap_hit: bool | None = None,
+    ) -> None:
         """Refuse a timed-out member — or one still serving that penalty.
 
         Called by check_eligible() only once the giveaway is known to still be
@@ -1374,12 +2041,41 @@ class GiveawayService:
         """
         if not user_id:
             return
-        left = self.timeout_ban_remaining(gw.guild_id, user_id)
+        # Snapshot staleness: the tuple was read in parallel with get(), before
+        # this thread started. A penalty started/expired in between would make
+        # a snapshot-based DELETE/consume wrong (false penalty or missed
+        # spend). Happy path (snapshot says clean and member not timed out)
+        # returns fast; the INSERT guard in join() still blocks a penalty that
+        # landed after the snapshot (zero-insert path re-runs this gate live).
+        # Anything the snapshot would refuse re-reads live before acting, so a
+        # stale ban/hit can never cause a false DELETE/consume.
+        if _snap_ban is not None or _snap_hit is not None:
+            snap_blocked = (_snap_ban or 0) > 0 or bool(_snap_hit) or timed_out
+            if not snap_blocked:
+                return
+            _snap_ban = None
+            _snap_hit = None
+        # Stale-giveaway precedence: gw was read before this thread started,
+        # so end() may have flipped status since. Never hand out, spend, or
+        # keep a penalty from a stale button on an ended giveaway -- the
+        # caller must hear "ended", with no side effects. Happy-path joins
+        # already returned above, so only refusal paths pay this trip.
+        try:
+            _live = self.get(gw.id)
+        except ServiceError:
+            raise ServiceError("This giveaway has ended.") from None
+        if not _live.active or _live.ends_at <= now_ms():
+            raise ServiceError("This giveaway has ended.")
+        left = _snap_ban if _snap_ban is not None else self.timeout_ban_remaining(gw.guild_id, user_id)
         if left <= 0 and not timed_out:
             # The penalty is over, but a giveaway it was served on is still one
             # they sat out: rejoining it (say, the one that spent the last unit)
             # would hand the penalty straight back.
-            if self._was_blocked_from(gw.guild_id, user_id, gw.id):
+            if _snap_hit is not None:
+                was_blocked = _snap_hit
+            else:
+                was_blocked = self._was_blocked_from(gw.guild_id, user_id, gw.id)
+            if was_blocked:
                 raise ServiceError(
                     "You sat out this giveaway as part of your timed-out penalty.",
                     kind=TIMEOUT_BAN_KIND,

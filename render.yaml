@@ -11,7 +11,9 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     plan: free
-    region: oregon
+    # Singapore: closest Render region to Turso aws-ap-south-1 (Mumbai).
+    # Oregon->Singapore cuts every Turso RTT from ~250ms to ~100ms warm.
+    region: singapore
     autoDeploy: true
     healthCheckPath: /health
     envVars:

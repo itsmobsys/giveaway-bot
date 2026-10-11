@@ -79,6 +79,8 @@ class WiringTests(BotTestCase):
     """The slash-command surface and the button dispatch, wired but not started."""
 
     EXPECTED = (
+        "giveaway_ban",
+        "giveaway_ban_list",
         "giveaway_blacklist_add",
         "giveaway_blacklist_list",
         "giveaway_blacklist_remove",
@@ -91,6 +93,7 @@ class WiringTests(BotTestCase):
         "giveaway_ping",
         "giveaway_reroll",
         "giveaway_timeout_bans",
+        "giveaway_unban",
         "skipclaim",
     )
 
@@ -883,7 +886,8 @@ class GiveawayLifecycleTests(BotTestCase):
     def test_tick_continues_after_announcement_and_role_strip_failures(self) -> None:
         first, second = self.make(), self.make()
         self.bot.service.due = lambda: [first, second]
-        self.bot.service.end = lambda gw_id: (self.svc.get(gw_id), [])
+        # B04: tick ends with require_due=True, so the stub accepts it.
+        self.bot.service.end = lambda gw_id, *args, **kwargs: (self.svc.get(gw_id), [])
         calls: list[tuple[str, str]] = []
 
         async def announce(gw, winners) -> None:
@@ -1117,6 +1121,395 @@ class GracefulShutdownTests(unittest.TestCase):
 
         for windows in (False, True):
             self.assertEqual(asyncio.run(scenario(windows)), ["buffer flushed"])
+
+
+class JoinFastPathTests(BotTestCase):
+    """handle_join reuses the snapshot + count instead of re-reading rows."""
+
+    def press(self, gw_id: str, member) -> object:
+        interaction = FakeInteraction(guild=FakeGuild(self.guild, [member]), user=member)
+        asyncio.run(self.bot.handle_join(interaction, gw_id))
+        return interaction
+
+    def test_handle_join_passes_snapshot_to_join(self) -> None:
+        gw = self.make()
+        seen: dict = {}
+        original = self.bot.service.join
+        def spy(gw_arg, **kwargs):
+            seen["snapshot"] = kwargs.get("snapshot")
+            return original(gw_arg, **kwargs)
+        self.bot.service.join = spy  # type: ignore[method-assign]
+        try:
+            member = FakeMember(555555555555555555)
+            interaction = self.press(gw.id, member)
+        finally:
+            self.bot.service.join = original  # type: ignore[method-assign]
+        snap = seen.get("snapshot")
+        self.assertIsNotNone(snap, "fast-path must hand join() a snapshot tuple")
+        assert snap is not None
+        self.assertEqual(len(snap), 4)
+        self.assertTrue(any("You're in!" in t for t in interaction.texts))
+
+    def test_handle_join_none_snapshot_still_enters(self) -> None:
+        gw = self.make()
+        original = self.bot.service.eligibility_snapshot
+        self.bot.service.eligibility_snapshot = lambda *a: None  # type: ignore[method-assign]
+        try:
+            member = FakeMember(556555555555555555)
+            interaction = self.press(gw.id, member)
+        finally:
+            self.bot.service.eligibility_snapshot = original  # type: ignore[method-assign]
+        self.assertEqual(self.svc.entry_count(gw.id), 1, "None falls back to individual checks")
+        self.assertTrue(any("You're in!" in t for t in interaction.texts))
+
+    def test_handle_join_reuses_count_for_refresh(self) -> None:
+        gw = self.make()
+        refreshed: list = []
+        granted: list = []
+        async def fake_refresh(gw_arg, *, entry_count=None, live_status=None, **kwargs):
+            refreshed.append(entry_count)
+        async def fake_grant(gw_arg, member, live_status=None, **kwargs):
+            granted.append(gw_arg.id)
+        self.bot._refresh_embed = fake_refresh  # type: ignore[method-assign]
+        self.bot._grant_entrants_role = fake_grant  # type: ignore[method-assign]
+        member = FakeMember(557555555555555555)
+        self.press(gw.id, member)
+        self.assertEqual(refreshed, [1], "join count is reused, no second COUNT query")
+        self.assertEqual(granted, [gw.id])
+
+    def test_refresh_embed_reuses_count_without_query(self) -> None:
+        gw = self.make()
+        channel = FakeTextChannel()
+        self.bot.get_channel = lambda channel_id: channel
+        self.svc.set_message(gw.id, str(channel.message.id))
+        def boom(giveaway_id: str):
+            raise AssertionError("entry_count must not be queried when reused")
+        original = self.bot.service.entry_count
+        self.bot.service.entry_count = boom  # type: ignore[method-assign]
+        try:
+            asyncio.run(self.bot._refresh_embed(self.svc.get(gw.id), entry_count=5))
+        finally:
+            self.bot.service.entry_count = original  # type: ignore[method-assign]
+        self.assertEqual(len(channel.message.edits), 1)
+
+    def test_post_join_race_with_end_takes_role_without_refresh(self) -> None:
+        gw = self.make()
+        channel = FakeTextChannel()
+        self.svc.set_message(gw.id, str(channel.message.id))
+        self.bot.get_channel = lambda channel_id: channel
+        original = self.bot.service.join
+        def join_then_end(*args, **kwargs):
+            count = original(*args, **kwargs)
+            self.svc.end(gw.id)
+            return count
+        self.bot.service.join = join_then_end  # type: ignore[method-assign]
+        taken: list = []
+        async def fake_take(gw_arg, user_id: str) -> None:
+            taken.append((gw_arg.id, user_id))
+        self.bot._take_entrants_role = fake_take  # type: ignore[method-assign]
+        try:
+            member = FakeMember(558555555555555555)
+            interaction = self.press(gw.id, member)
+        finally:
+            self.bot.service.join = original  # type: ignore[method-assign]
+        self.assertTrue(any("You're in!" in t for t in interaction.texts))
+        self.assertEqual(channel.message.edits, [], "ended race must not restore the live embed")
+        self.assertEqual(taken, [(gw.id, str(member.id))])
+
+
+class AuditPostAckTests(BotTestCase):
+    """Post-ack isolation + refresh guard + silent-followup log (audit)."""
+
+    def test_post_ack_grant_failure_does_not_cancel_refresh(self) -> None:
+        gw = self.make()
+        channel = FakeTextChannel()
+        self.svc.set_message(gw.id, str(channel.message.id))
+        self.bot.get_channel = lambda channel_id: channel
+        async def boom_grant(gw_arg, member, live_status=None, **kwargs):
+            raise RuntimeError("role api down")
+        self.bot._grant_entrants_role = boom_grant  # type: ignore[method-assign]
+        member = FakeMember(559555555555555555)
+        interaction = FakeInteraction(guild=FakeGuild(self.guild, [member]), user=member)
+        with self.assertLogs("giveaway_bot", level="ERROR"):
+            asyncio.run(self.bot.handle_join(interaction, gw.id))
+        self.assertTrue(any("You're in!" in t for t in interaction.texts))
+        self.assertEqual(len(channel.message.edits), 1, "refresh must survive a grant failure")
+        self.assertEqual(self.svc.entry_count(gw.id), 1, "entry stays despite grant failure")
+
+    def test_post_ack_refresh_failure_does_not_undo_entry(self) -> None:
+        gw = self.make()
+        channel = FakeTextChannel()
+        self.svc.set_message(gw.id, str(channel.message.id))
+        self.bot.get_channel = lambda channel_id: channel
+        async def boom_refresh(gw_arg, *, entry_count=None, live_status=None, **kwargs):
+            raise RuntimeError("discord edit down")
+        granted: list = []
+        async def ok_grant(gw_arg, member, live_status=None, **kwargs):
+            granted.append(True)
+        self.bot._refresh_embed = boom_refresh  # type: ignore[method-assign]
+        self.bot._grant_entrants_role = ok_grant  # type: ignore[method-assign]
+        member = FakeMember(560555555555555555)
+        interaction = FakeInteraction(guild=FakeGuild(self.guild, [member]), user=member)
+        with self.assertLogs("giveaway_bot", level="ERROR"):
+            asyncio.run(self.bot.handle_join(interaction, gw.id))
+        self.assertEqual(granted, [True], "grant must survive a refresh failure")
+        self.assertEqual(self.svc.entry_count(gw.id), 1)
+
+    def test_join_refresh_guard_skips_ended_without_discord_edit(self) -> None:
+        gw = self.make()
+        channel = FakeTextChannel()
+        self.bot.get_channel = lambda channel_id: channel
+        self.svc.set_message(gw.id, str(channel.message.id))
+        self.svc.end(gw.id)
+        ended = self.svc.get(gw.id)
+        asyncio.run(self.bot._refresh_embed(ended, entry_count=5))
+        self.assertEqual(channel.message.edits, [], "ended guard must not touch the winner embed")
+
+    def test_tick_refresh_stale_snapshot_does_not_clobber_announce(self) -> None:
+        """B05: tick's live list going stale before the edit must not win."""
+        gw = self.make()
+        channel = FakeTextChannel()
+        self.bot.get_channel = lambda channel_id: channel
+        self.svc.set_message(gw.id, str(channel.message.id))
+        stale = self.svc.get(gw.id)
+        self.assertTrue(stale.active)
+        # end() flips status after the tick snapshot was taken, exactly the
+        # list_all_active -> _refresh_embeds window the tick walks every pass.
+        self.svc.end(gw.id)
+        asyncio.run(self.bot._refresh_embed(stale))
+        self.assertEqual(
+            channel.message.edits, [],
+            "stale tick snapshot must not overwrite the winner announcement",
+        )
+
+    def test_timeout_loop_one_bad_role_does_not_stop_rest(self) -> None:
+        gw = self.make()
+        other = self.make(prize="other")
+        member = FakeMember(561555555555555555, timed_out=True)
+        for active in (gw, other):
+            self.svc.join(
+                active, user_id=str(member.id), username="m", member_roles=[],
+                account_created_ts=time.time() - 400 * 86400,
+            )
+        calls: list = []
+        async def flaky_take(giveaway, user_id: str) -> None:
+            calls.append(giveaway.id)
+            if giveaway.id == gw.id:
+                raise RuntimeError("take down")
+        self.bot._take_entrants_role = flaky_take  # type: ignore[method-assign]
+        interaction = FakeInteraction(guild=FakeGuild(self.guild, [member]), user=member)
+        asyncio.run(self.bot.handle_join(interaction, gw.id))
+        self.assertEqual(set(calls), {gw.id, other.id}, "second take must run despite first failing")
+
+    def test_silent_followup_is_logged(self) -> None:
+        member = FakeMember(562555555555555555)
+        interaction = FakeInteraction(guild=FakeGuild(self.guild, [member]), user=member)
+        async def dead_send(text, ephemeral=True):
+            raise discord.NotFound(SimpleNamespace(status=404, reason="gone"), "gone")
+        interaction.followup.send = dead_send  # type: ignore[method-assign]
+        with self.assertLogs("giveaway_bot", level="WARNING"):
+            asyncio.run(self.bot._safe_followup(interaction, "hello"))
+
+    def test_grant_recheck_revokes_when_ended_during_grant(self) -> None:
+        gw = self.make()
+        role = SimpleNamespace(id=123)
+        self.bot._role_for = lambda g: role  # type: ignore[method-assign]
+        events: list = []
+        class FakeM:
+            async def add_roles(self, r, reason=None):
+                events.append("add")
+            async def remove_roles(self, r, reason=None):
+                events.append("remove")
+        orig = self.bot.service.get_status
+        self.bot.service.get_status = lambda gid: "ended"  # type: ignore[method-assign]
+        try:
+            asyncio.run(self.bot._grant_entrants_role(gw, FakeM()))
+        finally:
+            self.bot.service.get_status = orig  # type: ignore[method-assign]
+        self.assertEqual(events, ["add", "remove"])
+
+    def test_grant_recheck_keeps_when_still_active(self) -> None:
+        gw = self.make()
+        role = SimpleNamespace(id=123)
+        self.bot._role_for = lambda g: role  # type: ignore[method-assign]
+        events: list = []
+        class FakeM:
+            async def add_roles(self, r, reason=None):
+                events.append("add")
+            async def remove_roles(self, r, reason=None):
+                events.append("remove")
+        orig = self.bot.service.get_status
+        self.bot.service.get_status = lambda gid: "active"  # type: ignore[method-assign]
+        try:
+            asyncio.run(self.bot._grant_entrants_role(gw, FakeM()))
+        finally:
+            self.bot.service.get_status = orig  # type: ignore[method-assign]
+        self.assertEqual(events, ["add"])
+
+
+class BanCommandTests(BotTestCase):
+    """Ban commands: timed + permanent + reason in both places."""
+
+    def test_ban_blocks_and_reports_expiry_and_reason(self) -> None:
+        command = self.bot.tree.get_command("giveaway_ban")
+        self.assertIsNotNone(command)
+        member = FakeMember(571555555555555555)
+        interaction = FakeInteraction(
+            guild=FakeGuild(self.guild, [member]), user=fake_user(manage_guild=True)
+        )
+        interaction.user = SimpleNamespace(
+            id=999, guild_permissions=SimpleNamespace(manage_guild=True, administrator=False)
+        )
+        asyncio.run(command.callback(interaction, member, 5, "spam"))
+        text = interaction.followup.sent[-1]["content"]
+        self.assertIn("banned until <t:", text)
+        self.assertIn("Reason: spam", text)
+        self.assertTrue(self.svc.is_blacklisted(self.guild, str(member.id)))
+        info = self.svc.ban_info(self.guild, str(member.id))
+        assert info is not None
+        self.assertEqual(info.get("reason"), "spam")
+
+    def test_ban_zero_is_permanent(self) -> None:
+        command = self.bot.tree.get_command("giveaway_ban")
+        self.assertIsNotNone(command)
+        member = FakeMember(572555555555555555)
+        interaction = FakeInteraction(
+            guild=FakeGuild(self.guild, [member]), user=fake_user(manage_guild=True)
+        )
+        interaction.user = SimpleNamespace(
+            id=999, guild_permissions=SimpleNamespace(manage_guild=True, administrator=False)
+        )
+        asyncio.run(command.callback(interaction, member, 0, "bad"))
+        text = interaction.followup.sent[-1]["content"]
+        self.assertIn("permanently", text)
+        self.assertIn("Reason: bad", text)
+
+    def test_ban_bad_hours_is_refused(self) -> None:
+        command = self.bot.tree.get_command("giveaway_ban")
+        self.assertIsNotNone(command)
+        member = FakeMember(573555555555555555)
+        interaction = FakeInteraction(
+            guild=FakeGuild(self.guild, [member]), user=fake_user(manage_guild=True)
+        )
+        interaction.user = SimpleNamespace(
+            id=999, guild_permissions=SimpleNamespace(manage_guild=True, administrator=False)
+        )
+        asyncio.run(command.callback(interaction, member, 721, ""))
+        self.assertIn("0-720", interaction.followup.sent[-1]["content"])
+        self.assertFalse(self.svc.is_blacklisted(self.guild, str(member.id)))
+
+    def test_ban_requires_manage(self) -> None:
+        command = self.bot.tree.get_command("giveaway_ban")
+        self.assertIsNotNone(command)
+        member = FakeMember(574555555555555555)
+        interaction = FakeInteraction(guild=FakeGuild(self.guild, [member]), user=fake_user())
+        asyncio.run(command.callback(interaction, member, 1, ""))
+        self.assertEqual(interaction.texts, ["You need **Manage Server**."])
+
+    def test_unban_clears_and_reports(self) -> None:
+        self.svc.blacklist_add(self.guild, "575555555555555555", hours=3)
+        command = self.bot.tree.get_command("giveaway_unban")
+        self.assertIsNotNone(command)
+        member = FakeMember(575555555555555555)
+        interaction = FakeInteraction(
+            guild=FakeGuild(self.guild, [member]), user=fake_user(manage_guild=True)
+        )
+        interaction.user = SimpleNamespace(
+            id=999, guild_permissions=SimpleNamespace(manage_guild=True, administrator=False)
+        )
+        asyncio.run(command.callback(interaction, member))
+        self.assertIn("can join giveaways again", interaction.followup.sent[-1]["content"])
+        self.assertFalse(self.svc.is_blacklisted(self.guild, "575555555555555555"))
+
+class JoinBurstHandlerTests(BotTestCase):
+    """handle_join under burst: one row per user, debounce, lane cap."""
+
+    def run_burst(self, gw_id: str, members):
+        async def scenario():
+            async def one(member):
+                guild = FakeGuild(self.guild, [member])
+                interaction = FakeInteraction(guild=guild, user=member)
+                await self.bot.handle_join(interaction, gw_id)
+                return interaction
+            return await __import__("asyncio").gather(*(one(m) for m in members))
+        return asyncio.run(scenario())
+
+    def test_40_concurrent_handler_joins_all_commit(self) -> None:
+        gw = self.make()
+        members = [FakeMember(10 ** 17 + i) for i in range(40)]
+        interactions = self.run_burst(gw.id, members)
+        self.assertEqual(self.svc.entry_count(gw.id), 40)
+        for interaction in interactions:
+            self.assertTrue(any("You're in!" in t for t in interaction.texts))
+
+    def test_burst_embeds_are_debounced(self) -> None:
+        gw = self.make()
+        channel = FakeTextChannel()
+        self.bot.get_channel = lambda channel_id: channel
+        self.svc.set_message(gw.id, str(channel.message.id))
+        members = [FakeMember(3 * 10 ** 17 + i) for i in range(10)]
+        self.run_burst(gw.id, members)
+        self.assertEqual(self.svc.entry_count(gw.id), 10)
+        self.assertLessEqual(
+            len(channel.message.edits), 10,
+            "burst must not PATCH once per click at minimum; debounce cuts it",
+        )
+        # Leading edge fires immediately: the first click always refreshes.
+        self.assertGreaterEqual(len(channel.message.edits), 1)
+
+    def test_dead_refresh_read_still_acks_honestly(self) -> None:
+        gw = self.make()
+        original = self.bot.service.refresh_snapshot
+        self.bot.service.refresh_snapshot = lambda gid: (_ for _ in ()).throw(
+            OSError("turso down"))  # type: ignore[method-assign]
+        try:
+            member = FakeMember(4 * 10 ** 17 + 1)
+            interaction = FakeInteraction(
+                guild=FakeGuild(self.guild, [member]), user=member)
+            asyncio.run(self.bot.handle_join(interaction, gw.id))
+        finally:
+            self.bot.service.refresh_snapshot = original  # type: ignore[method-assign]
+        self.assertTrue(self.svc.has_entry(gw.id, str(4 * 10 ** 17 + 1)))
+        self.assertTrue(any(t == "🎟️ You're in!" for t in interaction.texts))
+
+    def test_db_lane_caps_concurrent_streams(self) -> None:
+        import asyncio as _asyncio
+        peak = 0
+        live = 0
+
+        def slow_probe():
+            nonlocal peak, live
+            live += 1
+            peak = max(peak, live)
+            try:
+                time.sleep(0.05)
+                return True
+            finally:
+                live -= 1
+
+        async def scenario():
+            await _asyncio.gather(*(
+                self.bot._db_call(slow_probe) for _ in range(40)
+            ))
+        asyncio.run(scenario())
+        self.assertLessEqual(
+            peak, 24, f"gate must cap live streams at 24, saw {peak}")
+        self.assertGreater(peak, 1, "probe must actually overlap")
+
+    def test_ban_list_shows_expiry_and_reason(self) -> None:
+        self.svc.blacklist_add(self.guild, "1" * 18, hours=0, reason="perm reason")
+        self.svc.blacklist_add(self.guild, "2" * 18, hours=5, reason="timed reason")
+        command = self.bot.tree.get_command("giveaway_ban_list")
+        self.assertIsNotNone(command)
+        interaction = FakeInteraction(
+            guild=FakeGuild(self.guild), user=fake_user(manage_guild=True)
+        )
+        asyncio.run(command.callback(interaction))
+        text = interaction.followup.sent[-1]["content"]
+        self.assertIn("Banned (2)", text)
+        self.assertIn("permanent", text)
+        self.assertIn("expires <t:", text)
+        self.assertIn("timed reason", text)
 
 
 if __name__ == "__main__":

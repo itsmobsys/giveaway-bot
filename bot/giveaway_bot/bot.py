@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 import signal
+import time
 
 import discord
 from discord import app_commands
@@ -105,6 +106,62 @@ class GiveawayBot(commands.Bot):
         self._tick_count = 0
         #: Where the rotating embed-refresh window starts on the next tick.
         self._refresh_cursor = 0
+        #: Bounded DB lane: Turso serializes writes and every to_thread call
+        #: opens its own thread-local connection (TLS + auth on cold threads).
+        #: An unbounded burst of 100 joins would spawn ~200 default-pool
+        #: threads and ~200 streams. 32 workers keep ~100 concurrent joins
+        #: flowing with headroom for ticks/commands; the semaphore caps live
+        #: Turso streams at 24 so bursts queue in memory (cheap) instead of
+        #: opening streams (expensive) that then fight over one writer.
+        # No private ThreadPoolExecutor: _db_call uses the loop's default
+        # executor (shared per loop, no per-bot thread leak in tests) plus
+        # this gate to cap live Turso streams. 24 lets ~100 concurrent joins
+        # queue in memory (cheap) instead of opening 200 streams (expensive).
+        self._db_gate = asyncio.Semaphore(24)
+        #: Leading-edge refresh debounce: giveaway_id -> last epoch seconds.
+        #: A 100-click burst would PATCH the same embed 100 times (~2s of
+        #: rate-limit burn); the first click refreshes immediately, the rest
+        #: within the window reuse the ack-time snapshot count. Failures never
+        #: populate the stamp so a dead edit retries on the next click.
+        self._refresh_stamp: dict[str, float] = {}
+        self._bg_tasks: set[asyncio.Task] = set()
+
+    # -- bounded DB lane --------------------------------------------------
+    #: Seconds a single DB call may hold a lane before the join gives up.
+    #: Turso warm RTT is ~0.1s; 8s is generations of headroom, but a hung
+    #: stream must never park a click (or a lane) forever.
+    DB_CALL_TIMEOUT = 8.0
+
+    #: Leading-edge refresh window in seconds (see _refresh_stamp above).
+    REFRESH_DEBOUNCE_SECONDS = 2.0
+
+    async def _db_call(self, func, *args, **kwargs):
+        """Run a blocking service/DB call on the shared pool, gated."""
+        loop = asyncio.get_running_loop()
+        async with self._db_gate:
+            try:
+                return await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: func(*args, **kwargs)),
+                    timeout=self.DB_CALL_TIMEOUT,
+                )
+            except TimeoutError:
+                log.warning("db call %s timed out", getattr(func, "__name__", func))
+                raise
+
+    def _should_refresh(self, giveaway_id: str) -> bool:
+        """Leading-edge debounce: first click refreshes, burst mates skip."""
+        now = time.monotonic()
+        try:
+            last = self._refresh_stamp.get(giveaway_id, 0.0)
+        except Exception:
+            last = 0.0
+        if now - last < self.REFRESH_DEBOUNCE_SECONDS:
+            return False
+        try:
+            self._refresh_stamp[giveaway_id] = now
+        except Exception:
+            pass
+        return True
 
     # -- lifecycle ------------------------------------------------------
     async def setup_hook(self) -> None:
@@ -162,6 +219,8 @@ class GiveawayBot(commands.Bot):
         except Exception:
             log.exception("final message-count flush failed")
         for task in list(self._role_tasks):
+            task.cancel()
+        for task in list(self._bg_tasks):
             task.cancel()
         await super().close()
         # Every thread's connection, not just this one's.
@@ -293,24 +352,47 @@ class GiveawayBot(commands.Bot):
         self._refresh_cursor = (start + count) % len(rest)
         return head + extra
 
-    async def _refresh_embed(self, gw: Giveaway) -> None:
+    async def _refresh_embed(
+        self, gw: Giveaway, *, entry_count: int | None = None,
+        live_status: str | None = None,
+    ) -> str | None:
         if not gw.active or not gw.message_id:
-            return
+            return None
+        # B05: every refresh re-checks live status immediately before the
+        # Discord edit. The gw snapshot may pre-date an end()/cancel() that
+        # flipped status since (join fast-path race, or the tick's own live
+        # list going stale between list_all_active and the edit). Editing now
+        # would overwrite the winner announcement _announce just posted.
+        # Join fast-path passes live_status from its refresh_snapshot so the
+        # common case costs zero extra trips; None keeps the old recheck.
+        # Tick budgets (REFRESH_CONCURRENCY/PER_TICK/ROTATING) are unchanged.
+        if live_status is None:
+            try:
+                live_status = await self._db_call(self.service.get_status, gw.id)
+            except Exception:
+                log.exception("refresh status recheck failed for %s", gw.id)
+                return None
+        if live_status != "active":
+            return live_status
         try:
             channel = self.get_channel(int(gw.channel_id))
             message_id = int(gw.message_id)
         except (TypeError, ValueError):
-            return
+            return None
         if not isinstance(channel, discord.TextChannel):
-            return
+            return None
         try:
-            count = await asyncio.to_thread(self.service.entry_count, gw.id)
+            if entry_count is None:
+                count = await self._db_call(self.service.entry_count, gw.id)
+            else:
+                count = entry_count
             # A partial message edits by id. fetch_message() would spend a full
             # GET per giveaway per tick on a message object nothing here reads.
             await channel.get_partial_message(message_id).edit(
                 embed=embeds.giveaway_embed(gw, count, self.settings.embed_color),
                 view=GiveawayView(gw.id, self.settings.dashboard_url),
             )
+            return live_status
         except discord.NotFound:
             # The message is gone for good: nothing to edit, and nothing worth
             # repeating in the log every tick.
@@ -418,7 +500,9 @@ class GiveawayBot(commands.Bot):
             return ""
         return role.mention if role is not None else ""
 
-    async def _grant_entrants_role(self, gw: Giveaway, member: discord.Member) -> None:
+    async def _grant_entrants_role(
+        self, gw: Giveaway, member: discord.Member, live_status: str | None = None
+    ) -> None:
         role = self._role_for(gw)
         if role is None:
             return
@@ -426,6 +510,29 @@ class GiveawayBot(commands.Bot):
             await member.add_roles(role, reason=f"Joined giveaway {gw.id}")
         except (discord.Forbidden, discord.HTTPException):
             log.warning("could not grant entrants role for %s", gw.id)
+            return
+        # Grant-after-end TOCTOU: end() may have flipped status during the
+        # add_roles call. Re-check live status after the grant; when the
+        # giveaway is no longer active, take the role back immediately so the
+        # member is not left holding the ping-everyone role of an ended
+        # giveaway. Fail-closed on lookup failure (take) so a DB blip can
+        # never leave a stale role behind; the entry itself is untouched.
+        # The join background worker passes the snapshot status it already
+        # read, so the common case costs zero extra trips; live_status=None
+        # (tick/legacy callers) keeps the old recheck behaviour.
+        live = live_status
+        if live is None:
+            try:
+                live = await self._db_call(self.service.get_status, gw.id)
+            except Exception:
+                log.exception("post-grant status recheck failed for %s", gw.id)
+                live = None
+        if live != "active":
+            try:
+                await member.remove_roles(role, reason=f"Giveaway {gw.id} ended")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+            log.info("revoked stale entrants role for %s (ended during grant)", gw.id)
 
     async def _take_entrants_role(self, gw: Giveaway, user_id: str) -> None:
         role = self._role_for(gw)
@@ -600,14 +707,19 @@ class GiveawayBot(commands.Bot):
         # interaction payload, so this is the state Discord reported when they
         # clicked — not a cache read that could be minutes old.
         timed_out = self._timed_out(member)
+        guild_id_str = str(interaction.guild.id)
         try:
-            gw = await asyncio.to_thread(self.service.get, giveaway_id)
+            # Fast-path: one round-trip returns the giveaway row + the 4
+            # eligibility subqueries (was: 2 parallel queries on 2 threads).
+            gw, snapshot = await self._db_call(
+                self.service.join_snapshot, giveaway_id, guild_id_str, uid
+            )
         except ServiceError:
             # Log the id plus what IS live: tells a stale button (id absent
             # from the live list) apart from a phantom empty read (id present
             # but the lookup missed it).
             try:
-                live = await asyncio.to_thread(
+                live = await self._db_call(
                     self.service.list_all_active, 50
                 )
                 live_ids = [g.id for g in live]
@@ -629,7 +741,11 @@ class GiveawayBot(commands.Bot):
             )
             return
         try:
-            count = await asyncio.to_thread(
+            # Commit first, count later: fetch_count=False skips the COUNT so
+            # the ack waits on 1 write wave only. The post-ack
+            # refresh_snapshot() supplies status + count in one read wave.
+            # -1 = committed, count unknown (never printed).
+            await self._db_call(
                 self.service.join,
                 gw,
                 user_id=uid,
@@ -637,8 +753,10 @@ class GiveawayBot(commands.Bot):
                 member_roles=roles,
                 account_created_ts=created_ts,
                 # Messages this member sent since the last flush still count.
-                pending_messages=self._pending_messages(str(interaction.guild.id), uid),
+                pending_messages=self._pending_messages(guild_id_str, uid),
                 timed_out=timed_out,
+                snapshot=snapshot,
+                fetch_count=False,
             )
         except ServiceError as exc:
             await self._safe_followup(interaction, f"⚠️ {exc.message}")
@@ -647,40 +765,79 @@ class GiveawayBot(commands.Bot):
                 # role it earned has to go too — in every active giveaway
                 # whose entries the service dropped, not just this one.
                 try:
-                    active = await asyncio.to_thread(self.service.list_active, gw.guild_id)
+                    active = await self._db_call(self.service.list_active, gw.guild_id)
                 except Exception:
                     log.exception("timeout role lookup failed for %s", uid)
                 else:
                     for live in active:
-                        await self._take_entrants_role(live, uid)
+                        try:
+                            await self._take_entrants_role(live, uid)
+                        except Exception:
+                            log.exception(
+                                "timeout role take failed for %s/%s", live.id, uid
+                            )
             return
         except Exception:
             log.exception("join failed for %s", giveaway_id)
             await self._safe_followup(interaction, "⚠️ Could not enter you. Try again.")
             return
-        await self._safe_followup(interaction, f"🎟️ You're in! Entry #{count}.")
+        # One read wave returns status + count together (was: COUNT then
+        # status as two sequential waves). The ack carries the real entry
+        # number; the same pair feeds grant-vs-take + refresh with zero
+        # further trips. Commit already landed, so a dead read still acks
+        # honestly, just without the number.
         try:
-            fresh = await asyncio.to_thread(self.service.get, giveaway_id)
-        except ServiceError:
-            return
+            status, count = await self._db_call(
+                self.service.refresh_snapshot, giveaway_id
+            )
         except Exception:
             log.exception("post-join refresh lookup failed for %s", giveaway_id)
+            await self._safe_followup(interaction, "🎟️ You're in!")
             return
-        if fresh.active:
-            await self._grant_entrants_role(fresh, member)
+        if status is None:
+            await self._safe_followup(interaction, "🎟️ You're in!")
+            return
+        await self._safe_followup(interaction, f"🎟️ You're in! Entry #{count}.")
+        if status == "active":
+            # Each post-ack step is isolated: a role-grant failure must not
+            # cancel the embed refresh (or vice versa), and neither may undo
+            # the valid entry or crash the button callback after the ack.
+            # Debounce: every click grants the role, but only the first in
+            # the window PATCHes the embed (a 100-click burst re-rendered it
+            # 100 times for one visible change).
+            steps = [self._grant_entrants_role(gw, member, live_status=status)]
+            if self._should_refresh(giveaway_id):
+                steps.append(
+                    self._refresh_embed(gw, entry_count=count, live_status=status)
+                )
+            results = await asyncio.gather(*steps, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    log.exception("post-join background step failed for %s", giveaway_id)
         else:
             # The draw won the race: this member joined in the same instant the
             # giveaway ended, and the strip pass may already have walked past
             # them. Granting the role now would leave them holding the
-            # ping-everyone role of a giveaway that is over.
-            await self._take_entrants_role(fresh, uid)
-        await self._refresh_embed(fresh)
+            # ping-everyone role of a giveaway that is over. The entry stays
+            # (it landed before the draw claimed status) but missed this draw;
+            # say so so "You're in!" above is not the last word.
+            try:
+                await self._take_entrants_role(gw, uid)
+            except Exception:
+                log.exception("post-join role take failed for %s", giveaway_id)
+            await self._safe_followup(
+                interaction,
+                "This giveaway just ended — your entry arrived too late for the draw.",
+            )
 
     async def _safe_followup(self, interaction: discord.Interaction, text: str) -> None:
         try:
             await interaction.followup.send(text, ephemeral=True)
-        except (discord.NotFound, discord.HTTPException):
-            pass
+        except (discord.NotFound, discord.HTTPException) as exc:
+            # The ack never reached the member: log so a silent join (entry
+            # stored, user told nothing) leaves a trace instead of looking
+            # like the button did nothing.
+            log.warning("followup failed (%s): %s", type(exc).__name__, exc)
 
     async def handle_participants(
         self, interaction: discord.Interaction, giveaway_id: str
@@ -797,7 +954,11 @@ class GiveawayBot(commands.Bot):
             return
         for gw in due:
             try:
-                ended, winners = await asyncio.to_thread(self.service.end, gw.id)
+                # B04: stale due rows must not beat a concurrent extend — the
+                # flip re-checks ends_at itself and refuses when extended.
+                ended, winners = await asyncio.to_thread(
+                    self.service.end, gw.id, require_due=True
+                )
             except ServiceError as exc:
                 # Usually another ender won the claim (the tick and
                 # /giveaway_end firing together), but a giveaway that never ends
@@ -1714,6 +1875,147 @@ def wire_commands(bot: GiveawayBot) -> None:
         lines = "\n".join(f"<@{uid}>" for uid in shown)
         extra = f"\n…plus {total - len(shown)} more." if total > len(shown) else ""
         await bot._safe_followup(interaction, f"🚫 **Blocked ({total}):**\n{lines}{extra}")
+
+    @bot.tree.command(name="giveaway_ban", description="Ban a user for N hours (0 = permanent)")
+    @app_commands.describe(
+        user="The member to ban",
+        hours="0 = permanent, 1-720 hours",
+        reason="Reason shown to the member and staff",
+    )
+    async def giveaway_ban(
+        interaction: discord.Interaction, user: discord.Member, hours: int = 0, reason: str = ""
+    ) -> None:
+        """Timed ban + yank entries + strip roles. hours=0 means permanent."""
+        if interaction.guild is None or not _can_manage(interaction.user):
+            await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
+            return
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        gid, uid = str(interaction.guild.id), str(user.id)
+        try:
+            hours_int = int(hours)
+        except (TypeError, ValueError):
+            await bot._safe_followup(
+                interaction, "⚠️ Ban duration must be 0-720 hours (0 = permanent)."
+            )
+            return
+        try:
+            info = await asyncio.to_thread(
+                svc.blacklist_add, gid, uid,
+                hours=hours_int, reason=reason or "",
+                banned_by=str(getattr(interaction.user, "id", "")),
+            )
+            active = await asyncio.to_thread(svc.list_active, gid)
+        except ServiceError as exc:
+            await bot._safe_followup(interaction, f"⚠️ {exc.message}")
+            return
+        except Exception:
+            log.exception("ban failed for %s", uid)
+            await bot._safe_followup(interaction, "⚠️ Could not update the ban. Try again.")
+            return
+        for gw in active:
+            try:
+                await bot._take_entrants_role(gw, uid)
+            except Exception:
+                log.exception("ban role take failed for %s/%s", gw.id, uid)
+        log.info("banned %s in guild %s for %sh reason=%r", uid, gid, hours_int, (reason or "")[:64])
+        clean_reason = (reason or "").strip()
+        reason_bit = f" Reason: {clean_reason[:256]}" if clean_reason else ""
+        try:
+            exp = info.get("expires_at") if isinstance(info, dict) else None
+            permanent = bool(info.get("permanent")) if isinstance(info, dict) else hours_int == 0
+        except Exception:
+            exp, permanent = None, hours_int == 0
+        if permanent:
+            when = "permanently"
+        elif exp:
+            try:
+                when = f"until <t:{int(exp) // 1000}:R>"
+            except (TypeError, ValueError):
+                when = f"for {hours_int}h"
+        else:
+            when = f"for {hours_int}h"
+        await bot._safe_followup(
+            interaction,
+            f"🚫 {user.mention} is banned {when} — entries removed"
+            f" from {len(active)} running giveaway(s).{reason_bit}",
+        )
+
+    @bot.tree.command(name="giveaway_unban", description="Unban a user from giveaways")
+    @app_commands.describe(user="The member to unban")
+    async def giveaway_unban(
+        interaction: discord.Interaction, user: discord.Member
+    ) -> None:
+        if interaction.guild is None or not _can_manage(interaction.user):
+            await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
+            return
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        try:
+            removed = await asyncio.to_thread(
+                svc.blacklist_remove, str(interaction.guild.id), str(user.id)
+            )
+        except Exception:
+            log.exception("unban failed for %s", user.id)
+            await bot._safe_followup(
+                interaction, "⚠️ Could not update the ban. Try again."
+            )
+            return
+        await bot._safe_followup(
+            interaction,
+            f"✅ {user.mention} can join giveaways again."
+            if removed
+            else f"{user.mention} was not banned.",
+        )
+
+    @bot.tree.command(name="giveaway_ban_list", description="Show banned users with expiry and reason")
+    async def giveaway_ban_list(interaction: discord.Interaction) -> None:
+        if interaction.guild is None or not _can_manage(interaction.user):
+            await interaction.response.send_message("You need **Manage Server**.", ephemeral=True)
+            return
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+        except (discord.NotFound, discord.HTTPException):
+            return
+        try:
+            gid = str(interaction.guild.id)
+            try:
+                await asyncio.to_thread(svc.purge_expired_bans)
+            except Exception:
+                log.exception("ban purge failed")
+            rows = await asyncio.to_thread(svc.blacklist_list_detailed, gid)
+            total = await asyncio.to_thread(svc.count_blacklisted, gid)
+        except Exception:
+            log.exception("ban list failed")
+            await bot._safe_followup(
+                interaction, "⚠️ Could not load the ban list. Try again."
+            )
+            return
+        if not rows:
+            await bot._safe_followup(interaction, "Ban list is empty — nobody is banned.")
+            return
+        shown = rows[:20]
+        lines: list[str] = []
+        for r in shown:
+            uid = str(r.get("user_id"))
+            reason = str(r.get("reason") or "").strip()
+            exp = r.get("expires_at")
+            if exp is None:
+                when = "permanent"
+            else:
+                try:
+                    when = f"expires <t:{int(exp) // 1000}:R>"  # type: ignore[arg-type]
+                except (TypeError, ValueError):
+                    when = "timed"
+            tail = f" — {reason[:100]}" if reason else ""
+            lines.append(f"<@{uid}> ({when}){tail}")
+        body = "\n".join(lines)
+        extra = f"\n…plus {total - len(shown)} more." if total > len(shown) else ""
+        await bot._safe_followup(interaction, f"🚫 **Banned ({total}):**\n{body}{extra}")
 
     @bot.tree.command(
         name="giveaway_timeout_bans",

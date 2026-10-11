@@ -1330,6 +1330,105 @@ class RerollCasTests(ServiceTestCase):
         self.assertEqual(json.loads(raw), [winner])
 
 
+class ClaimAtomicityTests(ServiceTestCase):
+    """B01: a crash between a stored draw and its claim inserts heals."""
+
+    def _three_entrant_ended(self, **kw):
+        kw.setdefault("claim_timeout_seconds", 3600)
+        kw.setdefault("winner_count", 1)
+        gw = self.make(**kw)
+        users = [str(10 ** 17 + i) for i in range(3)]
+        for u in users:
+            self.join(gw, user_id=u)
+        ended, winners = self.svc.end(gw.id)
+        return ended, winners[0], users
+
+    def _strand(self, giveaway_id: str) -> None:
+        self.db.execute("DELETE FROM simple_claims WHERE giveaway_id = ?", (giveaway_id,))
+        self.assertEqual(
+            self.db.query(
+                "SELECT user_id FROM simple_claims WHERE giveaway_id = ?", (giveaway_id,)
+            ),
+            [],
+        )
+
+    def test_end_insert_crash_still_announces_and_heals(self) -> None:
+        gw = self.make(winner_count=1, claim_timeout_seconds=3600)
+        users = [str(10 ** 17 + i) for i in range(3)]
+        for u in users:
+            self.join(gw, user_id=u)
+        with unittest.mock.patch.object(
+            self.svc, "start_claims", side_effect=RuntimeError("boom")
+        ):
+            ended, winners = self.svc.end(gw.id)
+        self.assertEqual(len(winners), 1)
+        self.assertIn(winners[0], users)
+        # Post-flip failure returns the stored draw; the repair healed the window.
+        pending = self.svc.pending_claims(ended.id)
+        self.assertEqual([str(r["user_id"]) for r in pending], winners)
+
+    def test_stranded_draw_healed_by_pending_and_claim_retry(self) -> None:
+        ended, winner, _users = self._three_entrant_ended()
+        self._strand(ended.id)
+        pending = self.svc.pending_claims(ended.id)
+        self.assertEqual([str(r["user_id"]) for r in pending], [winner])
+        self._strand(ended.id)
+        row = self.svc.claim(ended.id, winner)
+        self.assertEqual(str(row["user_id"]), winner)
+        self.assertEqual(self.svc.pending_claims(ended.id), [])
+
+    def test_stranded_draw_healed_by_tick_sweep(self) -> None:
+        ended, winner, _users = self._three_entrant_ended()
+        deadline = int(self.svc.pending_claims(ended.id)[0]["deadline_ms"])
+        self._strand(ended.id)
+        due = self.svc.due_claims(now=deadline + 1)
+        self.assertEqual([str(r["user_id"]) for r in due], [winner])
+
+    def test_repair_is_idempotent_and_settles_stale_pending(self) -> None:
+        ended, winner, users = self._three_entrant_ended()
+        # A stale pending row for a non-winner (targeted reroll that died
+        # before settling) flips to replaced; existing winners keep windows.
+        loser = next(u for u in users if u != winner)
+        self.db.execute(
+            "INSERT OR IGNORE INTO simple_claims"
+            " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
+            " VALUES (?, ?, 0, 'pending', ?, ?)",
+            (ended.id, loser, now_ms() + 3600 * 1000, now_ms()),
+        )
+        written = self.svc.repair_missing_claims(ended.id)
+        self.assertGreaterEqual(written, 1)
+        statuses = {
+            str(r["user_id"]): str(r["status"]) for r in self.svc.claim_status(ended.id)
+        }
+        self.assertEqual(statuses[winner], "pending")
+        self.assertEqual(statuses[loser], "replaced")
+        again = self.svc.repair_missing_claims(ended.id)
+        self.assertEqual(again, 0, "second sweep must be a no-op")
+
+    def test_reroll_insert_crash_heals_fresh_window(self) -> None:
+        ended, winner, users = self._three_entrant_ended()
+        with unittest.mock.patch.object(
+            self.svc, "start_claims", side_effect=RuntimeError("boom")
+        ):
+            redrawn, fresh = self.svc.reroll(ended.id, 1)
+        self.assertEqual(len(fresh), 1)
+        pending = {str(r["user_id"]) for r in self.svc.pending_claims(ended.id)}
+        self.assertIn(fresh[0], pending)
+        self.assertIn(winner, pending)
+        self.assertIn(fresh[0], redrawn.winners)
+
+    def test_expire_insert_crash_heals_replacement(self) -> None:
+        ended, winner, _users = self._three_entrant_ended()
+        deadline = int(self.svc.pending_claims(ended.id)[0]["deadline_ms"])
+        with unittest.mock.patch.object(
+            self.svc, "start_claims", side_effect=RuntimeError("boom")
+        ):
+            redrawn, fresh = self.svc.expire_claim(ended.id, winner, now=deadline + 1)
+        self.assertEqual(len(fresh), 1)
+        pending = {str(r["user_id"]) for r in self.svc.pending_claims(ended.id)}
+        self.assertIn(fresh[0], pending)
+
+
 class TargetedSettledGuardTests(ServiceTestCase):
     def _four_entrant_three_winner_ended(self, **kw):
         gw = self.make(winner_count=3, claim_timeout_seconds=3600, **kw)
@@ -1384,6 +1483,681 @@ class GuildSettingTests(ServiceTestCase):
         self.svc.set_notify_role(self.guild, None)
         self.assertIsNone(self.svc.get_notify_role(self.guild))
         self.assertIsNone(self.svc.get_notify_role("999"))
+
+
+class EligibilitySnapshotTests(ServiceTestCase):
+    """One SELECT for blacklist + ban + messages + hit (latency fast-path)."""
+
+    def test_snapshot_returns_all_four_fields(self) -> None:
+        gw = self.make()
+        self.svc.record_message(self.guild, "5" * 18)
+        self.svc.record_message(self.guild, "5" * 18)
+        snap = self.svc.eligibility_snapshot(self.guild, "5" * 18, gw.id)
+        self.assertIsNotNone(snap)
+        assert snap is not None
+        bl, ban, msgs, hit = snap
+        self.assertFalse(bl)
+        self.assertEqual(ban, 0)
+        self.assertEqual(msgs, 2)
+        self.assertFalse(hit)
+
+    def test_snapshot_sees_blacklist_ban_and_hit(self) -> None:
+        gw = self.make()
+        uid = "6" * 18
+        self.svc.blacklist_add(self.guild, uid)
+        self.svc.apply_timeout_penalty(self.guild, uid, giveaway_id=gw.id)
+        snap = self.svc.eligibility_snapshot(self.guild, uid, gw.id)
+        assert snap is not None
+        bl, ban, msgs, hit = snap
+        self.assertTrue(bl)
+        self.assertEqual(ban, 3)
+        self.assertTrue(hit)
+
+    def test_snapshot_empty_ids_fail_closed(self) -> None:
+        self.assertEqual(self.svc.eligibility_snapshot("", ""), (False, 0, 0, False))
+
+    def test_snapshot_none_on_db_failure_forces_fallback(self) -> None:
+        gw = self.make()
+        with unittest.mock.patch.object(self.db, "query_one", side_effect=OSError("turso down")):
+            self.assertIsNone(self.svc.eligibility_snapshot(self.guild, "5" * 18, gw.id))
+        # None forces the individual checks: the join still works.
+        self.assertEqual(self.join(gw, user_id="5" * 18), 1)
+
+    def test_join_with_snapshot_honors_live_block(self) -> None:
+        gw = self.make()
+        uid = "7" * 18
+        self.svc.blacklist_add(self.guild, uid)
+        with self.assertRaises(ServiceError):
+            self.svc.join(
+                gw, user_id=uid, username="u", member_roles=[],
+                account_created_ts=time.time() - 400 * 86400,
+                snapshot=(True, 0, 0, False),
+            )
+        self.assertEqual(self.svc.entry_count(gw.id), 0)
+
+    def test_stale_snapshot_block_does_not_falsely_refuse(self) -> None:
+        # Snapshot says blocked but the row is gone (blacklist_remove raced
+        # the snapshot): live-confirm lets the join through. The INSERT
+        # guard still blocks a racing blacklist_add, so safety is kept.
+        gw = self.make()
+        count = self.svc.join(
+            gw, user_id="7" * 18, username="u", member_roles=[],
+            account_created_ts=time.time() - 400 * 86400,
+            snapshot=(True, 0, 0, False),
+        )
+        self.assertEqual(count, 1)
+
+    def test_join_with_snapshot_counts_buffered_messages(self) -> None:
+        gw = self.make(min_messages=3)
+        self.svc.record_message(self.guild, "8" * 18)
+        count = self.svc.join(
+            gw, user_id="8" * 18, username="u", member_roles=[],
+            account_created_ts=time.time() - 400 * 86400,
+            snapshot=(False, 0, 1, False), pending_messages=2,
+        )
+        self.assertEqual(count, 1)
+
+    def test_get_status_is_status_only(self) -> None:
+        gw = self.make()
+        self.assertEqual(self.svc.get_status(gw.id), "active")
+        self.svc.end(gw.id)
+        self.assertEqual(self.svc.get_status(gw.id), "ended")
+        self.assertIsNone(self.svc.get_status("gw_missing"))
+
+
+class DbStatsTests(ServiceTestCase):
+    def test_stats_count_read_trips(self) -> None:
+        gw = self.make()
+        self.db.reset_stats()
+        self.svc.eligibility_snapshot(self.guild, "5" * 18, gw.id)
+        self.svc.get_status(gw.id)
+        stats = self.db.get_stats()
+        self.assertGreaterEqual(stats["reads"], 2)
+        self.assertEqual(stats["writes"], 0)
+
+    def test_stats_counts_failed_attempts(self) -> None:
+        gw = self.make()
+        self.db.reset_stats()
+        orig_conn = self.db._conn
+        calls = {"n": 0}
+        def flaky_conn():
+            if calls["n"] == 0:
+                calls["n"] += 1
+                raise sqlite3.OperationalError("database is locked")
+            return orig_conn()
+        self.db._conn = flaky_conn  # type: ignore[method-assign]
+        try:
+            with unittest.mock.patch("time.sleep", return_value=None):
+                self.svc.get_status(gw.id)
+        finally:
+            self.db._conn = orig_conn  # type: ignore[method-assign]
+        stats = self.db.get_stats()
+        self.assertGreaterEqual(stats["reads"], 2, "failed retry must count, not hide")
+
+    def test_stats_separates_reads_and_writes(self) -> None:
+        self.db.reset_stats()
+        self.svc.record_message(self.guild, "9" * 18)
+        stats = self.db.get_stats()
+        self.assertGreaterEqual(stats["writes"], 1)
+        self.assertEqual(stats["reads"], 0)
+
+
+class AuditRaceTests(ServiceTestCase):
+    """Production-safety races for the join fast-path (audit fixes)."""
+
+    def test_insert_guard_blocks_racing_blacklist(self) -> None:
+        gw = self.make()
+        fresh_gw = self.svc.get(gw.id)
+        uid = "9" * 18
+        self.svc.blacklist_add(self.guild, uid)
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.join(
+                fresh_gw, user_id=uid, username="u", member_roles=[],
+                account_created_ts=time.time() - 400 * 86400,
+                snapshot=(False, 0, 0, False),
+            )
+        self.assertIn("blocked", str(ctx.exception.message))
+        self.assertEqual(self.svc.entry_count(gw.id), 0)
+
+    def test_insert_guard_blocks_racing_deadline(self) -> None:
+        gw = self.make()
+        stale = self.svc.get(gw.id)
+        self.db.execute(
+            "UPDATE simple_giveaways SET ends_at = ? WHERE id = ?",
+            (now_ms() - 1, gw.id),
+        )
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.join(
+                stale, user_id="9" * 18, username="u", member_roles=[],
+                account_created_ts=time.time() - 400 * 86400,
+                snapshot=(False, 0, 0, False),
+            )
+        self.assertIn("ended", str(ctx.exception.message))
+        self.assertEqual(self.svc.entry_count(gw.id), 0)
+
+    def test_insert_guard_blocks_penalty_race_and_consumes(self) -> None:
+        gw = self.make()
+        uid = "8" * 18
+        stale_gw = self.svc.get(gw.id)
+        self.svc.apply_timeout_penalty(self.guild, uid, giveaway_id="other_gw")
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.join(
+                stale_gw, user_id=uid, username="u", member_roles=[],
+                account_created_ts=time.time() - 400 * 86400,
+                snapshot=(False, 0, 0, False),
+            )
+        self.assertEqual(ctx.exception.kind, TIMEOUT_BAN_KIND)
+        self.assertEqual(self.svc.entry_count(gw.id), 0)
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, uid), 2)
+
+    def test_insert_guard_blocks_ban_hit_race(self) -> None:
+        gw = self.make()
+        uid = "8" * 18
+        self.svc._record_ban_hit(self.guild, uid, gw.id)
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.join(
+                gw, user_id=uid, username="u", member_roles=[],
+                account_created_ts=time.time() - 400 * 86400,
+                snapshot=(False, 0, 0, False),
+            )
+        self.assertEqual(ctx.exception.kind, TIMEOUT_BAN_KIND)
+        self.assertEqual(self.svc.entry_count(gw.id), 0)
+
+    def test_stale_ban_snapshot_does_not_falsely_penalize(self) -> None:
+        gw = self.make()
+        count = self.svc.join(
+            gw, user_id="7" * 18, username="u", member_roles=[],
+            account_created_ts=time.time() - 400 * 86400,
+            snapshot=(False, 3, 0, False),
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, "7" * 18), 0)
+
+    def test_stale_hit_snapshot_does_not_falsely_refuse(self) -> None:
+        gw = self.make()
+        count = self.svc.join(
+            gw, user_id="7" * 18, username="u", member_roles=[],
+            account_created_ts=time.time() - 400 * 86400,
+            snapshot=(False, 0, 0, True),
+        )
+        self.assertEqual(count, 1)
+
+    def test_stale_message_snapshot_live_confirm_allows(self) -> None:
+        gw = self.make(min_messages=3)
+        uid = "8" * 18
+        for _ in range(3):
+            self.svc.record_message(self.guild, uid)
+        count = self.svc.join(
+            gw, user_id=uid, username="u", member_roles=[],
+            account_created_ts=time.time() - 400 * 86400,
+            snapshot=(False, 0, 1, False),
+        )
+        self.assertEqual(count, 1)
+
+    def test_stale_ended_never_penalizes_timed_out(self) -> None:
+        gw = self.make()
+        stale = self.svc.get(gw.id)
+        self.svc.end(gw.id)
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.join(
+                stale, user_id="7" * 18, username="u", member_roles=[],
+                account_created_ts=time.time() - 400 * 86400,
+                timed_out=True, snapshot=(False, 0, 0, False),
+            )
+        self.assertIn("ended", str(ctx.exception.message))
+        self.assertNotEqual(ctx.exception.kind, TIMEOUT_BAN_KIND)
+        self.assertEqual(self.svc.timeout_ban_remaining(self.guild, "7" * 18), 0)
+
+    def test_ambiguous_insert_fresh_age_succeeds(self) -> None:
+        gw = self.make()
+        uid = "9" * 18
+        self.join(gw, user_id=uid)
+        original = self.db.execute
+        def flaky(sql, params=()):
+            if sql.lstrip().startswith("INSERT INTO simple_entries"):
+                raise OSError("connection reset")
+            return original(sql, params)
+        self.db.execute = flaky  # type: ignore[method-assign]
+        try:
+            count = self.svc.join(
+                gw, user_id=uid, username="u", member_roles=[],
+                account_created_ts=time.time() - 400 * 86400,
+            )
+        finally:
+            self.db.execute = original  # type: ignore[method-assign]
+        self.assertGreaterEqual(count, 1)
+
+    def test_ambiguous_insert_old_age_reports_duplicate(self) -> None:
+        gw = self.make()
+        uid = "9" * 18
+        self.join(gw, user_id=uid)
+        self.db.execute(
+            "UPDATE simple_entries SET entered_at = ? WHERE giveaway_id = ? AND user_id = ?",
+            (now_ms() - 60000, gw.id, uid),
+        )
+        original = self.db.execute
+        def flaky(sql, params=()):
+            if sql.lstrip().startswith("INSERT INTO simple_entries"):
+                raise OSError("connection reset")
+            return original(sql, params)
+        self.db.execute = flaky  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(ServiceError) as ctx:
+                self.svc.join(
+                    gw, user_id=uid, username="u", member_roles=[],
+                    account_created_ts=time.time() - 400 * 86400,
+                )
+        finally:
+            self.db.execute = original  # type: ignore[method-assign]
+        self.assertIn("already entered", str(ctx.exception.message))
+
+    def test_rowcount_negative_with_entry_succeeds(self) -> None:
+        gw = self.make()
+        uid = "9" * 18
+        original = self.db.execute
+        def fake(sql, params=()):
+            cur = original(sql, params)
+            if sql.lstrip().startswith("INSERT INTO simple_entries"):
+                class Neg:
+                    rowcount = -1
+                return Neg()
+            return cur
+        self.db.execute = fake  # type: ignore[method-assign]
+        try:
+            count = self.svc.join(
+                gw, user_id=uid, username="u", member_roles=[],
+                account_created_ts=time.time() - 400 * 86400,
+            )
+        finally:
+            self.db.execute = original  # type: ignore[method-assign]
+        self.assertEqual(count, 1)
+        self.assertTrue(self.svc.has_entry(gw.id, uid))
+
+
+class TimedBanTests(ServiceTestCase):
+    """Hour bans: 0 = permanent, 1-720 timed, reason in both places."""
+
+    def test_default_add_is_permanent(self) -> None:
+        self.svc.blacklist_add(self.guild, "1" * 18)
+        info = self.svc.ban_info(self.guild, "1" * 18)
+        assert info is not None
+        self.assertTrue(info.get("permanent"))
+        self.assertIsNone(info.get("expires_at"))
+        self.assertTrue(self.svc.is_blacklisted(self.guild, "1" * 18))
+
+    def test_timed_ban_blocks_then_expires(self) -> None:
+        gw = self.make()
+        uid = "2" * 18
+        base = now_ms()
+        self.svc.blacklist_add(self.guild, uid, hours=5, reason="spam", now=base)
+        info = self.svc.ban_info(self.guild, uid, now=base)
+        assert info is not None
+        self.assertFalse(info.get("permanent"))
+        self.assertEqual(info.get("reason"), "spam")
+        self.assertTrue(self.svc.is_blacklisted(self.guild, uid, now=base))
+        with self.assertRaises(ServiceError) as ctx:
+            self.join(gw, user_id=uid)
+        self.assertIn("blocked", str(ctx.exception.message))
+        # After expiry the same row reads as absent (lazy expiry, no write).
+        later = base + 5 * 3600 * 1000 + 1
+        self.assertFalse(self.svc.is_blacklisted(self.guild, uid, now=later))
+        self.assertIsNone(self.svc.ban_info(self.guild, uid, now=later))
+        # join() uses real now, so expire the row for real before re-joining.
+        self.db.execute(
+            "UPDATE simple_blacklist SET expires_at = ? WHERE guild_id = ? AND user_id = ?",
+            (now_ms() - 1, self.guild, uid),
+        )
+        self.assertEqual(self.join(gw, user_id=uid), 1)
+
+    def test_hours_validation(self) -> None:
+        for bad in (-1, 721, "x"):
+            with self.assertRaises(ServiceError):
+                self.svc.blacklist_add(self.guild, "3" * 18, hours=bad)
+        # Boundary values are accepted.
+        self.svc.blacklist_add(self.guild, "3" * 18, hours=720)
+        self.assertTrue(self.svc.is_blacklisted(self.guild, "3" * 18))
+        self.svc.blacklist_remove(self.guild, "3" * 18)
+        self.svc.blacklist_add(self.guild, "3" * 18, hours=0)
+        self.assertTrue(self.svc.is_blacklisted(self.guild, "3" * 18))
+
+    def test_reban_overwrites_expiry_and_reason(self) -> None:
+        uid = "4" * 18
+        base = now_ms()
+        self.svc.blacklist_add(self.guild, uid, hours=5, reason="first", now=base)
+        first = self.svc.ban_info(self.guild, uid, now=base)
+        assert first is not None
+        self.svc.blacklist_add(
+            self.guild, uid, hours=2, reason="second", now=base + 1000
+        )
+        second = self.svc.ban_info(self.guild, uid, now=base + 1000)
+        assert second is not None
+        self.assertEqual(second.get("reason"), "second")
+        self.assertLess(int(second.get("expires_at") or 0), int(first.get("expires_at") or 0))
+
+    def test_reason_trimmed_to_256(self) -> None:
+        self.svc.blacklist_add(self.guild, "5" * 18, hours=1, reason="x" * 300)
+        info = self.svc.ban_info(self.guild, "5" * 18)
+        assert info is not None
+        self.assertEqual(len(str(info.get("reason"))), 256)
+
+    def test_ban_message_shows_reason_and_expiry(self) -> None:
+        uid = "6" * 18
+        base = now_ms()
+        self.svc.blacklist_add(self.guild, uid, hours=5, reason="spam", now=base)
+        msg = self.svc.ban_message(self.guild, uid, now=base)
+        self.assertIn("blocked", msg)
+        self.assertIn("spam", msg)
+        self.assertIn("Ban expires <t:", msg)
+        # Permanent variant.
+        self.svc.blacklist_add(self.guild, "7" * 18, hours=0, reason="bad")
+        pmsg = self.svc.ban_message(self.guild, "7" * 18)
+        self.assertIn("blocked", pmsg)
+        self.assertIn("permanent", pmsg.lower())
+
+    def test_timed_ban_purges_running_entries(self) -> None:
+        gw = self.make()
+        uid = "8" * 18
+        self.join(gw, user_id=uid)
+        self.svc.blacklist_add(self.guild, uid, hours=3, reason="r")
+        self.assertEqual(self.svc.entry_count(gw.id), 0)
+        with self.assertRaises(ServiceError) as ctx:
+            self.join(gw, user_id=uid)
+        self.assertIn("blocked", str(ctx.exception.message))
+
+    def test_count_and_list_hide_expired(self) -> None:
+        base = now_ms()
+        self.svc.blacklist_add(self.guild, "1" * 18, hours=0)
+        self.svc.blacklist_add(self.guild, "2" * 18, hours=1, now=base)
+        self.assertEqual(self.svc.count_blacklisted(self.guild, now=base), 2)
+        later = base + 3600 * 1000 + 1
+        self.assertEqual(self.svc.count_blacklisted(self.guild, now=later), 1)
+        self.assertEqual(self.svc.blacklist_list(self.guild, now=later), ["1" * 18])
+        detailed = self.svc.blacklist_list_detailed(self.guild, now=base)
+        by_id = {r["user_id"]: r for r in detailed}
+        self.assertTrue(by_id["1" * 18]["permanent"])
+        self.assertFalse(by_id["2" * 18]["permanent"])
+        self.assertIn("expires_at", by_id["2" * 18])
+
+    def test_purge_expired_bans(self) -> None:
+        base = now_ms()
+        self.svc.blacklist_add(self.guild, "1" * 18, hours=1, now=base)
+        self.svc.blacklist_add(self.guild, "2" * 18, hours=0)
+        removed = self.svc.purge_expired_bans(now=base + 3600 * 1000 + 1)
+        self.assertEqual(removed, 1)
+        self.assertFalse(self.svc.is_blacklisted(self.guild, "1" * 18, now=base + 3600 * 1000 + 1))
+        self.assertTrue(self.svc.is_blacklisted(self.guild, "2" * 18))
+
+    def test_snapshot_is_expiry_aware(self) -> None:
+        gw = self.make()
+        uid = "9" * 18
+        base = now_ms()
+        self.svc.blacklist_add(self.guild, uid, hours=1, now=base)
+        snap = self.svc.eligibility_snapshot(self.guild, uid, gw.id)
+        assert snap is not None
+        self.assertTrue(snap[0])
+
+    def test_insert_guard_blocks_racing_timed_ban(self) -> None:
+        gw = self.make()
+        fresh = self.svc.get(gw.id)
+        uid = "9" * 18
+        self.svc.blacklist_add(self.guild, uid, hours=4, reason="race")
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.join(
+                fresh, user_id=uid, username="u", member_roles=[],
+                account_created_ts=time.time() - 400 * 86400,
+                snapshot=(False, 0, 0, False),
+            )
+        self.assertIn("blocked", str(ctx.exception.message))
+        self.assertIn("race", str(ctx.exception.message))
+
+    def test_zero_insert_reports_ban_with_reason(self) -> None:
+        gw = self.make()
+        uid = "9" * 18
+        self.svc.blacklist_add(self.guild, uid, hours=4, reason="late race")
+        original = self.svc.is_blacklisted
+        calls = {"n": 0}
+        def stale_first(guild_id: str, user_id: str) -> bool:
+            calls["n"] += 1
+            return False if calls["n"] == 1 else original(guild_id, user_id)
+        self.svc.is_blacklisted = stale_first  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(ServiceError) as ctx:
+                self.join(gw, user_id=uid)
+        finally:
+            self.svc.is_blacklisted = original  # type: ignore[method-assign]
+        self.assertIn("blocked", str(ctx.exception.message))
+
+
+class DueExtendRaceTests(ServiceTestCase):
+    """B04: a stale due() snapshot must not beat a concurrent extend.
+
+    due() is a snapshot; the tick used to end whatever it listed with a
+    status-only claim, so due-listed -> extended -> tick-end still ended the
+    giveaway. The flip now re-checks ends_at itself (require_due=True), and
+    manual /giveaway_end keeps the early-end behavior (require_due=False).
+    """
+
+    def _due_gw(self, base: int, extra_ms: int = 1000):
+        gw = self.make(duration_seconds=60)
+        self.join(gw)
+        self.db.execute(
+            "UPDATE simple_giveaways SET ends_at = ? WHERE id = ?",
+            (base + extra_ms, gw.id),
+        )
+        return self.svc.get(gw.id)
+
+    def test_stale_due_loses_to_extend(self) -> None:
+        base = now_ms()
+        gw = self._due_gw(base)
+        tick_ts = base + 2000
+        # Tick snapshots while still due.
+        self.assertIn(gw.id, [g.id for g in self.svc.due(now=tick_ts)])
+        # Operator extends before the tick acts on its snapshot.
+        self.svc.extend(gw.id, 3600)
+        self.assertGreater(self.svc.get(gw.id).ends_at, tick_ts)
+        # The stale tick end must refuse and leave the giveaway running.
+        with self.assertRaises(ServiceError) as ctx:
+            self.svc.end(gw.id, now=tick_ts, require_due=True)
+        self.assertIn("not due", str(ctx.exception.message).lower())
+        self.assertTrue(self.svc.get(gw.id).active)
+        # Once the new deadline passes the tick ends it for real.
+        later = self.svc.get(gw.id).ends_at + 1
+        self.assertIn(gw.id, [g.id for g in self.svc.due(now=later)])
+        ended, _winners = self.svc.end(gw.id, now=later, require_due=True)
+        self.assertEqual(ended.status, "ended")
+
+    def test_atomic_flip_rechecks_deadline(self) -> None:
+        base = now_ms()
+        gw = self._due_gw(base)
+        tick_ts = base + 2000
+        stale = self.svc.get(gw.id)
+        # Extend behind the stale read: pre-check would pass on stale data,
+        # so the UPDATE predicate itself must refuse.
+        self.db.execute(
+            "UPDATE simple_giveaways SET ends_at = ? WHERE id = ?",
+            (base + 5000000, gw.id),
+        )
+        original_get = self.svc.get
+        calls = {"n": 0}
+
+        def stale_first(giveaway_id: str):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return stale
+            return original_get(giveaway_id)
+
+        self.svc.get = stale_first  # type: ignore[method-assign]
+        try:
+            with self.assertRaises(ServiceError) as ctx:
+                self.svc.end(gw.id, now=tick_ts, require_due=True)
+        finally:
+            self.svc.get = original_get  # type: ignore[method-assign]
+        self.assertIn("not due", str(ctx.exception.message).lower())
+        self.assertTrue(self.svc.get(gw.id).active)
+
+    def test_tick_end_still_wins_when_still_due(self) -> None:
+        base = now_ms()
+        gw = self._due_gw(base)
+        tick_ts = base + 2000
+        ended, winners = self.svc.end(gw.id, now=tick_ts, require_due=True)
+        self.assertEqual(ended.status, "ended")
+        self.assertEqual(sorted(ended.winners), sorted(winners))
+
+    def test_manual_end_keeps_early_end(self) -> None:
+        gw = self.make(duration_seconds=3600)
+        self.join(gw)
+        self.svc.extend(gw.id, 3600)
+        # Manual /giveaway_end (no require_due) still ends before the deadline.
+        ended, _winners = self.svc.end(gw.id)
+        self.assertEqual(ended.status, "ended")
+
+
+class JoinBurstTests(ServiceTestCase):
+    """High-concurrency join proof: 100 simultaneous clicks, one row each."""
+
+    def _burst_join(self, gw, user_ids, **kw):
+        errors: list = []
+        barrier = threading.Barrier(len(user_ids), timeout=30)
+
+        def one(uid: str) -> None:
+            try:
+                barrier.wait()
+                self.svc.join(
+                    gw, user_id=uid, username="u" + uid[-4:],
+                    member_roles=[],
+                    account_created_ts=time.time() - 400 * 86400, **kw,
+                )
+            except ServiceError:
+                pass
+            except Exception as exc:  # noqa: BLE001 -- must surface as failure
+                errors.append(exc)
+
+        threads = [threading.Thread(target=one, args=(uid,)) for uid in user_ids]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        self.assertEqual(errors, [], f"burst raised: {errors!r}")
+
+    def test_100_distinct_users_each_get_exactly_one_entry(self) -> None:
+        gw = self.make()
+        user_ids = [str(10 ** 17 + i) for i in range(100)]
+        self._burst_join(gw, user_ids)
+        self.assertEqual(self.svc.entry_count(gw.id), 100)
+        for uid in user_ids:
+            self.assertTrue(self.svc.has_entry(gw.id, uid), f"{uid} lost its entry")
+
+    def test_simultaneous_duplicate_clicks_keep_one_row(self) -> None:
+        gw = self.make()
+        uid = "9" * 18
+        barrier = threading.Barrier(10, timeout=30)
+        outcomes: list = []
+
+        def click() -> None:
+            try:
+                barrier.wait()
+                self.svc.join(
+                    gw, user_id=uid, username="dup", member_roles=[],
+                    account_created_ts=time.time() - 400 * 86400,
+                )
+                outcomes.append("ok")
+            except ServiceError as exc:
+                outcomes.append(str(exc.message))
+
+        threads = [threading.Thread(target=click) for _ in range(10)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        self.assertEqual(self.svc.entry_count(gw.id), 1)
+        self.assertEqual(outcomes.count("ok"), 1, outcomes)
+        self.assertTrue(all("already entered" in o for o in outcomes if o != "ok"))
+
+    def test_join_while_closing_never_accepts_late_entries(self) -> None:
+        gw = self.make()
+        user_ids = [str(2 * 10 ** 17 + i) for i in range(40)]
+        barrier = threading.Barrier(len(user_ids) + 1, timeout=30)
+        ended: list = []
+
+        def closer() -> None:
+            barrier.wait()
+            try:
+                self.svc.end(gw.id)
+                ended.append(True)
+            except ServiceError:
+                ended.append(False)
+
+        def joiner(uid: str) -> None:
+            try:
+                barrier.wait()
+                self.svc.join(
+                    gw, user_id=uid, username="u" + uid[-4:],
+                    member_roles=[],
+                    account_created_ts=time.time() - 400 * 86400,
+                )
+            except ServiceError:
+                pass
+
+        threads = [threading.Thread(target=closer)]
+        threads += [threading.Thread(target=joiner, args=(uid,)) for uid in user_ids]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+        self.assertEqual(len(ended), 1)
+        # Whatever landed before the flip is the pool; the draw can only
+        # pick from committed rows, never from refused late clicks.
+        if self.svc.get(gw.id).active:
+            _, winners = self.svc.end(gw.id)
+        else:
+            winners = self.svc.get(gw.id).winners
+        rows = {r["user_id"] for r in self.svc.entries(gw.id)}
+        for winner in winners:
+            self.assertIn(winner, rows)
+
+    def test_banned_user_gets_zero_entries_under_burst(self) -> None:
+        gw = self.make()
+        banned = str(10 ** 17 + 999)
+        self.svc.blacklist_add(self.guild, banned, hours=5, reason="spam")
+        user_ids = [str(10 ** 17 + i) for i in range(20)] + [banned]
+        self._burst_join(gw, user_ids)
+        self.assertFalse(self.svc.has_entry(gw.id, banned))
+        self.assertEqual(self.svc.entry_count(gw.id), 20)
+
+    def test_fetch_count_false_skips_count_but_commits(self) -> None:
+        gw = self.make()
+        before = self.db.get_stats()
+        marker = self.svc.join(
+            gw, user_id="1" * 18, username="u1", member_roles=[],
+            account_created_ts=time.time() - 400 * 86400, fetch_count=False,
+        )
+        after = self.db.get_stats()
+        self.assertEqual(marker, -1, "-1 means committed, count unknown")
+        self.assertTrue(self.svc.has_entry(gw.id, "1" * 18))
+        # One fewer read wave than the counted path: no COUNT(*) trip.
+        self.assertLessEqual(after["reads"], before["reads"] + 4, after)
+
+    def test_join_snapshot_matches_split_reads(self) -> None:
+        gw = self.make(min_messages=2)
+        uid = "3" * 18
+        self.svc.record_message(self.guild, uid)
+        self.svc.record_message(self.guild, uid)
+        merged_gw, merged_snap = self.svc.join_snapshot(gw.id, self.guild, uid)
+        split_gw = self.svc.get(gw.id)
+        split_snap = self.svc.eligibility_snapshot(self.guild, uid, gw.id)
+        self.assertEqual(merged_gw.id, split_gw.id)
+        self.assertEqual(merged_snap, split_snap)
+
+    def test_refresh_snapshot_returns_status_and_count(self) -> None:
+        gw = self.make()
+        self.join(gw, user_id="1" * 18)
+        self.join(gw, user_id="2" * 18)
+        status, count = self.svc.refresh_snapshot(gw.id)
+        self.assertEqual(status, "active")
+        self.assertEqual(count, 2)
+        self.svc.end(gw.id)
+        status, _count = self.svc.refresh_snapshot(gw.id)
+        self.assertEqual(status, "ended")
 
 
 if __name__ == "__main__":

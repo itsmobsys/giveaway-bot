@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import random
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -136,6 +137,19 @@ class Database:
         #: connection; close_all() is for shutdown.
         self._connections: list[Any] = []
         self._lock = threading.Lock()
+        #: Lightweight latency instrumentation: attempts + total ms spent
+        #: inside execute()/query(). Each attempt is counted (a dead-stream
+        #: retry that succeeds on the second try counts 2, not 1), and ms
+        #: includes failed attempts plus fetchall() transfer time. These are
+        #: DB-only numbers (Turso round-trips); Discord API time is not
+        #: tracked here. Timings measured against the sqlite test harness are
+        #: not Turso/Render benchmarks. Read via get_stats()/reset_stats().
+        #: Counters are updated under the connection lock so concurrent
+        #: to_thread workers cannot lose increments.
+        self._query_count = 0
+        self._write_count = 0
+        self._query_ms = 0.0
+        self._write_ms = 0.0
         if connect is not None:
             # Injection point for tests: anything with sqlite3's
             # execute/commit/close surface works, so the rules can run against a
@@ -247,14 +261,29 @@ class Database:
   notify_role_id TEXT
 )"""
         )
-        # Users blocked from giveaways in a server. Permanent until removed —
-        # the entry-wipe sweep never touches this table.
+        # Users blocked from giveaways in a server. Permanent until removed
+        # (expires_at NULL) or timed (expires_at ms epoch) — the entry-wipe
+        # sweep never touches this table. reason/banned_by are shown both to
+        # the refused member and in the staff list.
         self.execute(
             """CREATE TABLE IF NOT EXISTS simple_blacklist (
   guild_id TEXT NOT NULL,
   user_id TEXT NOT NULL,
+  expires_at INTEGER,
+  reason TEXT NOT NULL DEFAULT '',
+  banned_by TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (guild_id, user_id)
 )"""
+        )
+        self._ensure_columns(
+            "simple_blacklist",
+            {
+                "expires_at": "INTEGER",
+                "reason": "TEXT NOT NULL DEFAULT ''",
+                "banned_by": "TEXT NOT NULL DEFAULT ''",
+                "created_at": "INTEGER NOT NULL DEFAULT 0",
+            },
         )
         # Members sitting out a fixed number of giveaways because Discord had
         # them timed out (native /mute) when they tried to join. Persisted like
@@ -337,14 +366,38 @@ class Database:
           short backoff. Anything else raises untouched.
         """
         last_error: Exception | None = None
+        is_write = _is_write(sql)
         for attempt in range(6):
+            start = time.perf_counter()
             try:
                 conn = self._conn()
                 cur = conn.execute(sql, tuple(params))
-                if _is_write(sql):
+                if is_write:
                     conn.commit()
+                elapsed = (time.perf_counter() - start) * 1000.0
+                try:
+                    with self._lock:
+                        if is_write:
+                            self._write_count += 1
+                            self._write_ms += elapsed
+                        else:
+                            self._query_count += 1
+                            self._query_ms += elapsed
+                except Exception:
+                    pass
                 return cur
             except Exception as exc:
+                elapsed = (time.perf_counter() - start) * 1000.0
+                try:
+                    with self._lock:
+                        if is_write:
+                            self._write_count += 1
+                            self._write_ms += elapsed
+                        else:
+                            self._query_count += 1
+                            self._query_ms += elapsed
+                except Exception:
+                    pass
                 message = str(exc).lower()
                 ambiguous = _is_ambiguous_loss(message)
                 if ambiguous or _is_dead_stream(message):
@@ -358,11 +411,11 @@ class Database:
                         "database stream went away (%s); reconnecting", _brief(exc)
                     )
                     last_error = exc
-                    time.sleep(0.15 * (attempt + 1))
+                    time.sleep(0.15 * (attempt + 1) + random.uniform(0, 0.05 * (attempt + 1)))  # noqa: S311
                     continue
                 if any(word in message for word in ("locked", "busy", "conflict")):
                     last_error = exc
-                    time.sleep(0.15 * (attempt + 1))
+                    time.sleep(0.15 * (attempt + 1) + random.uniform(0, 0.05 * (attempt + 1)))  # noqa: S311
                     continue
                 raise
         raise last_error  # type: ignore[misc]
@@ -371,11 +424,20 @@ class Database:
         # fetchall() pulls rows over the network on Turso, so the stream can
         # die here too — after execute() already succeeded. Retry the whole
         # read on a fresh connection instead of surfacing a phantom failure.
+        # fetchall() transfer time counts toward read_ms (DB time, not
+        # Discord/total): execute() already counted the trip, so only the ms
+        # are added here, under the same lock.
         last_error: Exception | None = None
         for _ in range(3):
+            fetch_start = time.perf_counter()
             try:
                 cur = self.execute(sql, params)
                 rows = cur.fetchall()
+                try:
+                    with self._lock:
+                        self._query_ms += (time.perf_counter() - fetch_start) * 1000.0
+                except Exception:
+                    pass
                 break
             except Exception as exc:
                 message = str(exc).lower()
@@ -414,6 +476,33 @@ class Database:
     def query_one(self, sql: str, params: Sequence[Any] = ()) -> dict[str, Any] | None:
         rows = self.query(sql, params)
         return rows[0] if rows else None
+
+    def get_stats(self) -> dict[str, float]:
+        """DB-only attempt counters (Turso round-trips, not Discord/total).
+
+        Counts every execute() attempt including dead-stream/locked retries, and
+        query() fetchall() transfer time is included in read_ms. Timings from
+        the sqlite test harness are not Turso/Render benchmarks."""
+        try:
+            with self._lock:
+                return {
+                    "reads": int(self._query_count),
+                    "writes": int(self._write_count),
+                    "read_ms": float(self._query_ms),
+                    "write_ms": float(self._write_ms),
+                }
+        except Exception:
+            return {"reads": 0, "writes": 0, "read_ms": 0.0, "write_ms": 0.0}
+
+    def reset_stats(self) -> None:
+        try:
+            with self._lock:
+                self._query_count = 0
+                self._write_count = 0
+                self._query_ms = 0.0
+                self._write_ms = 0.0
+        except Exception:
+            pass
 
     def close(self) -> None:
         """Close the calling thread's connection (also used to drop a dead stream).
