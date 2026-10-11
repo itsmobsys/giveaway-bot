@@ -329,11 +329,73 @@ class GiveawayService:
             " or copy the ID from /giveaway_list."
         )
 
-    def entry_count(self, giveaway_id: str) -> int:
+    def entry_count(self, giveaway_id: str, *, exact: bool = False) -> int:
+        """Live entry count, counter-first with COUNT(*) backfill.
+
+        exact=True forces COUNT(*) (retention tests, audits): the counter is
+        a fast path, not the source of truth after bulk deletes. Otherwise
+        the counter column answers in 1 indexed-row read; a legacy row
+        (NULL/0 counter with real entries) heals itself on read and writes
+        the true value back, so old giveaways converge without a migration.
+        """
+        if exact:
+            true_row = self.db.query_one(
+                "SELECT COUNT(*) AS n FROM simple_entries WHERE giveaway_id = ?",
+                (giveaway_id,),
+            )
+            try:
+                return int((true_row or {}).get("n") or 0)
+            except (TypeError, ValueError):
+                return 0
         row = self.db.query_one(
+            "SELECT entrant_count FROM simple_giveaways WHERE id = ?", (giveaway_id,)
+        )
+        try:
+            cached = int((row or {}).get("entrant_count") or 0)
+        except (TypeError, ValueError):
+            cached = 0
+        if cached > 0:
+            return cached
+        true_row = self.db.query_one(
             "SELECT COUNT(*) AS n FROM simple_entries WHERE giveaway_id = ?", (giveaway_id,)
         )
-        return int(row["n"]) if row else 0
+        try:
+            true_n = int((true_row or {}).get("n") or 0)
+        except (TypeError, ValueError):
+            true_n = 0
+        if true_n > 0:
+            try:
+                self.db.execute(
+                    "UPDATE simple_giveaways SET entrant_count = ?"
+                    " WHERE id = ? AND (entrant_count IS NULL OR entrant_count < ?)",
+                    (true_n, giveaway_id, true_n),
+                )
+            except Exception:
+                pass
+        return true_n
+
+    def _sync_counter(self, giveaway_id: str) -> None:
+        """Reset counter to COUNT(*) after a bulk drop (ban/timeout).
+
+        Bulk drops remove entries without going through leave(), so the live
+        counter would otherwise stay high. Rare path (bans only), so a full
+        COUNT(*) here is fine; failures only log (the read path heals it).
+        """
+        try:
+            row = self.db.query_one(
+                "SELECT COUNT(*) AS n FROM simple_entries WHERE giveaway_id = ?",
+                (giveaway_id,),
+            )
+            try:
+                n = int((row or {}).get("n") or 0)
+            except (TypeError, ValueError):
+                return
+            self.db.execute(
+                "UPDATE simple_giveaways SET entrant_count = ? WHERE id = ?",
+                (n, giveaway_id),
+            )
+        except Exception:
+            pass
 
     def entries(self, giveaway_id: str, limit: int | None = None) -> list[dict]:
         """Entrants in entry order. Pass limit for a display path.
@@ -466,14 +528,15 @@ class GiveawayService:
         (2 waves, ~200ms warm) just to decide grant-vs-take and render the
         embed. One SELECT with scalar subqueries returns both; a dead read
         returns (None, 0) so the caller skips background work fail-closed
-        instead of mis-rendering.
+        instead of mis-rendering. P2-2: count comes from the live counter
+        column (1 indexed row), never COUNT(*) — the scan cost no longer
+        grows with entries.
         """
         try:
             row = self.db.query_one(
-                "SELECT "
-                "(SELECT status FROM simple_giveaways WHERE id = ?) AS status, "
-                "(SELECT COUNT(*) FROM simple_entries WHERE giveaway_id = ?) AS n",
-                (giveaway_id, giveaway_id),
+                "SELECT status, COALESCE(entrant_count, 0) AS n"
+                " FROM simple_giveaways WHERE id = ?",
+                (giveaway_id,),
             )
         except Exception:
             return None, 0
@@ -846,12 +909,60 @@ class GiveawayService:
             except Exception:
                 pass
             raise ServiceError("Could not enter you. Try again.")
+        # Counter bump on success (P2-2): same lane, 1 extra write, only when
+        # the INSERT actually landed. COALESCE heals legacy NULL counters;
+        # the status guard keeps a join that raced the draw from bumping a
+        # frozen end/cancel count. Concurrent bumps never overwrite: +1 is
+        # atomic in the statement itself, not read-modify-write.
+        try:
+            self.db.execute(
+                "UPDATE simple_giveaways SET entrant_count = COALESCE(entrant_count, 0) + 1"
+                " WHERE id = ? AND status = 'active'",
+                (gw.id,),
+            )
+        except Exception:
+            pass
         # fetch_count=False skips the COUNT so the ack never waits on it:
         # the post-ack refresh_snapshot() supplies the count for the embed.
         # -1 means "committed, count unknown"; callers must not print it.
         if not fetch_count:
             return -1
         return self.entry_count(gw.id)
+
+    def join_and_refresh(
+        self,
+        gw: Giveaway,
+        *,
+        user_id: str,
+        username: str,
+        member_roles: list[str],
+        account_created_ts: float | None,
+        pending_messages: int = 0,
+        timed_out: bool = False,
+        snapshot: tuple[bool, int, int, bool] | None = None,
+    ) -> tuple[str | None, int]:
+        """P0-2: commit + status/count in ONE db lane acquisition.
+
+        handle_join used to pay _db_call(join) then _db_call(refresh_snapshot):
+        2 semaphore acquires + 2 thread hops for 3 statements. This bundles
+        the write (INSERT + counter bump) and the read (status + counter) in
+        one lane, so a 50-burst holds 50 lanes instead of 150 sequential
+        acquires. Same statements, same order, same atomic guards -- only the
+        lane/thread overhead is removed. Refresh never raises (returns
+        (None, 0) on dead read), so any exception here means the join failed.
+        """
+        self.join(
+            gw,
+            user_id=user_id,
+            username=username,
+            member_roles=member_roles,
+            account_created_ts=account_created_ts,
+            pending_messages=pending_messages,
+            timed_out=timed_out,
+            snapshot=snapshot,
+            fetch_count=False,
+        )
+        return self.refresh_snapshot(gw.id)
 
     def leave(self, giveaway_id: str, user_id: str) -> bool:
         """Drop this member's entry. Only while the giveaway is running.
@@ -866,9 +977,23 @@ class GiveawayService:
             (giveaway_id, user_id, giveaway_id),
         )
         try:
-            return (cur.rowcount or 0) > 0
+            removed = (cur.rowcount or 0) > 0
         except Exception:
-            return True
+            removed = True
+        if removed:
+            # Keep the live counter exact: a leave must undo the join bump.
+            # GREATEST-equivalent via CASE (portable sqlite/libsql) so a
+            # racing double-leave can never drive it negative.
+            try:
+                self.db.execute(
+                    "UPDATE simple_giveaways SET entrant_count ="
+                    " CASE WHEN COALESCE(entrant_count, 0) > 0"
+                    " THEN entrant_count - 1 ELSE 0 END WHERE id = ?",
+                    (giveaway_id,),
+                )
+            except Exception:
+                pass
+        return removed
 
     # -- end / reroll / cancel ------------------------------------------
     def _pick(self, giveaway_id: str, n: int, exclude: list[str] | None = None) -> list[str]:
@@ -1647,8 +1772,23 @@ class GiveawayService:
     ENTRY_RETENTION_MS = 5 * 3600 * 1000
 
     def wipe_stale_entries(self, now: int | None = None) -> int:
-        """Delete entry rows for giveaways finished over 5h ago. Returns count."""
+        """Delete entry rows for giveaways finished over 5h ago. Returns count.
+
+        Also zeroes the live counter on wiped giveaways: otherwise
+        entry_count() would keep returning the stale pre-wipe bump.
+        """
         cutoff = (now if now is not None else now_ms()) - self.ENTRY_RETENTION_MS
+        try:
+            self.db.execute(
+                "UPDATE simple_giveaways SET entrant_count = 0 WHERE status != 'active'"
+                " AND COALESCE(ended_at, created_at) <= ?"
+                " AND NOT EXISTS (SELECT 1 FROM simple_claims"
+                " WHERE simple_claims.giveaway_id = simple_giveaways.id"
+                " AND simple_claims.status = 'pending')",
+                (cutoff,),
+            )
+        except Exception:
+            pass
         cur = self.db.execute(
             # ended_at was added to a table that already held data, so giveaways
             # that finished before that migration carry NULL forever; created_at
@@ -1785,6 +1925,8 @@ class GiveawayService:
             " (SELECT id FROM simple_giveaways WHERE guild_id = ? AND status = 'active')",
             (user_id, guild_id),
         )
+        for row in self.list_active(guild_id):
+            self._sync_counter(row.id)
         info = self.ban_info(guild_id, user_id, ts)
         return info or {"permanent": hours_int == 0, "reason": clean_reason}
 
@@ -2091,6 +2233,8 @@ class GiveawayService:
             " (SELECT id FROM simple_giveaways WHERE guild_id = ? AND status = 'active')",
             (user_id, gw.guild_id),
         )
+        for row in self.list_active(gw.guild_id):
+            self._sync_counter(row.id)
         if left > 0:
             left = self.consume_timeout_ban(gw.guild_id, user_id, gw.id)
             if left > 0:

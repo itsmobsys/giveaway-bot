@@ -121,6 +121,11 @@ SCHEMA_INDEXES = f"""
 CREATE INDEX IF NOT EXISTS idx_simple_gw_status_ends ON {TABLE_GIVEAWAYS}(status, ends_at);
 CREATE INDEX IF NOT EXISTS idx_simple_entries_giveaway ON {TABLE_ENTRIES}(giveaway_id);
 CREATE INDEX IF NOT EXISTS idx_simple_entries_user ON {TABLE_ENTRIES}(user_id);
+CREATE INDEX IF NOT EXISTS idx_simple_bl_cover ON simple_blacklist(guild_id, user_id, expires_at);
+CREATE INDEX IF NOT EXISTS idx_simple_bans_cover ON simple_giveaway_bans(guild_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_simple_banhits_cover
+ON simple_giveaway_ban_hits(guild_id, user_id, giveaway_id);
+CREATE INDEX IF NOT EXISTS idx_simple_msgcounts_pk ON simple_message_counts(guild_id, user_id);
 """
 
 
@@ -229,8 +234,11 @@ class Database:
                 "created_at": "INTEGER NOT NULL DEFAULT 0",
                 "ended_at": "INTEGER",
                 "winners_json": "TEXT NOT NULL DEFAULT '[]'",
-                # Entries are wiped 5h after the end, so the count is frozen
-                # when a giveaway ends or is cancelled. NULL for older rows.
+                # Live entry counter (P2-2): incremented on every successful
+                # join, decremented on leave/ban-drop, so refresh_snapshot
+                # reads 1 indexed row instead of COUNT(*) over all entries.
+                # NULL for rows that ended before the counter existed;
+                # read path COALESCEs + backfills without a migration.
                 "entrant_count": "INTEGER",
                 # Optional winner-claim window in seconds. 0/NULL = disabled;
                 # live databases gain it via this same migration map.

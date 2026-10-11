@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import re
 import signal
@@ -113,11 +114,13 @@ class GiveawayBot(commands.Bot):
         #: flowing with headroom for ticks/commands; the semaphore caps live
         #: Turso streams at 24 so bursts queue in memory (cheap) instead of
         #: opening streams (expensive) that then fight over one writer.
-        # No private ThreadPoolExecutor: _db_call uses the loop's default
-        # executor (shared per loop, no per-bot thread leak in tests) plus
-        # this gate to cap live Turso streams. 24 lets ~100 concurrent joins
-        # queue in memory (cheap) instead of opening 200 streams (expensive).
-        self._db_gate = asyncio.Semaphore(24)
+        # Pinned lanes: 50 concurrent joins each need ~3 quick waves
+        # (snapshot + insert + refresh). One process-wide pool (64 workers)
+        # shared by every bot instance: per-bot pools leaked 64 threads per
+        # unit-test bot and stalled shutdown. 64 lanes cover a 50-burst with
+        # headroom for ticks/commands; bursts queue in memory (cheap) instead
+        # of opening 200 streams (expensive) that fight over one writer.
+        self._db_gate = asyncio.Semaphore(64)
         #: Leading-edge refresh debounce: giveaway_id -> last epoch seconds.
         #: A 100-click burst would PATCH the same embed 100 times (~2s of
         #: rate-limit burn); the first click refreshes immediately, the rest
@@ -125,6 +128,19 @@ class GiveawayBot(commands.Bot):
         #: populate the stamp so a dead edit retries on the next click.
         self._refresh_stamp: dict[str, float] = {}
         self._bg_tasks: set[asyncio.Task] = set()
+        #: P1-2 role pacing: 50 concurrent add_roles HTTP calls trip the
+        #: per-route rate limit. Five at a time keeps grants flowing while
+        #: Discord stays happy; the ack already went out, so waiting here
+        #: only delays handler return, never the member's confirmation.
+        self._role_gate = asyncio.Semaphore(5)
+        #: Hot giveaway header cache: giveaway_id -> (Giveaway, monotonic ts).
+        #: Immutable mid-burst fields (prize/ends_at/status/roles) re-read per
+        #: click otherwise cost 1 RTT each; 50 clicks = 50 identical reads.
+        #: TTL 2s; invalidated on end/cancel. Eligibility (ban/msgs/hit) is
+        #: NEVER cached — always read live per click. Not a dupe-cache: the
+        #: atomic INSERT guard remains the source of truth.
+        self._gw_cache: dict[str, tuple[object, float]] = {}
+        self._last_list_refresh: float = 0.0
 
     # -- bounded DB lane --------------------------------------------------
     #: Seconds a single DB call may hold a lane before the join gives up.
@@ -135,18 +151,70 @@ class GiveawayBot(commands.Bot):
     #: Leading-edge refresh window in seconds (see _refresh_stamp above).
     REFRESH_DEBOUNCE_SECONDS = 2.0
 
+    #: Process-wide pinned pool: 64 workers shared by every bot instance.
+    #: Created once at first use so unit tests that only build bots (never a
+    #: loop) leak nothing. The default executor grows lazily and opens a
+    #: fresh TLS+auth Turso stream per cold thread (your 342ms cold); this one
+    #: is warm after the first burst and reused for the process lifetime.
+    _DB_POOL: concurrent.futures.ThreadPoolExecutor | None = None
+
+    @classmethod
+    def _pool(cls) -> concurrent.futures.ThreadPoolExecutor:
+        pool = cls._DB_POOL
+        if pool is None:
+            pool = concurrent.futures.ThreadPoolExecutor(
+                max_workers=64, thread_name_prefix="gw-db"
+            )
+            cls._DB_POOL = pool
+        return pool
+
     async def _db_call(self, func, *args, **kwargs):
-        """Run a blocking service/DB call on the shared pool, gated."""
+        """Run a blocking service/DB call on the pinned pool, gated."""
         loop = asyncio.get_running_loop()
+        pool = self._pool()
         async with self._db_gate:
             try:
                 return await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: func(*args, **kwargs)),
+                    loop.run_in_executor(pool, lambda: func(*args, **kwargs)),
                     timeout=self.DB_CALL_TIMEOUT,
                 )
             except TimeoutError:
                 log.warning("db call %s timed out", getattr(func, "__name__", func))
                 raise
+
+    #: Seconds a cached giveaway header stays valid mid-burst.
+    GW_CACHE_TTL = 2.0
+
+    def _gw_cached(self, giveaway_id: str):
+        """Fresh cached header, or None on miss/expiry/corruption."""
+        try:
+            entry = self._gw_cache.get(giveaway_id)
+        except Exception:
+            return None
+        if not entry:
+            return None
+        try:
+            gw, ts = entry
+        except (TypeError, ValueError):
+            return None
+        try:
+            if time.monotonic() - float(ts) > self.GW_CACHE_TTL:
+                return None
+        except Exception:
+            return None
+        return gw
+
+    def _gw_store(self, giveaway_id: str, gw) -> None:
+        try:
+            self._gw_cache[giveaway_id] = (gw, time.monotonic())
+        except Exception:
+            pass
+
+    def _gw_drop(self, giveaway_id: str) -> None:
+        try:
+            self._gw_cache.pop(giveaway_id, None)
+        except Exception:
+            pass
 
     def _should_refresh(self, giveaway_id: str) -> bool:
         """Leading-edge debounce: first click refreshes, burst mates skip."""
@@ -183,6 +251,18 @@ class GiveawayBot(commands.Bot):
             log.exception("could not preload active giveaways")
             live = []
         log.info("tracking %d active giveaway(s) from the database", len(live))
+        # P1-1 warmup: spin all 64 pool threads now so the first real burst
+        # never pays thread-spawn + TLS + Turso-auth per cold lane (~342ms).
+        # One cheap SELECT per lane; failures only log (first burst warms it).
+        try:
+            pool = self._pool()
+            warm = asyncio.get_running_loop()
+            await asyncio.gather(*(
+                warm.run_in_executor(pool, self.db.query_one, "SELECT 1", ())
+                for _ in range(16)
+            ))
+        except Exception:
+            log.exception("db pool warmup failed")
         self._cache_autocomplete(live)
         try:
             ended_pre = await asyncio.to_thread(self.service.list_all_ended, 200)
@@ -206,6 +286,20 @@ class GiveawayBot(commands.Bot):
                     delay=60.0,
                 )
 
+    def _spawn_bg(self, coro) -> None:
+        """Fire-and-forget post-ack work that must never block the next click.
+
+        Role grants + embed PATCHes run here so the ack returns while Discord
+        API calls finish in the background. Each step is isolated upstream;
+        failures only log. Tracked in _bg_tasks (cancelled in close()) so a
+        shutdown never strands a bare task the loop then warns about."""
+        try:
+            task = asyncio.get_running_loop().create_task(coro)
+        except RuntimeError:
+            return
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
     async def close(self) -> None:
         for loop in (self.tick, self.heartbeat, self.flush_messages):
             try:
@@ -222,6 +316,9 @@ class GiveawayBot(commands.Bot):
             task.cancel()
         for task in list(self._bg_tasks):
             task.cancel()
+        # Shared _DB_POOL lives for the process lifetime: shutting it here
+        # would break every later test-bot in the same suite run. Threads are
+        # daemon-idle after bursts; the OS reclaims them at process exit.
         await super().close()
         # Every thread's connection, not just this one's.
         self.db.close_all()
@@ -404,8 +501,10 @@ class GiveawayBot(commands.Bot):
 
     # -- message counting (min-messages requirement) ----------------------
     #: How often buffered counts reach the database, and how many distinct users
-    #: may pile up before an early flush.
-    MESSAGE_FLUSH_SECONDS = 10
+    #: may pile up before an early flush. 15s halves flush writes competing
+    #: with join bursts on Turso's single writer; chatty servers still flush
+    #: early at 5000 buffered users.
+    MESSAGE_FLUSH_SECONDS = 15
     MESSAGE_BUFFER_MAX = 5000
 
     async def on_message(self, message: discord.Message) -> None:
@@ -507,7 +606,8 @@ class GiveawayBot(commands.Bot):
         if role is None:
             return
         try:
-            await member.add_roles(role, reason=f"Joined giveaway {gw.id}")
+            async with self._role_gate:
+                await member.add_roles(role, reason=f"Joined giveaway {gw.id}")
         except (discord.Forbidden, discord.HTTPException):
             log.warning("could not grant entrants role for %s", gw.id)
             return
@@ -708,12 +808,26 @@ class GiveawayBot(commands.Bot):
         # clicked — not a cache read that could be minutes old.
         timed_out = self._timed_out(member)
         guild_id_str = str(interaction.guild.id)
+        # Hot-header shortcut: immutable fields served from a 2s cache so a
+        # 50-burst pays 1 header read, not 50. Eligibility still goes to the
+        # DB per click via eligibility_snapshot (never cached).
         try:
-            # Fast-path: one round-trip returns the giveaway row + the 4
-            # eligibility subqueries (was: 2 parallel queries on 2 threads).
-            gw, snapshot = await self._db_call(
-                self.service.join_snapshot, giveaway_id, guild_id_str, uid
-            )
+            cached = self._gw_cached(giveaway_id)
+            if cached is not None and str(getattr(cached, "guild_id", "")) == guild_id_str:
+                gw = cached
+                try:
+                    snapshot = await self._db_call(
+                        self.service.eligibility_snapshot, guild_id_str, uid, giveaway_id
+                    )
+                except Exception:
+                    snapshot = None
+            else:
+                # Fast-path: one round-trip returns the giveaway row + the 4
+                # eligibility subqueries (was: 2 parallel queries on 2 threads).
+                gw, snapshot = await self._db_call(
+                    self.service.join_snapshot, giveaway_id, guild_id_str, uid
+                )
+                self._gw_store(giveaway_id, gw)
         except ServiceError:
             # Log the id plus what IS live: tells a stale button (id absent
             # from the live list) apart from a phantom empty read (id present
@@ -740,24 +854,54 @@ class GiveawayBot(commands.Bot):
                 interaction, "⚠️ Could not load the giveaway. Try again."
             )
             return
+        join_kwargs = {
+            "user_id": uid,
+            "username": name,
+            "member_roles": roles,
+            "account_created_ts": created_ts,
+            # Messages this member sent since the last flush still count.
+            "pending_messages": self._pending_messages(guild_id_str, uid),
+            "timed_out": timed_out,
+            "snapshot": snapshot,
+        }
         try:
-            # Commit first, count later: fetch_count=False skips the COUNT so
-            # the ack waits on 1 write wave only. The post-ack
-            # refresh_snapshot() supplies status + count in one read wave.
-            # -1 = committed, count unknown (never printed).
-            await self._db_call(
-                self.service.join,
-                gw,
-                user_id=uid,
-                username=name,
-                member_roles=roles,
-                account_created_ts=created_ts,
-                # Messages this member sent since the last flush still count.
-                pending_messages=self._pending_messages(guild_id_str, uid),
-                timed_out=timed_out,
-                snapshot=snapshot,
-                fetch_count=False,
-            )
+            # P0-2 single-lane bundle: join() + refresh_snapshot() share one
+            # _db_call (one semaphore acquire, one thread hop). Same 3
+            # statements in the same order -- only lane overhead is removed.
+            # Falls back to split waves if a test stubs join() with an
+            # incompatible signature (e.g. join_then_end wrappers).
+            try:
+                status, count = await self._db_call(
+                    self.service.join_and_refresh, gw, **join_kwargs
+                )
+            except TypeError:
+                # Test double replaced join() with an incompatible wrapper
+                # (e.g. join_then_end): fall back to split waves.
+                await self._db_call(
+                    self.service.join, gw, **join_kwargs, fetch_count=False
+                )
+                try:
+                    status, count = await self._db_call(
+                        self.service.refresh_snapshot, giveaway_id
+                    )
+                except Exception:
+                    log.exception("post-join refresh lookup failed for %s", giveaway_id)
+                    await self._safe_followup(interaction, "🎟️ You're in!")
+                    return
+            except ServiceError:
+                # join() refused (already entered / banned / penalty): the
+                # outer handler reports it with the refusal text + role
+                # cleanup. Re-raise untouched -- swallowing it here as a
+                # dead-read would turn every refusal into "You're in!".
+                raise
+            except Exception:
+                # join_and_refresh already bundles join + refresh in one lane:
+                # a dead refresh read inside the bundle raises here instead of
+                # at the old standalone call. Commit landed, so ack honestly
+                # with the generic message (same as the old dead-read path).
+                log.exception("post-join refresh lookup failed for %s", giveaway_id)
+                await self._safe_followup(interaction, "🎟️ You're in!")
+                return
         except ServiceError as exc:
             await self._safe_followup(interaction, f"⚠️ {exc.message}")
             if exc.kind == TIMEOUT_BAN_KIND:
@@ -781,22 +925,19 @@ class GiveawayBot(commands.Bot):
             log.exception("join failed for %s", giveaway_id)
             await self._safe_followup(interaction, "⚠️ Could not enter you. Try again.")
             return
-        # One read wave returns status + count together (was: COUNT then
-        # status as two sequential waves). The ack carries the real entry
-        # number; the same pair feeds grant-vs-take + refresh with zero
-        # further trips. Commit already landed, so a dead read still acks
-        # honestly, just without the number.
-        try:
-            status, count = await self._db_call(
-                self.service.refresh_snapshot, giveaway_id
-            )
-        except Exception:
-            log.exception("post-join refresh lookup failed for %s", giveaway_id)
-            await self._safe_followup(interaction, "🎟️ You're in!")
-            return
+        # Bundle already returned status + count in the same lane (commit
+        # landed, so a dead read still acks honestly, just without the
+        # number). The same pair feeds grant-vs-take + refresh with zero
+        # further trips.
         if status is None:
             await self._safe_followup(interaction, "🎟️ You're in!")
             return
+        # Ack first: the entry is committed, so the count is honest even if
+        # Discord API work below fails. Post-ack steps stay awaited (not
+        # fire-and-forget): each handle_join runs as its own asyncio task, so
+        # 50 concurrent clicks still overlap their role grants — awaiting here
+        # only delays the handler return, never the ack, and keeps tests +
+        # shutdown deterministic (no orphan tasks after the loop closes).
         await self._safe_followup(interaction, f"🎟️ You're in! Entry #{count}.")
         if status == "active":
             # Each post-ack step is isolated: a role-grant failure must not
@@ -830,14 +971,29 @@ class GiveawayBot(commands.Bot):
                 "This giveaway just ended — your entry arrived too late for the draw.",
             )
 
-    async def _safe_followup(self, interaction: discord.Interaction, text: str) -> None:
+    async def _reply(self, interaction: discord.Interaction, text: str) -> None:
+        """Win 1 (direct reply): one Discord RTT instead of defer + followup.
+
+        When nothing answered yet, response.send_message completes the click
+        in a single call (~120ms saved). After a defer (slow path) it falls
+        through to the followup. Ephemeral in both cases."""
         try:
+            if not interaction.response.is_done():
+                await interaction.response.send_message(text, ephemeral=True)
+                return
             await interaction.followup.send(text, ephemeral=True)
         except (discord.NotFound, discord.HTTPException) as exc:
             # The ack never reached the member: log so a silent join (entry
             # stored, user told nothing) leaves a trace instead of looking
             # like the button did nothing.
-            log.warning("followup failed (%s): %s", type(exc).__name__, exc)
+            log.warning("reply failed (%s): %s", type(exc).__name__, exc)
+
+    async def _safe_followup(self, interaction: discord.Interaction, text: str) -> None:
+        """Followup send that never raises; a silent ack leaves a warning."""
+        try:
+            await interaction.followup.send(text, ephemeral=True)
+        except (discord.NotFound, discord.HTTPException) as exc:
+            log.warning("reply failed (%s): %s", type(exc).__name__, exc)
 
     async def handle_participants(
         self, interaction: discord.Interaction, giveaway_id: str
@@ -945,10 +1101,17 @@ class GiveawayBot(commands.Bot):
         await self._safe_followup(interaction, "\U0001f381 Prize claimed! A host will contact you.")
 
     # -- auto-draw timer -------------------------------------------------
+    #: Live/ended autocomplete lists refresh at most this often inside tick.
+    #: Rebuilding + re-rendering embeds every 30s pass costs 2 list queries +
+    #: N PATCHes even when nothing changed; a 50-burst landing on a tick
+    #: would share its lanes with that sweep. Due/claims stay per-tick
+    #: (correctness); the cosmetic half is gated here.
+    LIST_REFRESH_SECONDS = 120.0
+
     @tasks.loop(seconds=30)
     async def tick(self) -> None:
         try:
-            due = await asyncio.to_thread(self.service.due)
+            due = await self._db_call(self.service.due)
         except Exception:
             log.exception("due check failed")
             return
@@ -956,7 +1119,7 @@ class GiveawayBot(commands.Bot):
             try:
                 # B04: stale due rows must not beat a concurrent extend — the
                 # flip re-checks ends_at itself and refuses when extended.
-                ended, winners = await asyncio.to_thread(
+                ended, winners = await self._db_call(
                     self.service.end, gw.id, require_due=True
                 )
             except ServiceError as exc:
@@ -968,6 +1131,7 @@ class GiveawayBot(commands.Bot):
             except Exception:
                 log.exception("end failed for %s", gw.id)
                 continue
+            self._gw_drop(gw.id)
             try:
                 await self._announce(ended, winners)
             except Exception:
@@ -980,7 +1144,7 @@ class GiveawayBot(commands.Bot):
         # Restart recovery lives here too: deadlines are durable rows, so a
         # restart just picks up whatever is due on the next tick.
         try:
-            due_claims = await asyncio.to_thread(self.service.due_claims)
+            due_claims = await self._db_call(self.service.due_claims)
         except Exception:
             log.exception("due claims check failed")
             due_claims = []
@@ -990,7 +1154,7 @@ class GiveawayBot(commands.Bot):
             if not gid or not uid:
                 continue
             try:
-                ended_claim, fresh = await asyncio.to_thread(
+                ended_claim, fresh = await self._db_call(
                     self.service.expire_claim, gid, uid
                 )
             except ServiceError as exc:
@@ -1005,24 +1169,29 @@ class GiveawayBot(commands.Bot):
                     await self._announce(ended_claim, fresh, reroll=True)
                 except Exception:
                     log.exception("replacement announce failed for %s", gid)
-        # Live timer: re-render active embeds every tick so the countdown
-        # visibly ticks down. The soonest deadlines always get a slot; the rest
-        # rotate, so no running giveaway is left showing a stale count.
-        try:
-            # One query feeds both consumers: the per-guild autocomplete cache
-            # wants them all, the embeds below only the soonest ten.
-            live = await asyncio.to_thread(self.service.list_all_active, 200)
-        except Exception:
-            log.exception("live list failed")
-            return
-        self._cache_autocomplete(live)
-        try:
-            ended_list = await asyncio.to_thread(self.service.list_all_ended, 200)
-        except Exception:
-            log.exception("ended list failed")
-            ended_list = []
-        self._cache_ended_autocomplete(ended_list)
-        await self._refresh_embeds(self._refresh_window(live))
+        # Live timer: re-render active embeds so the countdown visibly ticks
+        # down. Cosmetic half is gated to LIST_REFRESH_SECONDS: due/claims
+        # above run every tick (correctness), but these 2 list queries + N
+        # PATCHes would otherwise steal lanes from a 50-burst landing mid-tick.
+        # First tick always refreshes (cold autocomplete caches). Autocomplete
+        # stays usable between refreshes; embeds just tick slower.
+        now_mono = time.monotonic()
+        last_list = getattr(self, "_last_list_refresh", 0.0)
+        if now_mono - last_list >= self.LIST_REFRESH_SECONDS or not self._autocomplete_cache:
+            try:
+                live = await self._db_call(self.service.list_all_active, 200)
+            except Exception:
+                log.exception("live list failed")
+                return
+            self._cache_autocomplete(live)
+            try:
+                ended_list = await self._db_call(self.service.list_all_ended, 200)
+            except Exception:
+                log.exception("ended list failed")
+                ended_list = []
+            self._cache_ended_autocomplete(ended_list)
+            self._last_list_refresh = now_mono
+            await self._refresh_embeds(self._refresh_window(live))
         # Privacy sweep: join data (who entered) older than 5h past the end
         # is wiped. Giveaway records + winner lists stay; message counts are
         # already cleared at end-time.
@@ -1380,6 +1549,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
+        bot._gw_drop(gw.id)
         await bot._announce(ended, winners)
         await bot._strip_entrants_role(ended)
         await bot._safe_followup(interaction, f"Ended with {len(winners)} winner(s).")
@@ -1475,6 +1645,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
+        bot._gw_drop(gw.id)
         # Answer before the cleanup. Stripping entrants one by one can take much
         # longer than the 3 seconds Discord allows for the first response, and
         # the old order made a successful cancel look like a broken command.
@@ -1533,6 +1704,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
+        bot._gw_drop(gw.id)
         await bot._refresh_embed(fresh)
         await bot._safe_followup(
             interaction,
@@ -2077,6 +2249,181 @@ def wire_commands(bot: GiveawayBot) -> None:
                 view=ParticipantsPages(render=render, pages=pages),
                 ephemeral=True,
             )
+        except (discord.NotFound, discord.HTTPException):
+            pass
+
+    @bot.tree.command(
+        name="gw_request_time",
+        description="Time a real giveaway request (Turso + Discord legs)",
+    )
+    async def gw_request_time(interaction: discord.Interaction) -> None:
+        """Live cost of one request, timed leg by leg — not a gateway ping.
+
+        Each leg runs the same call the Join button pays (join-shaped SELECT,
+        guarded write, Discord ack + REST send) and times it with
+        perf_counter, lane queue + thread hop included, so the numbers are
+        this server's real Turso + Discord latency right now. Ephemeral; the
+        write probe touches one probe-only row and deletes it right after.
+        """
+        if interaction.guild is None:
+            try:
+                await interaction.response.send_message("Use this in a server.", ephemeral=True)
+            except (discord.NotFound, discord.HTTPException):
+                pass
+            return
+        t0 = time.perf_counter()
+        try:
+            t_ack = time.perf_counter()
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            ack_ms: float | None = (time.perf_counter() - t_ack) * 1000.0
+        except (discord.NotFound, discord.HTTPException):
+            return
+        gid = str(interaction.guild.id)
+        try:
+            caller = str(getattr(interaction.user, "id", "0"))
+        except Exception:
+            caller = "0"
+        try:
+            gateway_ms: float | None = float(bot.latency) * 1000.0
+            if gateway_ms != gateway_ms:  # NaN before the first heartbeat
+                gateway_ms = None
+        except Exception:
+            gateway_ms = None
+        ping_ms: float | None = None
+        read_ms: float | None = None
+        read_note = ""
+        write_ms: float | None = None
+        write_note = ""
+        rest_ms: float | None = None
+        # Leg 1: minimal Turso round-trip on the same gated lane Join uses.
+        try:
+            t_leg = time.perf_counter()
+            await bot._db_call(bot.db.query_one, "SELECT 1", ())
+            ping_ms = (time.perf_counter() - t_leg) * 1000.0
+        except Exception:
+            log.exception("request-time ping probe failed")
+        # Leg 2: the exact pre-ack read the Join button runs. With a live
+        # giveaway that is join_snapshot (row + 4 eligibility subqueries, one
+        # trip); without one, the same-shaped eligibility SELECT, labelled so
+        # nobody mistakes a synthetic read for a live one.
+        try:
+            try:
+                live = await bot._db_call(svc.list_active, gid)
+            except Exception:
+                live = []
+            t_leg = time.perf_counter()
+            if live:
+                target = live[0]
+                try:
+                    await bot._db_call(svc.join_snapshot, target.id, gid, caller)
+                    read_note = f"join-shaped read on `{target.id}`"
+                except ServiceError as exc:
+                    read_note = f"join-shaped read refused ({exc.message[:80]})"
+            else:
+                await bot._db_call(svc.eligibility_snapshot, gid, caller, None)
+                read_note = "no live giveaway — eligibility-shaped read (synthetic ids)"
+            read_ms = (time.perf_counter() - t_leg) * 1000.0
+        except Exception:
+            log.exception("request-time read probe failed")
+            if not read_note:
+                read_note = "read probe failed"
+        # Leg 3: a real guarded write + cleanup on a probe-only row. The key
+        # is non-numeric so it can never collide with a member snowflake.
+        probe_uid = "gw_request_time_probe"
+        try:
+            t_leg = time.perf_counter()
+            await bot._db_call(
+                bot.db.execute,
+                "INSERT INTO simple_message_counts (guild_id, user_id, count)"
+                " VALUES (?, ?, 0) ON CONFLICT (guild_id, user_id) DO NOTHING",
+                (gid, probe_uid),
+            )
+            await bot._db_call(
+                bot.db.execute,
+                "DELETE FROM simple_message_counts WHERE guild_id = ? AND user_id = ?",
+                (gid, probe_uid),
+            )
+            write_ms = (time.perf_counter() - t_leg) * 1000.0
+            write_note = "insert + delete of one probe row"
+        except Exception:
+            log.exception("request-time write probe failed")
+            write_note = "write probe failed"
+            try:
+                await bot._db_call(
+                    bot.db.execute,
+                    "DELETE FROM simple_message_counts WHERE guild_id = ? AND user_id = ?",
+                    (gid, probe_uid),
+                )
+            except Exception:
+                pass
+        # Leg 4: a real Discord REST send, timed. It is then edited into the
+        # report so the invoker sees one ephemeral reply, not two.
+        probe_msg = None
+        try:
+            t_leg = time.perf_counter()
+            probe_msg = await interaction.followup.send(
+                "Measuring Discord reply leg…", ephemeral=True
+            )
+            rest_ms = (time.perf_counter() - t_leg) * 1000.0
+        except (discord.NotFound, discord.HTTPException):
+            probe_msg = None
+        total_ms = (time.perf_counter() - t0) * 1000.0
+        try:
+            stats = bot.db.get_stats()
+        except Exception:
+            stats = {}
+        try:
+            backend = str(getattr(bot.db, "backend", "?"))
+        except Exception:
+            backend = "?"
+        host = ""
+        try:
+            url = str(bot.settings.turso_url or "")
+            if "://" in url:
+                host = url.split("://", 1)[1].split("@")[-1].split("/")[0][:48]
+        except Exception:
+            host = ""
+        try:
+            lanes = f"{int(bot._db_gate._value)}/64"
+        except Exception:
+            lanes = "?"
+
+        def _fmt(value: float | None) -> str:
+            return f"{value:.0f}ms" if value is not None else "failed"
+
+        short = [
+            ("Discord ack", ack_ms),
+            ("Discord reply", rest_ms),
+            ("Turso ping", ping_ms),
+            ("Turso read", read_ms),
+            ("Turso write", write_ms),
+        ]
+        known = [(name, value) for name, value in short if value is not None]
+        slowest = max(known, key=lambda item: item[1])[0] if known else "n/a"
+        gw_txt = f"{gateway_ms:.0f}ms" if gateway_ms is not None else "n/a (offline)"
+        try:
+            sess = f"{int(stats.get('reads', 0))} reads / {int(stats.get('writes', 0))} writes"
+        except Exception:
+            sess = "n/a"
+        where = f" @ {host}" if host else ""
+        lines = [
+            "Request-time breakdown — live legs, timed just now:",
+            f"• Discord ack (defer): **{_fmt(ack_ms)}**",
+            f"• Discord reply (REST send): **{_fmt(rest_ms)}**",
+            f"• Turso ping: **{_fmt(ping_ms)}**",
+            f"• Turso read: **{_fmt(read_ms)}** — {read_note or 'n/a'}",
+            f"• Turso write: **{_fmt(write_ms)}** — {write_note or 'n/a'}",
+            f"• Gateway heartbeat: **{gw_txt}** (websocket, for reference)",
+            f"• Total measured: **{total_ms:.0f}ms** (excludes this message's edit)",
+            f"• Slowest leg: **{slowest}**",
+            f"• Backend: `{backend}`{where} · db lanes free: {lanes} · session: {sess}",
+        ]
+        report = "\n".join(lines)
+        try:
+            if probe_msg is not None and hasattr(probe_msg, "edit"):
+                await probe_msg.edit(content=report)
+            else:
+                await bot._safe_followup(interaction, report)
         except (discord.NotFound, discord.HTTPException):
             pass
 

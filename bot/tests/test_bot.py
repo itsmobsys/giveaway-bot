@@ -94,6 +94,7 @@ class WiringTests(BotTestCase):
         "giveaway_reroll",
         "giveaway_timeout_bans",
         "giveaway_unban",
+        "gw_request_time",
         "skipclaim",
     )
 
@@ -1442,6 +1443,15 @@ class JoinBurstHandlerTests(BotTestCase):
         for interaction in interactions:
             self.assertTrue(any("You're in!" in t for t in interaction.texts))
 
+    def test_50_concurrent_handler_joins_all_commit(self) -> None:
+        """50 simultaneous clicks: every entry commits, every ack honest."""
+        gw = self.make()
+        members = [FakeMember(10 ** 17 + 1000 + i) for i in range(50)]
+        interactions = self.run_burst(gw.id, members)
+        self.assertEqual(self.svc.entry_count(gw.id), 50)
+        for interaction in interactions:
+            self.assertTrue(any("You're in!" in t for t in interaction.texts))
+
     def test_burst_embeds_are_debounced(self) -> None:
         gw = self.make()
         channel = FakeTextChannel()
@@ -1493,7 +1503,7 @@ class JoinBurstHandlerTests(BotTestCase):
             ))
         asyncio.run(scenario())
         self.assertLessEqual(
-            peak, 24, f"gate must cap live streams at 24, saw {peak}")
+            peak, 64, f"gate must cap live streams at 64, saw {peak}")
         self.assertGreater(peak, 1, "probe must actually overlap")
 
     def test_ban_list_shows_expiry_and_reason(self) -> None:
@@ -1510,6 +1520,55 @@ class JoinBurstHandlerTests(BotTestCase):
         self.assertIn("permanent", text)
         self.assertIn("expires <t:", text)
         self.assertIn("timed reason", text)
+
+
+class RequestTimeTests(BotTestCase):
+    """The /gw_request_time probe reports live legs and cleans up."""
+
+    def run_command(self, interaction: FakeInteraction) -> object:
+        command = self.bot.tree.get_command("gw_request_time")
+        self.assertIsNotNone(command, "the command must be registered")
+        asyncio.run(command.callback(interaction))
+        # FakeFollowup.send returns None, so the report lands as a second
+        # followup message; live Discord edits the probe message instead.
+        return interaction.followup.sent[-1]
+
+    def test_breakdown_names_every_live_leg(self) -> None:
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        report = self.run_command(interaction)
+        if isinstance(report, dict):
+            text = report.get("content") or ""
+        else:
+            text = getattr(report, "content", "") or ""
+        for leg in (
+            "Discord ack (defer)",
+            "Discord reply (REST send)",
+            "Turso ping",
+            "Turso read",
+            "Turso write",
+            "Gateway heartbeat",
+            "Total measured",
+            "Slowest leg",
+        ):
+            self.assertIn(leg, text)
+
+    def test_write_probe_leaves_no_row_behind(self) -> None:
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        self.run_command(interaction)
+        rows = self.db.query(
+            "SELECT * FROM simple_message_counts WHERE user_id = ?",
+            ("gw_request_time_probe",),
+        )
+        self.assertEqual(rows, [])
+
+    def test_dm_says_to_use_a_server(self) -> None:
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        interaction.guild = None
+        command = self.bot.tree.get_command("gw_request_time")
+        self.assertIsNotNone(command)
+        asyncio.run(command.callback(interaction))
+        self.assertEqual(interaction.response.sent[0]["content"], "Use this in a server.")
+        self.assertEqual(interaction.followup.sent, [])
 
 
 if __name__ == "__main__":
