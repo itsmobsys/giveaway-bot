@@ -1127,6 +1127,87 @@ class GracefulShutdownTests(unittest.TestCase):
             self.assertEqual(asyncio.run(scenario(windows)), ["buffer flushed"])
 
 
+class LoginRetryTests(unittest.TestCase):
+    """A 429 at static_login must retry in-process with a fresh client.
+
+    Regression for the Oct 11 Render crash loop: "async with bot" runs
+    __aexit__ -> close() even when start() raises, so the failed instance
+    stays closed. Re-entering it misread as a deliberate stop and re-raised
+    instead of backing off. amain must build a new client per attempt.
+    """
+
+    def test_429_retries_with_fresh_client(self) -> None:
+        async def scenario() -> list[str]:
+            events: list[str] = []
+            loop = asyncio.get_running_loop()
+
+            class FlakyBot:
+                def __init__(self, name: str) -> None:
+                    self.name = name
+                    self.closed = False
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    # Mirror discord.Client: exiting after a failed start
+                    # leaves the instance closed.
+                    self.closed = True
+
+                def is_closed(self) -> bool:
+                    return self.closed
+
+                async def start(self, token):
+                    events.append(f"start-{self.name}")
+                    if self.name == "first":
+                        raise Exception("429 Too Many Requests (error code: 0): Error 1015")
+
+                async def close(self):
+                    await asyncio.sleep(0)
+
+            first, second = FlakyBot("first"), FlakyBot("second")
+            fake_db = SimpleNamespace(init_schema=lambda: None)
+            with (patch("giveaway_bot.health.start_health_server"),
+                  patch("giveaway_bot.bot.Database", return_value=fake_db),
+                  patch("giveaway_bot.bot.GiveawayBot", side_effect=[first, second]),
+                  patch("giveaway_bot.bot.wire_commands"),
+                  patch("giveaway_bot.bot.LOGIN_RETRY_DELAYS", (0.0,)),
+                  patch.object(loop, "add_signal_handler", return_value=None)):
+                await amain(Settings(bot_token=uuid.uuid4().hex, turso_url=""))
+            self.assertEqual(events, ["start-first", "start-second"])
+            self.assertTrue(first.closed, "failed login must leave old client closed")
+            self.assertFalse(second.closed is True and events[-1] != "start-second")
+
+        asyncio.run(scenario())
+
+    def test_non_429_still_raises_immediately(self) -> None:
+        async def scenario() -> None:
+            loop = asyncio.get_running_loop()
+
+            class BoomBot:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    pass
+
+                async def start(self, token):
+                    raise RuntimeError("boom")
+
+                async def close(self):
+                    await asyncio.sleep(0)
+
+            fake_db = SimpleNamespace(init_schema=lambda: None)
+            with (patch("giveaway_bot.health.start_health_server"),
+                  patch("giveaway_bot.bot.Database", return_value=fake_db),
+                  patch("giveaway_bot.bot.GiveawayBot", return_value=BoomBot()),
+                  patch("giveaway_bot.bot.wire_commands"),
+                  patch.object(loop, "add_signal_handler", return_value=None)):
+                await amain(Settings(bot_token=uuid.uuid4().hex, turso_url=""))
+        with self.assertRaises(RuntimeError):
+            asyncio.run(scenario())
+
+
 class JoinFastPathTests(BotTestCase):
     """handle_join reuses the snapshot + count instead of re-reading rows."""
 

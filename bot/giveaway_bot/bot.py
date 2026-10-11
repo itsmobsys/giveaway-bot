@@ -2460,15 +2460,17 @@ async def amain(settings: Settings) -> None:
     start_health_server(max(1, settings.port), ready_state=ready_state)
     db = Database(settings)
     db.init_schema()
-    bot = GiveawayBot(settings, db)
-    wire_commands(bot)
     loop = asyncio.get_running_loop()
     shutdown_task: asyncio.Task | None = None
+    current: dict[str, object] = {"bot": None}
 
     def shutdown() -> None:
         nonlocal shutdown_task
         if shutdown_task is None:
-            shutdown_task = asyncio.create_task(bot.close())
+            bot_obj = current.get("bot")
+            close = getattr(bot_obj, "close", None)
+            if callable(close):
+                shutdown_task = asyncio.create_task(close())
 
     try:
         loop.add_signal_handler(signal.SIGTERM, shutdown)
@@ -2476,7 +2478,14 @@ async def amain(settings: Settings) -> None:
         signal.signal(signal.SIGTERM, lambda *_: loop.call_soon_threadsafe(shutdown))
     attempt = 0
     while True:
-        stopped = False
+        # Fresh client per login attempt: when static_login raises 429,
+        # "async with bot" still runs __aexit__ -> close(), leaving the old
+        # instance closed. Re-entering it misreads as a deliberate stop
+        # (is_closed() True) and re-starting a closed client is unreliable,
+        # so never reuse an instance that just failed to log in.
+        bot = GiveawayBot(settings, db)
+        wire_commands(bot)
+        current["bot"] = bot
         try:
             async with bot:
                 ready_state["status"] = "online"
@@ -2485,11 +2494,15 @@ async def amain(settings: Settings) -> None:
                 await shutdown_task
             return
         except Exception as exc:
-            try:
-                stopped = bool(bot.is_closed())
-            except Exception:
-                stopped = False
-            if stopped or not _login_rate_limited(exc):
+            # A SIGTERM during start() resolves as a clean stop, never a
+            # retry: shutdown_task is only ever created by shutdown().
+            if shutdown_task is not None:
+                try:
+                    await shutdown_task
+                except Exception:
+                    pass
+                return
+            if not _login_rate_limited(exc):
                 raise
             attempt += 1
             wait = LOGIN_RETRY_DELAYS[min(attempt - 1, len(LOGIN_RETRY_DELAYS) - 1)]
