@@ -20,7 +20,18 @@ from unittest.mock import patch
 import discord
 
 from giveaway_bot import views
-from giveaway_bot.bot import GiveawayBot, amain, build_intents, wire_commands
+from giveaway_bot.bot import (
+    LOGIN_RETRY_JITTER,
+    LOGIN_RETRY_MAX_WAIT,
+    GiveawayBot,
+    _login_exc_summary,
+    _login_rate_limited,
+    _login_retry_after,
+    _login_wait,
+    amain,
+    build_intents,
+    wire_commands,
+)
 from giveaway_bot.config import Settings
 from giveaway_bot.db import Database
 from giveaway_bot.service import GiveawayService, PartialFlush
@@ -1206,6 +1217,141 @@ class LoginRetryTests(unittest.TestCase):
                 await amain(Settings(bot_token=uuid.uuid4().hex, turso_url=""))
         with self.assertRaises(RuntimeError):
             asyncio.run(scenario())
+
+    def test_login_failure_never_retries(self) -> None:
+        """A bad token (401 -> LoginFailure) must surface, not back off."""
+        self.assertFalse(_login_rate_limited(discord.LoginFailure("bad token")))
+
+        async def scenario() -> None:
+            loop = asyncio.get_running_loop()
+
+            class AuthBot:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    pass
+
+                async def start(self, token):
+                    raise discord.LoginFailure("Improper token has been passed.")
+
+                async def close(self):
+                    await asyncio.sleep(0)
+
+            fake_db = SimpleNamespace(init_schema=lambda: None)
+            with (
+                self.assertRaises(discord.LoginFailure),
+                patch("giveaway_bot.health.start_health_server"),
+                patch("giveaway_bot.bot.Database", return_value=fake_db),
+                patch("giveaway_bot.bot.GiveawayBot", return_value=AuthBot()),
+                patch("giveaway_bot.bot.wire_commands"),
+                patch("giveaway_bot.bot.asyncio.sleep") as nap,
+                patch.object(loop, "add_signal_handler", return_value=None),
+            ):
+                await amain(Settings(bot_token=uuid.uuid4().hex, turso_url=""))
+            nap.assert_not_called()
+
+        asyncio.run(scenario())
+
+    def test_1015_html_page_is_a_retryable_throttle(self) -> None:
+        """The Oct 11 body: 429 status + Cloudflare 1015 HTML, no retry hint."""
+        resp = SimpleNamespace(status=429, reason="Too Many Requests")
+        body = ("<title>Access denied | discord.com</title> Error 1015"
+                " You are being rate limited Ray ID: abc123")
+        exc = discord.HTTPException(resp, body)  # type: ignore[arg-type]
+        self.assertTrue(_login_rate_limited(exc))
+        self.assertIsNone(_login_retry_after(exc))
+        wait = _login_wait(1, exc)
+        self.assertGreaterEqual(wait, 30.0)
+        self.assertLessEqual(wait, 30.0 + LOGIN_RETRY_JITTER)
+
+    def test_retry_after_hint_is_honored_and_capped(self) -> None:
+        """Discord-shaped 429s carry retry_after; rogue hints never park us."""
+        quick = SimpleNamespace(retry_after=12.5, text='{"retry_after": 12.5}')
+        wait = _login_wait(4, quick)
+        self.assertGreaterEqual(wait, 12.5)
+        self.assertLessEqual(wait, 12.5 + LOGIN_RETRY_JITTER)
+        huge = SimpleNamespace(retry_after=3600.0, text='{"retry_after": 3600.0}')
+        capped = _login_wait(1, huge)
+        self.assertLessEqual(capped, LOGIN_RETRY_MAX_WAIT + LOGIN_RETRY_JITTER)
+        self.assertGreaterEqual(capped, 30.0)
+
+    def test_wait_schedule_is_bounded_with_jitter(self) -> None:
+        """Schedule: 30/60/120/300 base, jittered, never above the cap."""
+        plain = Exception("429 Too Many Requests")
+        bases = (30.0, 60.0, 120.0, 300.0, 300.0)
+        with patch("giveaway_bot.bot.random.uniform", return_value=0.0):
+            for attempt, base in enumerate(bases, start=1):
+                self.assertEqual(_login_wait(attempt, plain), base)
+        for attempt in (1, 2, 3, 4, 9):
+            wait = _login_wait(attempt, plain)
+            base = bases[min(attempt - 1, len(bases) - 1)]
+            self.assertGreaterEqual(wait, base)
+            self.assertLessEqual(wait, min(base + LOGIN_RETRY_JITTER,
+                                           LOGIN_RETRY_MAX_WAIT + LOGIN_RETRY_JITTER))
+
+    def test_exc_summary_never_leaks_token_and_keeps_ray_id(self) -> None:
+        """Full 1015 pages must not land in logs; the Ray ID must survive."""
+        resp = SimpleNamespace(status=429, reason="Too Many Requests")
+        token = uuid.uuid4().hex
+        body = ("x" * 500 + " Ray ID: deadbeef1234 " + "y" * 500)
+        exc = discord.HTTPException(resp, body)  # type: ignore[arg-type]
+        summary = _login_exc_summary(exc)
+        self.assertNotIn(token, summary)
+        self.assertIn("deadbeef1234", summary)
+        self.assertLessEqual(len(summary), 260)
+
+    def test_sigterm_during_backoff_stops_cleanly(self) -> None:
+        """SIGTERM between attempts resolves as a stop, never another retry."""
+        async def scenario() -> str:
+            loop = asyncio.get_running_loop()
+            state: dict = {}
+
+            class OnceBot:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    pass
+
+                async def start(self, token):
+                    raise Exception("429 Too Many Requests")
+
+                async def close(self):
+                    await asyncio.sleep(0)
+
+            fake_db = SimpleNamespace(init_schema=lambda: None)
+            real_sleep = asyncio.sleep
+
+            async def sleep_once(delay: float) -> None:
+                state["wait"] = delay
+                state["cancel_hook"]()
+                await real_sleep(0)
+
+            def seizing_add_handler(kind, callback):
+                state["shutdown"] = callback
+
+            def cancel_hook() -> None:
+                state["shutdown"]()
+
+            state["cancel_hook"] = cancel_hook
+            captured: dict = {}
+
+            def capture_server(port: int, ready_state: dict | None = None):
+                captured["state"] = ready_state
+                return SimpleNamespace()
+
+            with (patch("giveaway_bot.health.start_health_server",
+                        side_effect=capture_server),
+                  patch("giveaway_bot.bot.Database", return_value=fake_db),
+                  patch("giveaway_bot.bot.GiveawayBot", return_value=OnceBot()),
+                  patch("giveaway_bot.bot.wire_commands"),
+                  patch("giveaway_bot.bot.asyncio.sleep", side_effect=sleep_once),
+                  patch.object(loop, "add_signal_handler", side_effect=seizing_add_handler)):
+                await amain(Settings(bot_token=uuid.uuid4().hex, turso_url=""))
+            return str((captured.get("state") or {}).get("discord"))
+
+        self.assertEqual(asyncio.run(scenario()), "rate-limited")
 
 
 class JoinFastPathTests(BotTestCase):

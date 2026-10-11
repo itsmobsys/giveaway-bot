@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import random
 import re
 import signal
 import time
@@ -2428,22 +2429,124 @@ def wire_commands(bot: GiveawayBot) -> None:
             pass
 
 
-#: Seconds to wait before retrying a rate-limited Discord login. Cloudflare
-#: answers 429 when the shared Render egress IP is over budget; the old code
-#: raised immediately, Render restarted the container, and every restart
-#: re-hit the same limit — a hot crash loop. Backing off in-process keeps
-#: /health green while the ban cools down, and Render stops restarting us.
+#: Base seconds to wait before retrying a rate-limited Discord login, one
+#: entry per attempt; _login_wait caps and jitters the actual sleep. On Oct 11
+#: Cloudflare answered 429 + Error 1015 to GET /users/@me at static_login and
+#: discord.py raised HTTPException carrying that HTML page; the old code let it
+#: crash the container, Render restarted it, and every restart re-hit the same
+#: throttle. Backing off in-process keeps the process alive while it cools.
 LOGIN_RETRY_DELAYS = (30.0, 60.0, 120.0, 300.0)
+
+#: Hard cap on one login-retry sleep: a rogue server hint can never park the
+#: bot longer than this; the loop simply tries again and re-reads the hint.
+LOGIN_RETRY_MAX_WAIT = 300.0
+
+#: Jitter spread on every login-retry sleep so concurrent restarts desync
+#: instead of re-hitting the limit in lockstep.
+LOGIN_RETRY_JITTER = 5.0
+
+
+def _login_retry_after(exc: BaseException) -> float | None:
+    """Server-provided retry delay in seconds, or None when absent/unusable.
+
+    discord.RateLimited carries it as an attribute; some 429 bodies carry a
+    retry_after field. Cloudflare 1015 pages are HTML with no hint, so this
+    returns None there and the caller uses the bounded schedule. The body is
+    scanned manually: its shape is not a contract worth a regex.
+    """
+    try:
+        hint = getattr(exc, "retry_after", None)
+        if isinstance(hint, bool):
+            hint = None
+        if isinstance(hint, (int, float)) and hint >= 0:
+            return float(hint)
+    except Exception:
+        pass
+    try:
+        text = getattr(exc, "text", "")
+        if isinstance(text, str):
+            key = "retry_after"
+            idx = text.find(key)
+            if idx >= 0:
+                num = ""
+                started = False
+                for ch in text[idx + len(key):]:
+                    if ch.isdigit() or (ch == "." and started):
+                        num += ch
+                        started = True
+                    elif started:
+                        break
+                if num:
+                    return max(0.0, float(num))
+    except Exception:
+        pass
+    return None
 
 
 def _login_rate_limited(exc: BaseException) -> bool:
-    """True when Discord/Cloudflare refused the login with a 429."""
+    """True only when the login was refused with a 429 / rate-limit signal.
+
+    Deliberately narrow: LoginFailure (bad token, 401) and every other error
+    re-raise immediately. Retrying an invalid token would burn the backoff
+    for nothing and hide a config mistake behind retry logs. A 1015 page
+    means the throttle is upstream of Discord for now — still transient, so
+    it retries too.
+    """
     try:
+        if isinstance(exc, discord.LoginFailure):
+            return False
         if isinstance(exc, discord.HTTPException) and getattr(exc, "status", None) == 429:
+            return True
+        if isinstance(exc, discord.RateLimited):
             return True
     except Exception:
         pass
-    return "429" in str(exc) or "1015" in str(exc) or "rate limit" in str(exc).lower()
+    text = str(exc)
+    return "429" in text or "1015" in text or "rate limit" in text.lower()
+
+
+def _login_wait(attempt: int, exc: BaseException) -> float:
+    """Seconds to sleep before login attempt number attempt (1-based).
+
+    Prefers the server retry_after hint when present and sane, else the
+    bounded exponential schedule. Always capped at LOGIN_RETRY_MAX_WAIT plus
+    one jitter spread. Pure function of its inputs so tests pin the schedule
+    without sleeping.
+    """
+    hint = _login_retry_after(exc)
+    if hint is not None and hint <= LOGIN_RETRY_MAX_WAIT:
+        base = hint
+    else:
+        base = LOGIN_RETRY_DELAYS[min(attempt - 1, len(LOGIN_RETRY_DELAYS) - 1)]
+    capped = LOGIN_RETRY_MAX_WAIT + LOGIN_RETRY_JITTER
+    jittered = base + random.uniform(0, LOGIN_RETRY_JITTER)  # noqa: S311
+    return min(jittered, capped)
+
+
+def _login_exc_summary(exc: BaseException) -> str:
+    """One safe log line for a refused login: class, status, short snippet.
+
+    Never includes the token (login failures carry no token) and never the
+    full body: Cloudflare 1015 pages are kilobytes of HTML, so only the first
+    160 collapsed characters are kept, plus the Ray ID when present so the
+    block can be correlated with Cloudflare/Discord support.
+    """
+    try:
+        status = getattr(exc, "status", None)
+    except Exception:
+        status = None
+    try:
+        flat = " ".join(str(exc).split())
+    except Exception:
+        flat = ""
+    ray = ""
+    try:
+        at = flat.find("Ray ID")
+        if at >= 0:
+            ray = " ray=" + "".join(flat[at:at + 48].split())
+    except Exception:
+        ray = ""
+    return type(exc).__name__ + " status=" + str(status) + ray + " :: " + flat[:160]
 
 
 async def amain(settings: Settings) -> None:
@@ -2477,6 +2580,7 @@ async def amain(settings: Settings) -> None:
     except NotImplementedError:  # Windows event loops do not support add_signal_handler.
         signal.signal(signal.SIGTERM, lambda *_: loop.call_soon_threadsafe(shutdown))
     attempt = 0
+    ready_state["discord"] = "starting"
     while True:
         # Fresh client per login attempt: when static_login raises 429,
         # "async with bot" still runs __aexit__ -> close(), leaving the old
@@ -2489,6 +2593,7 @@ async def amain(settings: Settings) -> None:
         try:
             async with bot:
                 ready_state["status"] = "online"
+                ready_state["discord"] = "online"
                 await bot.start(settings.bot_token)
             if shutdown_task is not None:
                 await shutdown_task
@@ -2497,24 +2602,29 @@ async def amain(settings: Settings) -> None:
             # A SIGTERM during start() resolves as a clean stop, never a
             # retry: shutdown_task is only ever created by shutdown().
             if shutdown_task is not None:
+                ready_state["discord"] = "stopped"
                 try:
                     await shutdown_task
                 except Exception:
                     pass
                 return
             if not _login_rate_limited(exc):
+                ready_state["discord"] = "auth-failed"
                 raise
             attempt += 1
-            wait = LOGIN_RETRY_DELAYS[min(attempt - 1, len(LOGIN_RETRY_DELAYS) - 1)]
+            wait = _login_wait(attempt, exc)
             ready_state["status"] = f"retrying-{attempt}"
+            ready_state["discord"] = "rate-limited"
             log.warning(
-                "Discord login rate-limited (attempt %d); retrying in %.0fs"
-                " — /health stays green, no restart needed.",
-                attempt, wait,
+                "Discord login rate-limited (attempt %d); retrying in %.1fs"
+                " — /health stays green (liveness only), /ready reports"
+                " discord=%s :: %s",
+                attempt, wait, ready_state["discord"], _login_exc_summary(exc),
             )
             try:
                 await asyncio.sleep(wait)
             except asyncio.CancelledError:
+                ready_state["discord"] = "stopped"
                 raise
             if shutdown_task is not None:
                 await shutdown_task

@@ -22,7 +22,12 @@ log = logging.getLogger("giveaway_bot.health")
 
 #: Paths answered with 200. Everything else 404s. A query string is ignored,
 #: so /health?cachebust=1 still works for monitors that add one.
-OK_PATHS = ("/", "/health")
+#: /health is liveness (process alive — always 200); /ready is readiness
+#: (Discord gateway up — 200 only when online, else 503). Splitting them
+#: stops a green /health from falsely implying the bot is operational while
+#: a login throttle cools down. Render healthCheckPath stays /health so a
+#: 429 never triggers a container restart.
+OK_PATHS = ("/", "/health", "/ready")
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -80,19 +85,35 @@ class _Server(ThreadingHTTPServer):
 def start_health_server(
     port: int, ready_state: dict | None = None
 ) -> ThreadingHTTPServer:
-    """Serve /health (200 while starting/retrying) and / (status page).
+    """Serve /health (liveness), /ready (readiness), / (status page).
 
-    ready_state is an optional mutable mapping with a "status" key ("starting",
-    "online", "retrying-N"). A 429-cooldown must NOT fail the Render health
-    check: failing it restarts the container, which re-hits the same Discord
-    rate limit — the crash loop in the Oct 11 logs. /health stays 200 so
-    Render leaves us alone while the ban cools down; / shows the state.
+    ready_state is an optional mutable mapping with a "status" key
+    ("starting", "online", "retrying-N") plus a "discord" key ("starting",
+    "online", "rate-limited", "auth-failed", "stopped"). A 429-cooldown
+    must NOT fail the Render health check: failing it restarts the container,
+    which re-hits the same Discord throttle — the crash loop in the Oct 11
+    logs. /health stays 200 so Render leaves us alone while it cools; /ready
+    answers 503 until the gateway is up so monitors can tell liveness from
+    Discord connectivity. / shows both states.
     """
     state = ready_state if ready_state is not None else {"status": "starting"}
 
+    def _discord_state() -> str:
+        try:
+            return str(state.get("discord", "starting"))
+        except Exception:
+            return "starting"
+
     class _StateHandler(_Handler):
         def do_GET(self) -> None:  # noqa: N802 - http.server naming
-            if self.path.split("?", 1)[0] == "/":
+            path = self.path.split("?", 1)[0]
+            if path == "/ready":
+                discord_state = _discord_state()
+                if discord_state == "online":
+                    self._respond(200, b"ready: discord online")
+                else:
+                    self._respond(503, ("not ready: discord " + discord_state).encode())
+            elif path == "/":
                 try:
                     status = str(state.get("status", "starting"))
                 except Exception:
@@ -101,6 +122,7 @@ def start_health_server(
                 body = (
                     "giveaway-bot: "
                     + ("online — gateway connected" if online else status)
+                    + " discord=" + _discord_state()
                     + " (bot not ready" if not online else " (ready)"
                     + " — Discord commands appear once the gateway connects)"
                 ).encode()
@@ -109,7 +131,13 @@ def start_health_server(
                 super().do_GET()
 
         def do_HEAD(self) -> None:  # noqa: N802 - http.server naming
-            if self.path.split("?", 1)[0] == "/":
+            path = self.path.split("?", 1)[0]
+            if path == "/ready":
+                if _discord_state() == "online":
+                    self._respond(200, b"", head_only=True)
+                else:
+                    self._respond(503, b"", head_only=True)
+            elif path == "/":
                 self._respond(200, b"", head_only=True)
             else:
                 super().do_HEAD()
