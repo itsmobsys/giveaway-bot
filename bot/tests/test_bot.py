@@ -252,20 +252,23 @@ class AutocompleteCacheTests(BotTestCase):
 
 
 class GuildSyncTests(BotTestCase):
-    """on_ready mirrors global commands into guilds so they appear in seconds.
+    """on_ready clears leftover guild command copies once, then stays global-only.
 
-    Regression: /gw_request_time shipped but stayed invisible because only the
-    global tree.sync() ran, which can take up to an hour to reach clients.
+    Regression: aa22c23 mirrored the global tree into every guild for instant
+    visibility, but that left TWO registrations per command (global + guild
+    copy), so every slash command rendered twice. The fix wipes the guild
+    copies exactly once per process (on_ready fires per reconnect) and keeps
+    the plain global sync in setup_hook.
     """
 
-    def test_on_ready_syncs_each_guild_without_breaking_startup(self) -> None:
+    def test_on_ready_clears_guild_copies_once_then_skips(self) -> None:
         async def scenario() -> list:
             calls: list = []
             guild_a = SimpleNamespace(id=111)
             guild_b = SimpleNamespace(id=222)
 
-            def fake_copy(*, guild):
-                calls.append(("copy", guild.id))
+            def fake_clear(*, guild=None):
+                calls.append(("clear", getattr(guild, "id", None)))
 
             async def fake_sync(*, guild=None):
                 calls.append(("sync", getattr(guild, "id", None)))
@@ -274,35 +277,37 @@ class GuildSyncTests(BotTestCase):
             with (
                 patch.object(type(self.bot), "guilds",
                              new_callable=property, fget=lambda _self: [guild_a, guild_b]),
-                patch.object(self.bot.tree, "copy_global_to", side_effect=fake_copy),
+                patch.object(self.bot.tree, "clear_commands", side_effect=fake_clear),
                 patch.object(self.bot.tree, "sync", side_effect=fake_sync),
             ):
                 await self.bot.on_ready()
-            return calls
+                first = list(calls)
+                await self.bot.on_ready()
+            return first, calls
 
-        calls = asyncio.run(scenario())
-        self.assertIn(("copy", 111), calls)
-        self.assertIn(("sync", 111), calls)
-        self.assertIn(("copy", 222), calls)
-        self.assertIn(("sync", 222), calls)
+        first, calls = asyncio.run(scenario())
+        self.assertIn(("clear", 111), first)
+        self.assertIn(("sync", 111), first)
+        self.assertIn(("clear", 222), first)
+        self.assertIn(("sync", 222), first)
+        # Second on_ready (a reconnect) must not sweep again.
+        self.assertEqual(calls, first)
 
-    def test_on_ready_survives_a_guild_sync_failure(self) -> None:
+    def test_on_ready_survives_a_guild_cleanup_failure(self) -> None:
         async def scenario() -> bool:
             bad = SimpleNamespace(id=999)
 
-            def fake_copy(*, guild):
+            def fake_clear(*, guild=None):
                 raise RuntimeError("sync down")
-
-            async def fake_sync(*, guild=None):
-                raise AssertionError("must not sync after a failed copy")
 
             with (
                 patch.object(type(self.bot), "guilds",
                              new_callable=property, fget=lambda _self: [bad]),
-                patch.object(self.bot.tree, "copy_global_to", side_effect=fake_copy),
-                patch.object(self.bot.tree, "sync", side_effect=fake_sync),
+                patch.object(self.bot.tree, "clear_commands", side_effect=fake_clear),
+                patch.object(self.bot.tree, "sync") as guild_sync,
             ):
                 await self.bot.on_ready()
+            guild_sync.assert_not_called()
             return True
 
         self.assertTrue(asyncio.run(scenario()))

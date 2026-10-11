@@ -142,6 +142,10 @@ class GiveawayBot(commands.Bot):
         #: atomic INSERT guard remains the source of truth.
         self._gw_cache: dict[str, tuple[object, float]] = {}
         self._last_list_refresh: float = 0.0
+        #: One-shot guild-command cleanup flag (see on_ready). Discord fires
+        #: on_ready on every reconnect, not just startup, so the sweep below
+        #: must run once per process, never per reconnect.
+        self._guild_cmd_cleanup_done = False
 
     # -- bounded DB lane --------------------------------------------------
     #: Seconds a single DB call may hold a lane before the join gives up.
@@ -244,21 +248,32 @@ class GiveawayBot(commands.Bot):
 
     async def on_ready(self) -> None:
         log.info("logged in as %s (%d guilds)", self.user, len(self.guilds))
-        try:
-            # Instant slash-command visibility: a global tree.sync() can take
-            # up to an hour to reach clients, which is why /gw_request_time
-            # stayed invisible after it shipped. Guild-scoped copies land in
-            # seconds, so mirror the same global tree into every guild we
-            # are in. Same commands, no divergence; failures only log.
-            for guild in list(self.guilds):
-                try:
-                    self.tree.copy_global_to(guild=guild)
-                    await self.tree.sync(guild=guild)
-                except Exception:
-                    log.exception("guild command sync failed for %s", getattr(guild, "id", "?"))
-            log.info("guild command sync done (%d guild(s))", len(self.guilds))
-        except Exception:
-            log.exception("guild command sync sweep failed")
+        # Duplicate-command cleanup (one-shot per process): aa22c23 mirrored
+        # the global tree into every guild for instant visibility, but that
+        # left TWO registrations per command (global + guild copy), so every
+        # slash command now renders twice. Guild sync offers no lasting win
+        # here — the global tree already propagates on its own — so clear
+        # the guild copies once and go back to global-only. Runs once because
+        # on_ready fires on every reconnect, and an empty guild sync is the
+        # supported way to wipe guild-scoped leftovers without touching global.
+        if not self._guild_cmd_cleanup_done:
+            self._guild_cmd_cleanup_done = True
+            try:
+                for guild in list(self.guilds):
+                    try:
+                        self.tree.clear_commands(guild=guild)
+                        await self.tree.sync(guild=guild)
+                    except Exception:
+                        log.exception(
+                            "guild command cleanup failed for %s",
+                            getattr(guild, "id", "?"),
+                        )
+                log.info(
+                    "guild command cleanup done (%d guild(s)); global-only from here",
+                    len(self.guilds),
+                )
+            except Exception:
+                log.exception("guild command cleanup sweep failed")
         try:
             # Off the event loop: this is a network round-trip, and blocking
             # here delays the gateway heartbeat that keeps the bot online.
