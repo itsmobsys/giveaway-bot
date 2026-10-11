@@ -251,6 +251,63 @@ class AutocompleteCacheTests(BotTestCase):
         self.assertEqual(self.bot._ended_autocomplete_cache[self.guild], [(done.id, "done")])
 
 
+class GuildSyncTests(BotTestCase):
+    """on_ready mirrors global commands into guilds so they appear in seconds.
+
+    Regression: /gw_request_time shipped but stayed invisible because only the
+    global tree.sync() ran, which can take up to an hour to reach clients.
+    """
+
+    def test_on_ready_syncs_each_guild_without_breaking_startup(self) -> None:
+        async def scenario() -> list:
+            calls: list = []
+            guild_a = SimpleNamespace(id=111)
+            guild_b = SimpleNamespace(id=222)
+
+            def fake_copy(*, guild):
+                calls.append(("copy", guild.id))
+
+            async def fake_sync(*, guild=None):
+                calls.append(("sync", getattr(guild, "id", None)))
+                return []
+
+            with (
+                patch.object(type(self.bot), "guilds",
+                             new_callable=property, fget=lambda _self: [guild_a, guild_b]),
+                patch.object(self.bot.tree, "copy_global_to", side_effect=fake_copy),
+                patch.object(self.bot.tree, "sync", side_effect=fake_sync),
+            ):
+                await self.bot.on_ready()
+            return calls
+
+        calls = asyncio.run(scenario())
+        self.assertIn(("copy", 111), calls)
+        self.assertIn(("sync", 111), calls)
+        self.assertIn(("copy", 222), calls)
+        self.assertIn(("sync", 222), calls)
+
+    def test_on_ready_survives_a_guild_sync_failure(self) -> None:
+        async def scenario() -> bool:
+            bad = SimpleNamespace(id=999)
+
+            def fake_copy(*, guild):
+                raise RuntimeError("sync down")
+
+            async def fake_sync(*, guild=None):
+                raise AssertionError("must not sync after a failed copy")
+
+            with (
+                patch.object(type(self.bot), "guilds",
+                             new_callable=property, fget=lambda _self: [bad]),
+                patch.object(self.bot.tree, "copy_global_to", side_effect=fake_copy),
+                patch.object(self.bot.tree, "sync", side_effect=fake_sync),
+            ):
+                await self.bot.on_ready()
+            return True
+
+        self.assertTrue(asyncio.run(scenario()))
+
+
 class RoleTaskTests(BotTestCase):
     def test_scheduled_deletes_are_kept_alive_and_deduplicated(self) -> None:
         async def scenario() -> tuple[int, int, int]:

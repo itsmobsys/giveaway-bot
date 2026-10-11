@@ -245,6 +245,21 @@ class GiveawayBot(commands.Bot):
     async def on_ready(self) -> None:
         log.info("logged in as %s (%d guilds)", self.user, len(self.guilds))
         try:
+            # Instant slash-command visibility: a global tree.sync() can take
+            # up to an hour to reach clients, which is why /gw_request_time
+            # stayed invisible after it shipped. Guild-scoped copies land in
+            # seconds, so mirror the same global tree into every guild we
+            # are in. Same commands, no divergence; failures only log.
+            for guild in list(self.guilds):
+                try:
+                    self.tree.copy_global_to(guild=guild)
+                    await self.tree.sync(guild=guild)
+                except Exception:
+                    log.exception("guild command sync failed for %s", getattr(guild, "id", "?"))
+            log.info("guild command sync done (%d guild(s))", len(self.guilds))
+        except Exception:
+            log.exception("guild command sync sweep failed")
+        try:
             # Off the event loop: this is a network round-trip, and blocking
             # here delays the gateway heartbeat that keeps the bot online.
             live = await asyncio.to_thread(self.service.list_all_active, 200)
