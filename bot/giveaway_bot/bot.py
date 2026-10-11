@@ -2428,13 +2428,36 @@ def wire_commands(bot: GiveawayBot) -> None:
             pass
 
 
+#: Seconds to wait before retrying a rate-limited Discord login. Cloudflare
+#: answers 429 when the shared Render egress IP is over budget; the old code
+#: raised immediately, Render restarted the container, and every restart
+#: re-hit the same limit — a hot crash loop. Backing off in-process keeps
+#: /health green while the ban cools down, and Render stops restarting us.
+LOGIN_RETRY_DELAYS = (30.0, 60.0, 120.0, 300.0)
+
+
+def _login_rate_limited(exc: BaseException) -> bool:
+    """True when Discord/Cloudflare refused the login with a 429."""
+    try:
+        if isinstance(exc, discord.HTTPException) and getattr(exc, "status", None) == 429:
+            return True
+    except Exception:
+        pass
+    return "429" in str(exc) or "1015" in str(exc) or "rate limit" in str(exc).lower()
+
+
 async def amain(settings: Settings) -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     if not settings.bot_token:
         raise SystemExit("DISCORD_BOT_TOKEN is not set.")
     from .health import start_health_server
 
-    start_health_server(max(1, settings.port))
+    # Mutable flag the /health page reads: "starting" until the gateway is up,
+    # "online" after login, "retrying-N" while cooling down from a 429. A
+    # plain dict keeps the health thread (no asyncio there) race-free enough
+    # for a status string.
+    ready_state: dict[str, str] = {"status": "starting"}
+    start_health_server(max(1, settings.port), ready_state=ready_state)
     db = Database(settings)
     db.init_schema()
     bot = GiveawayBot(settings, db)
@@ -2451,12 +2474,40 @@ async def amain(settings: Settings) -> None:
         loop.add_signal_handler(signal.SIGTERM, shutdown)
     except NotImplementedError:  # Windows event loops do not support add_signal_handler.
         signal.signal(signal.SIGTERM, lambda *_: loop.call_soon_threadsafe(shutdown))
-    try:
-        async with bot:
-            await bot.start(settings.bot_token)
-    finally:
-        if shutdown_task is not None:
-            await shutdown_task
+    attempt = 0
+    while True:
+        stopped = False
+        try:
+            async with bot:
+                ready_state["status"] = "online"
+                await bot.start(settings.bot_token)
+            if shutdown_task is not None:
+                await shutdown_task
+            return
+        except Exception as exc:
+            try:
+                stopped = bool(bot.is_closed())
+            except Exception:
+                stopped = False
+            if stopped or not _login_rate_limited(exc):
+                raise
+            attempt += 1
+            wait = LOGIN_RETRY_DELAYS[min(attempt - 1, len(LOGIN_RETRY_DELAYS) - 1)]
+            ready_state["status"] = f"retrying-{attempt}"
+            log.warning(
+                "Discord login rate-limited (attempt %d); retrying in %.0fs"
+                " — /health stays green, no restart needed.",
+                attempt, wait,
+            )
+            try:
+                await asyncio.sleep(wait)
+            except asyncio.CancelledError:
+                raise
+            if shutdown_task is not None:
+                await shutdown_task
+                return
+        else:
+            return
 
 
 def run_forever(settings: Settings) -> None:

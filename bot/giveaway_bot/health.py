@@ -77,8 +77,44 @@ class _Server(ThreadingHTTPServer):
         log.exception("health server error")
 
 
-def start_health_server(port: int) -> ThreadingHTTPServer:
-    server = _Server(("0.0.0.0", port), _Handler)  # noqa: S104 - Render requires all interfaces
+def start_health_server(
+    port: int, ready_state: dict | None = None
+) -> ThreadingHTTPServer:
+    """Serve /health (200 while starting/retrying) and / (status page).
+
+    ready_state is an optional mutable mapping with a "status" key ("starting",
+    "online", "retrying-N"). A 429-cooldown must NOT fail the Render health
+    check: failing it restarts the container, which re-hits the same Discord
+    rate limit — the crash loop in the Oct 11 logs. /health stays 200 so
+    Render leaves us alone while the ban cools down; / shows the state.
+    """
+    state = ready_state if ready_state is not None else {"status": "starting"}
+
+    class _StateHandler(_Handler):
+        def do_GET(self) -> None:  # noqa: N802 - http.server naming
+            if self.path.split("?", 1)[0] == "/":
+                try:
+                    status = str(state.get("status", "starting"))
+                except Exception:
+                    status = "starting"
+                online = status == "online"
+                body = (
+                    "giveaway-bot: "
+                    + ("online — gateway connected" if online else status)
+                    + " (bot not ready" if not online else " (ready)"
+                    + " — Discord commands appear once the gateway connects)"
+                ).encode()
+                self._respond(200, body)
+            else:
+                super().do_GET()
+
+        def do_HEAD(self) -> None:  # noqa: N802 - http.server naming
+            if self.path.split("?", 1)[0] == "/":
+                self._respond(200, b"", head_only=True)
+            else:
+                super().do_HEAD()
+
+    server = _Server(("0.0.0.0", port), _StateHandler)  # noqa: S104 - Render requires all interfaces
     thread = threading.Thread(
         target=server.serve_forever, name="health-server", daemon=True
     )

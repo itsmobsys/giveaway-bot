@@ -1096,6 +1096,9 @@ class GracefulShutdownTests(unittest.TestCase):
                 handler = invoke_handler
 
             class FakeBot:
+                def is_closed(self) -> bool:
+                    return False
+
                 async def __aenter__(self):
                     return self
 
