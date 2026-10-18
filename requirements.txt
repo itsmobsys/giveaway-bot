@@ -3,3 +3,7 @@
 discord.py>=2.4,<3
 python-dotenv>=1.0,<2
 libsql>=0.1.11,<2
+# Short-TTL read cache + concurrency damper only. Turso stays the single
+# source of truth: every entry is confirmed by a Turso commit before the
+# member is acked, and losing Redis only costs latency, never data.
+redis>=5.0,<6

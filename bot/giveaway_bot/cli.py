@@ -71,6 +71,20 @@ def cmd_doctor(_: argparse.Namespace) -> int:
             finally:
                 db.close_all()
 
+    # Redis: reported, never required. The bot runs straight to Turso with no
+    # cache at all, so a missing/unreachable Redis is a note, not a problem --
+    # doctor must not fail a working deployment over an optional accelerator.
+    if not settings.uses_redis:
+        notes.append(
+            "REDIS_URL is empty (or REDIS_ENABLED=false), so every read goes"
+            " straight to Turso. Correct, just slower under load."
+        )
+    else:
+        notes.append(
+            "REDIS_URL is set: a short-TTL read cache is active. It is never a"
+            " source of truth -- entries are still confirmed by Turso."
+        )
+
     print(f"tick: every {settings.tick_seconds}s")
     print(f"giveaway channel: {settings.giveaway_channel_id or 'the channel the command runs in'}")
     print(f"dashboard button: {settings.dashboard_url or 'disabled'}")

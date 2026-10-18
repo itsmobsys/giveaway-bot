@@ -29,3 +29,8 @@ services:
         value: "30"
       - key: EMBED_COLOR
         value: 0x7C5CFF
+      # Short-TTL read cache (Singapore, same region as the bot). Optional at
+      # runtime: with no value the bot runs exactly as before, straight to
+      # Turso. Never a source of truth -- it only cuts repeat reads.
+      - key: REDIS_URL
+        sync: false

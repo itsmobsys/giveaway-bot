@@ -19,6 +19,21 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+def _bool(name: str, default: bool) -> bool:
+    """A yes/no setting, in any spelling people actually write.
+
+    '1/true/yes/on' are true, '0/false/no/off' are false (case-insensitive).
+    Anything else — including an empty value — keeps the default, so a typo
+    can never silently flip a safety switch.
+    """
+    raw = (os.getenv(name, "") or "").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 def _color(name: str, default: int) -> int:
     """A colour setting as a 24-bit int, in any spelling people actually write.
 
@@ -70,10 +85,21 @@ class Settings:
     #: the bot run as a Web Service (free tier has no background workers).
     port: int = field(default_factory=lambda: _int("PORT", 10000))
     embed_color: int = 0x7C5CFF
+    #: Optional managed Redis, used only as a short-TTL READ cache and as a
+    #: concurrency damper. Turso stays the single source of truth: with this
+    #: unset, or Redis unreachable, every read falls back to Turso and the bot
+    #: behaves exactly as it did before. Never a queue, never an owner of data.
+    redis_url: str = field(default_factory=lambda: os.getenv("REDIS_URL", "").strip())
+    #: Master switch, so the cache can be dropped without editing the URL.
+    redis_enabled: bool = field(default_factory=lambda: _bool("REDIS_ENABLED", True))
 
     @property
     def uses_turso(self) -> bool:
         return bool(self.turso_url)
+
+    @property
+    def uses_redis(self) -> bool:
+        return bool(self.redis_url) and self.redis_enabled
 
 
 def get_settings() -> Settings:

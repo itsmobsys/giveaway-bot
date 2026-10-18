@@ -17,6 +17,7 @@ from discord.ext import commands, tasks
 from . import embeds
 from .config import Settings
 from .db import Database
+from .redis_cache import RedisCache
 from .service import TIMEOUT_BAN_KIND, Giveaway, GiveawayService, PartialFlush, ServiceError
 from .views import ClaimView, GiveawayView, ParticipantsPages
 
@@ -80,11 +81,18 @@ def _still_in_guild(guild: discord.Guild, user_id: str) -> bool:
 
 
 class GiveawayBot(commands.Bot):
-    def __init__(self, settings: Settings, db: Database) -> None:
+    def __init__(self, settings: Settings, db: Database, redis=None) -> None:
         super().__init__(command_prefix="!", intents=build_intents(), help_command=None)
         self.settings = settings
         self.db = db
-        self.service = GiveawayService(db)
+        #: Shared short-TTL read cache + concurrency damper. Built once in
+        #: amain() next to db (so it survives login retries) and passed in;
+        #: None (or an unconfigured cache) means every read goes to Turso
+        #: exactly as before, which is also what every existing test builds.
+        #: Turso stays the single source of truth: nothing here is ever
+        #: confirmed to a member from cached data alone.
+        self.redis = redis
+        self.service = GiveawayService(db, redis)
         #: guild_id -> [(giveaway_id, prize)] rebuilt every tick. Discord kills
         #: autocomplete after 3s and a Turso round-trip can exceed that, so
         #: suggestions come from this snapshot — never from the database.
@@ -141,6 +149,14 @@ class GiveawayBot(commands.Bot):
         #: NEVER cached — always read live per click. Not a dupe-cache: the
         #: atomic INSERT guard remains the source of truth.
         self._gw_cache: dict[str, tuple[object, float]] = {}
+        #: entered_latch: giveaway_id -> {user_id: monotonic ts} for joins
+        #: that COMMITTED in this process. A second tap of the same button
+        #: (~1 in 20 members, two gateway events) is refused with the exact
+        #: service text after one dict lookup and zero network. Deliberately
+        #: tiny and self-expiring: only ever used to SHORT-CIRCUIT A REFUSAL,
+        #: so a miss (eviction, restart, another process) simply runs the
+        #: normal path where the atomic INSERT guard still decides.
+        self._entered: dict[str, dict[str, float]] = {}
         self._last_list_refresh: float = 0.0
         #: One-shot guild-command cleanup flag (see on_ready). Discord fires
         #: on_ready on every reconnect, not just startup, so the sweep below
@@ -173,6 +189,21 @@ class GiveawayBot(commands.Bot):
             cls._DB_POOL = pool
         return pool
 
+    async def _flush_invalidation(self) -> None:
+        """Drain the service's pending cache invalidations. Never raises.
+
+        The service records key suffixes inside its synchronous write paths
+        (which cannot await Redis); this runs on the event loop immediately
+        after that write returns, so the next read is live. A Redis outage
+        only means the keys expire by TTL instead -- correctness lives in
+        Turso, never in this cache.
+        """
+        try:
+            await self.service.flush_invalidations()
+        except Exception:
+            log.debug("cache invalidation flush failed", exc_info=True)
+
+
     async def _db_call(self, func, *args, **kwargs):
         """Run a blocking service/DB call on the pinned pool, gated."""
         loop = asyncio.get_running_loop()
@@ -189,6 +220,12 @@ class GiveawayBot(commands.Bot):
 
     #: Seconds a cached giveaway header stays valid mid-burst.
     GW_CACHE_TTL = 2.0
+    #: How long one process's claim on the tick's live-list sweep lasts. The
+    #: window itself is 120s, so a lease shorter than that can never skip a
+    #: window: after a sweep at t=120 the lease is gone by t=210 while the
+    #: next one is not due until t=240. Redis can only *narrow* duplicate
+    #: work here -- never a correctness input.
+    SWEEP_LEASE_SECONDS = 90.0
 
     def _gw_cached(self, giveaway_id: str):
         """Fresh cached header, or None on miss/expiry/corruption."""
@@ -218,6 +255,57 @@ class GiveawayBot(commands.Bot):
     def _gw_drop(self, giveaway_id: str) -> None:
         try:
             self._gw_cache.pop(giveaway_id, None)
+        except Exception:
+            pass
+
+    # -- duplicate-click latch (process-local) ----------------------------
+    #: Seconds an entry marker stays hot. It only has to outlive a double tap
+    #: (two gateway events, milliseconds apart), so 120s is generous while
+    #: keeping the whole map tiny; the database remains the real guard.
+    ENTERED_TTL = 120.0
+    #: Hard cap on tracked giveaways, so a very long uptime with many
+    #: giveaways cannot grow this map without bound.
+    ENTERED_MAX_GIVEAWAYS = 64
+
+    def _entered_recently(self, giveaway_id: str, user_id: str) -> bool:
+        """True only if THIS process saw this member's join commit.
+
+        A False here means "unknown", never "not entered": the caller then
+        runs the ordinary path and Turso decides. Expired markers are pruned
+        on read so no timer is needed."""
+        try:
+            members = self._entered.get(giveaway_id)
+            if not members:
+                return False
+            ts = members.get(user_id)
+            if ts is None:
+                return False
+            if time.monotonic() - ts > self.ENTERED_TTL:
+                members.pop(user_id, None)
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _mark_entered(self, giveaway_id: str, user_id: str) -> None:
+        """Record a committed join. Called only after the write returned."""
+        try:
+            members = self._entered.get(giveaway_id)
+            if members is None:
+                if len(self._entered) >= self.ENTERED_MAX_GIVEAWAYS:
+                    self._entered.clear()
+                members = {}
+                self._entered[giveaway_id] = members
+            members[user_id] = time.monotonic()
+        except Exception:
+            pass
+
+    def _clear_entered(self, giveaway_id: str, user_id: str) -> None:
+        """Forget one member's marker (they left, or were dropped)."""
+        try:
+            members = self._entered.get(giveaway_id)
+            if members is not None:
+                members.pop(user_id, None)
         except Exception:
             pass
 
@@ -363,6 +451,9 @@ class GiveawayBot(commands.Bot):
         await super().close()
         # Every thread's connection, not just this one's.
         self.db.close_all()
+        # The Redis client deliberately outlives this bot: amain() owns it and
+        # closes it once at the end, so a login retry reuses the same pool
+        # instead of leaving a discarded client behind (see amain).
 
     def register_components(self) -> None:
         """Make every giveaway button clickable, forever.
@@ -521,7 +612,12 @@ class GiveawayBot(commands.Bot):
             return None
         try:
             if entry_count is None:
-                count = await self._db_call(self.service.entry_count, gw.id)
+                # Display-only fallback. entry_count_cached is async (the
+                # Turso read it may fall back to is blocking), so it is
+                # awaited directly: _db_call runs its callable in a worker
+                # thread, which would return this coroutine un-awaited and
+                # print its repr into the embed's entry count.
+                count = await self.service.entry_count_cached(gw.id)
             else:
                 count = entry_count
             # A partial message edits by id. fetch_message() would spend a full
@@ -628,7 +724,7 @@ class GiveawayBot(commands.Bot):
     async def _notify_mention(self, guild_id: str) -> str:
         """`<@&...>` for this server's notify role, or empty when unset/gone."""
         try:
-            role_id = await asyncio.to_thread(self.service.get_notify_role, guild_id)
+            role_id = await self.service.get_notify_role_cached(guild_id)
         except Exception:
             return ""
         if not role_id:
@@ -849,6 +945,14 @@ class GiveawayBot(commands.Bot):
         # clicked — not a cache read that could be minutes old.
         timed_out = self._timed_out(member)
         guild_id_str = str(interaction.guild.id)
+        # entered_latch: a plain in-process set of (giveaway, user) ids whose
+        # join COMMITTED in this process. It answers the second tap with the
+        # exact refusal text the service gives, for one dict lookup (zero
+        # network), and it only ever SHORT-CIRCUITS A REFUSAL: a missing
+        # marker runs the normal path, and the database still decides.
+        if self._entered_recently(giveaway_id, uid):
+            await self._safe_followup(interaction, "⚠️ You are already entered.")
+            return
         # Hot-header shortcut: immutable fields served from a 2s cache so a
         # 50-burst pays 1 header read, not 50. Eligibility still goes to the
         # DB per click via eligibility_snapshot (never cached).
@@ -927,6 +1031,7 @@ class GiveawayBot(commands.Bot):
                     )
                 except Exception:
                     log.exception("post-join refresh lookup failed for %s", giveaway_id)
+                    self._mark_entered(giveaway_id, uid)
                     await self._safe_followup(interaction, "🎟️ You're in!")
                     return
             except ServiceError:
@@ -941,6 +1046,7 @@ class GiveawayBot(commands.Bot):
                 # at the old standalone call. Commit landed, so ack honestly
                 # with the generic message (same as the old dead-read path).
                 log.exception("post-join refresh lookup failed for %s", giveaway_id)
+                self._mark_entered(giveaway_id, uid)
                 await self._safe_followup(interaction, "🎟️ You're in!")
                 return
         except ServiceError as exc:
@@ -949,12 +1055,16 @@ class GiveawayBot(commands.Bot):
                 # The gate dropped the entry they already had, so the entrants
                 # role it earned has to go too — in every active giveaway
                 # whose entries the service dropped, not just this one.
+                # The same sweep clears this process's entry markers: their
+                # joins no longer exist, so a cached "already entered" would
+                # otherwise refuse their next honest click.
                 try:
                     active = await self._db_call(self.service.list_active, gw.guild_id)
                 except Exception:
                     log.exception("timeout role lookup failed for %s", uid)
                 else:
                     for live in active:
+                        self._clear_entered(live.id, uid)
                         try:
                             await self._take_entrants_role(live, uid)
                         except Exception:
@@ -970,6 +1080,16 @@ class GiveawayBot(commands.Bot):
         # landed, so a dead read still acks honestly, just without the
         # number). The same pair feeds grant-vs-take + refresh with zero
         # further trips.
+        # Invalidation before ack: join() queued the keys its own write just
+        # made wrong (the cached display count) and this drains them in one
+        # DEL. It happens here -- after the Turso commit, before the member is
+        # told anything -- so the number they are shown can never come from a
+        # snapshot that pre-dates their own entry.
+        await self._flush_invalidation()
+        # A committed join is the only thing that sets this marker: the
+        # refusal branch above never reaches here, so a refused click can
+        # never poison the next one.
+        self._mark_entered(giveaway_id, uid)
         if status is None:
             await self._safe_followup(interaction, "🎟️ You're in!")
             return
@@ -1109,6 +1229,15 @@ class GiveawayBot(commands.Bot):
             log.exception("leave failed for %s", giveaway_id)
             await self._safe_followup(interaction, "⚠️ Could not update your entry. Try again.")
             return
+        # A leave undoes the entry the latch remembers, so the marker goes
+        # first: otherwise the same member's next join would be refused with
+        # "already entered" for up to ENTERED_TTL.
+        if removed:
+            self._clear_entered(giveaway_id, str(interaction.user.id))
+        # leave() queued the display-count key it just made wrong; drain it
+        # before the reply so the number the member sees next cannot be the
+        # pre-leave one, and the embed refreshed below shows the true total.
+        await self._flush_invalidation()
         await self._safe_followup(
             interaction, "You left the giveaway." if removed else "You were not entered."
         )
@@ -1218,7 +1347,32 @@ class GiveawayBot(commands.Bot):
         # stays usable between refreshes; embeds just tick slower.
         now_mono = time.monotonic()
         last_list = getattr(self, "_last_list_refresh", 0.0)
-        if now_mono - last_list >= self.LIST_REFRESH_SECONDS or not self._autocomplete_cache:
+        due = now_mono - last_list >= self.LIST_REFRESH_SECONDS or not self._autocomplete_cache
+        # One poll body per window across processes. The free plan restarts
+        # (deploys, OOM, idle spin-down) and an old instance overlaps a new
+        # one for a few seconds; both would otherwise run the identical two
+        # list reads plus every embed edit, and the loser's edits can land
+        # after the winner's, briefly re-widening a countdown that was just
+        # re-rendered. A lease makes one of them do the work.
+        # A refused or unreachable Redis yields no lease, and the sweep then
+        # runs exactly as it did before Redis existed: this can never skip
+        # the sweep, only ever narrow who runs it.
+        lease: str | None = None
+        may_sweep = True
+        if due and self.redis is not None:
+            try:
+                lease, answered = await self.redis.acquire_checked(
+                    "sweep:live", self.SWEEP_LEASE_SECONDS
+                )
+            except Exception:
+                lease, answered = None, False
+            # Only a real answer may narrow the sweep. "Somebody else holds
+            # it" means another instance is already doing this pass; "no
+            # answer" (over budget, down, timed out) must leave the tick
+            # exactly as it was before Redis existed, or a broken cache
+            # would quietly freeze the lists and every countdown.
+            may_sweep = lease is not None or not answered
+        if due and may_sweep:
             try:
                 live = await self._db_call(self.service.list_all_active, 200)
             except Exception:
@@ -1233,6 +1387,11 @@ class GiveawayBot(commands.Bot):
             self._cache_ended_autocomplete(ended_list)
             self._last_list_refresh = now_mono
             await self._refresh_embeds(self._refresh_window(live))
+        if lease is not None:
+            try:
+                await self.redis.release("sweep:live", lease)
+            except Exception:
+                log.debug("sweep lease release failed", exc_info=True)
         # Privacy sweep: join data (who entered) older than 5h past the end
         # is wiped. Giveaway records + winner lists stay; message counts are
         # already cleared at end-time.
@@ -1917,6 +2076,12 @@ def wire_commands(bot: GiveawayBot) -> None:
             log.exception("notify role save failed")
             await bot._safe_followup(interaction, "⚠️ Could not save. Try again.")
             return
+        # Invalidate the cached notify-role now, not in 10s: the mention
+        # appended to the very next announcement must be the role just set.
+        try:
+            await svc.invalidate_notify_role(gid)
+        except Exception:
+            log.debug("notify role cache invalidation failed", exc_info=True)
         await bot._safe_followup(
             interaction,
             f"✅ {role.mention} will now be pinged on every giveaway (new, winners,"
@@ -2016,6 +2181,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             await bot._safe_followup(interaction, "⚠️ Could not update the blacklist. Try again.")
             return
         for gw in active:
+            bot._clear_entered(gw.id, uid)
             await bot._take_entrants_role(gw, uid)
         log.info("blacklisted %s in guild %s", uid, gid)
         await bot._safe_followup(
@@ -2129,6 +2295,9 @@ def wire_commands(bot: GiveawayBot) -> None:
             await bot._safe_followup(interaction, "⚠️ Could not update the ban. Try again.")
             return
         for gw in active:
+            # Their entries are gone, so this process's entry markers must go
+            # too, or the next honest click is refused as "already entered".
+            bot._clear_entered(gw.id, uid)
             try:
                 await bot._take_entrants_role(gw, uid)
             except Exception:
@@ -2637,6 +2806,25 @@ async def amain(settings: Settings) -> None:
     start_health_server(max(1, settings.port), ready_state=ready_state)
     db = Database(settings)
     db.init_schema()
+    # Redis is a short-TTL read cache plus a concurrency damper, never a
+    # source of truth: every entry is still confirmed by a Turso commit
+    # before anyone is told they are in. It is built here, next to db, so ONE
+    # client and one connection pool outlive the login-retry loop below
+    # (a fresh bot per attempt must not leak a fresh client per attempt).
+    redis = RedisCache(
+        getattr(settings, "redis_url", ""),
+        enabled=bool(getattr(settings, "redis_enabled", True)),
+    )
+    try:
+        if await redis.start():
+            log.info("redis cache ready (%s)", redis.describe())
+        else:
+            log.warning(
+                "redis not available (%s); every read falls back to the database",
+                "disabled" if not redis.configured else "unreachable",
+            )
+    except Exception:
+        log.warning("redis start failed; continuing without the cache", exc_info=True)
     loop = asyncio.get_running_loop()
     shutdown_task: asyncio.Task | None = None
     current: dict[str, object] = {"bot": None}
@@ -2655,56 +2843,65 @@ async def amain(settings: Settings) -> None:
         signal.signal(signal.SIGTERM, lambda *_: loop.call_soon_threadsafe(shutdown))
     attempt = 0
     ready_state["discord"] = "starting"
-    while True:
-        # Fresh client per login attempt: when static_login raises 429,
-        # "async with bot" still runs __aexit__ -> close(), leaving the old
-        # instance closed. Re-entering it misreads as a deliberate stop
-        # (is_closed() True) and re-starting a closed client is unreliable,
-        # so never reuse an instance that just failed to log in.
-        bot = GiveawayBot(settings, db)
-        wire_commands(bot)
-        current["bot"] = bot
-        try:
-            async with bot:
-                ready_state["status"] = "online"
-                ready_state["discord"] = "online"
-                await bot.start(settings.bot_token)
-            if shutdown_task is not None:
-                await shutdown_task
-            return
-        except Exception as exc:
-            # A SIGTERM during start() resolves as a clean stop, never a
-            # retry: shutdown_task is only ever created by shutdown().
-            if shutdown_task is not None:
-                ready_state["discord"] = "stopped"
-                try:
-                    await shutdown_task
-                except Exception:
-                    pass
-                return
-            if not _login_rate_limited(exc):
-                ready_state["discord"] = "auth-failed"
-                raise
-            attempt += 1
-            wait = _login_wait(attempt, exc)
-            ready_state["status"] = f"retrying-{attempt}"
-            ready_state["discord"] = "rate-limited"
-            log.warning(
-                "Discord login rate-limited (attempt %d); retrying in %.1fs"
-                " — /health stays green (liveness only), /ready reports"
-                " discord=%s :: %s",
-                attempt, wait, ready_state["discord"], _login_exc_summary(exc),
-            )
+    # The finally below is the ONLY place the cache client is closed: every
+    # exit path (clean stop, SIGTERM, auth failure, cancellation) leaves
+    # through it, so the pool never outlives the process that opened it.
+    try:
+        while True:
+            # Fresh client per login attempt: when static_login raises 429,
+            # "async with bot" still runs __aexit__ -> close(), leaving the old
+            # instance closed. Re-entering it misreads as a deliberate stop
+            # (is_closed() True) and re-starting a closed client is unreliable,
+            # so never reuse an instance that just failed to log in.
+            bot = GiveawayBot(settings, db, redis)
+            wire_commands(bot)
+            current["bot"] = bot
             try:
-                await asyncio.sleep(wait)
-            except asyncio.CancelledError:
-                ready_state["discord"] = "stopped"
-                raise
-            if shutdown_task is not None:
-                await shutdown_task
-                return
-        else:
-            return
+                async with bot:
+                    ready_state["status"] = "online"
+                    ready_state["discord"] = "online"
+                    await bot.start(settings.bot_token)
+                if shutdown_task is not None:
+                    await shutdown_task
+                break
+            except Exception as exc:
+                # A SIGTERM during start() resolves as a clean stop, never a
+                # retry: shutdown_task is only ever created by shutdown().
+                if shutdown_task is not None:
+                    ready_state["discord"] = "stopped"
+                    try:
+                        await shutdown_task
+                    except Exception:
+                        pass
+                    break
+                if not _login_rate_limited(exc):
+                    ready_state["discord"] = "auth-failed"
+                    raise
+                attempt += 1
+                wait = _login_wait(attempt, exc)
+                ready_state["status"] = f"retrying-{attempt}"
+                ready_state["discord"] = "rate-limited"
+                log.warning(
+                    "Discord login rate-limited (attempt %d); retrying in %.1fs"
+                    " — /health stays green (liveness only), /ready reports"
+                    " discord=%s :: %s",
+                    attempt, wait, ready_state["discord"], _login_exc_summary(exc),
+                )
+                try:
+                    await asyncio.sleep(wait)
+                except asyncio.CancelledError:
+                    ready_state["discord"] = "stopped"
+                    raise
+                if shutdown_task is not None:
+                    await shutdown_task
+                    break
+            else:
+                break
+    finally:
+        try:
+            await redis.aclose()
+        except Exception:
+            log.debug("redis close failed", exc_info=True)
 
 
 def run_forever(settings: Settings) -> None:

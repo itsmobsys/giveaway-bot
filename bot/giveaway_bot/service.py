@@ -5,16 +5,37 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .db import Database, _is_ambiguous_loss
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .redis_cache import RedisCache
 
 log = logging.getLogger("giveaway_bot.service")
 
 DAY = 86_400_000
+
+#: TTL of the short-lived read caches. Everything here is derivable from
+#: Turso, so a stale hit only ever costs a few seconds of cosmetic staleness
+#: (a list one giveaway behind, a count one entry behind) -- never a wrong
+#: decision, because every mutating statement re-checks the database itself.
+LIST_CACHE_TTL = 8.0
+#: Guild settings change only through the bot's own command, which clears the
+#: key, so this TTL is just a safety net for a missed invalidation.
+SETTINGS_CACHE_TTL = 10.0
+#: Giveaway-id-shaped keys are self-invalidating: a new giveaway gets a new
+#: id, so its id can never address a *different* giveaway's data.
+GW_CACHE_TTL = 6.0
+COUNT_CACHE_TTL = 4.0
+#: Longest key suffix this bot will cache. Ids are short (gw_xxxxxxxx) and an
+#: unbounded caller-supplied string would let one odd request write an
+#: arbitrarily long key into a 30 MB plan.
+KEY_SUFFIX_MAX = 96
 
 
 def now_ms() -> int:
@@ -137,9 +158,191 @@ class GiveawayService:
     #: the winner announcement has to fit in one Discord message.
     MAX_WINNERS = 25
 
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, redis: RedisCache | None = None) -> None:
         self.db = db
+        #: Optional short-TTL read cache. Turso is the source of truth: every
+        #: write goes straight there, and a cache miss/error/timeout simply
+        #: falls through to a normal query. None = every read hits the DB.
+        self._redis = redis
+        #: Key suffixes whose cached value a just-committed write invalidated.
+        #: The write path is synchronous (it runs inside a worker thread) and
+        #: cannot await a Redis delete, so it records them here and the event
+        #: loop drains the list -- immediately after that same DB call, so the
+        #: next read is live rather than waiting out a TTL. Plain list append
+        #: from worker threads: under the GIL this can lose nothing, and the
+        #: drain/clear below runs on the single event-loop thread.
+        self._pending_invalidations: list[str] = []
+        self._inval_lock = threading.Lock()
         self._rand = secrets.SystemRandom()
+
+    # -- optional redis read cache --------------------------------------
+    async def _cache_get(self, key: str) -> Any | None:
+        """Read one cached value. Never raises; a degraded Redis means None."""
+        cache = self._redis
+        if cache is None:
+            return None
+        try:
+            return await cache.get_json(key)
+        except Exception:
+            # The cache guarantees safe defaults itself; this is a last line
+            # of defence so no cache bug can ever break a user-facing path.
+            log.debug("redis read failed for %s", key, exc_info=True)
+            return None
+
+    async def _cache_get_int(self, key: str) -> int | None:
+        raw = await self._cache_get(key)
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+
+    async def _cache_put(self, key: str, value: Any, ttl: float) -> None:
+        """Best-effort write-through. A failure only costs a later read."""
+        cache = self._redis
+        if cache is None or len(key) > KEY_SUFFIX_MAX:
+            return
+        try:
+            await cache.set_json(key, value, ttl)
+        except Exception:
+            log.debug("redis write failed for %s", key, exc_info=True)
+
+    def _mark_stale(self, *suffixes: str) -> None:
+        """Record keys a committed write just made wrong (never raises)."""
+        if self._redis is None:
+            return
+        try:
+            with self._inval_lock:
+                self._pending_invalidations.extend(suffixes)
+        except Exception:
+            pass
+
+    def drain_invalidations(self) -> list[str]:
+        """Take the pending key suffixes (clearing them) for an async flush."""
+        try:
+            with self._inval_lock:
+                pending = list(self._pending_invalidations)
+                self._pending_invalidations.clear()
+            return pending
+        except Exception:
+            return []
+
+    async def flush_invalidations(self) -> int:
+        """Delete every key a committed write invalidated. Never raises.
+
+        Callers run this right after the write returns, which is still before
+        the user is acknowledged: a member who just joined must not be shown
+        a count or a header served from the pre-join cache.
+        """
+        cache = self._redis
+        pending = self.drain_invalidations()
+        if cache is None or not pending:
+            return 0
+        # Deduplicate: a burst of joins for one giveaway queues the same
+        # count key N times, and one DEL is enough for all of them.
+        unique = list(dict.fromkeys(pending))
+        if len(unique) > 64:
+            unique = unique[:64]
+        try:
+            return await cache.delete(*unique)
+        except Exception:
+            log.debug("redis invalidation flush failed", exc_info=True)
+            return 0
+
+    async def _cache_drop(self, suffix: str) -> None:
+        """Delete one key. Called after a write so the next read is live."""
+        cache = self._redis
+        if cache is None:
+            return
+        try:
+            await cache.delete(suffix)
+        except Exception:
+            log.debug("redis delete failed for %s", suffix, exc_info=True)
+
+    async def _invalidate_guild(self, guild_id: str, giveaway_id: str | None = None) -> None:
+        """Drop everything a finished/cancelled giveaway could have changed.
+
+        Called synchronously inside the write path (after the statement has
+        landed), so the very next read is served from the database rather
+        than from a row that says the giveaway is still running.
+        """
+        cache = self._redis
+        if cache is None or not guild_id:
+            return
+        keys = [f"guild:{guild_id}:active", "all:active"]
+        if giveaway_id:
+            keys.append(f"gw:{giveaway_id}")
+            keys.append(f"count:{giveaway_id}")
+        try:
+            await cache.delete(*keys)
+        except Exception:
+            log.debug("redis invalidation failed for guild %s", guild_id, exc_info=True)
+
+    @staticmethod
+    def _dump(gw: Giveaway) -> dict[str, Any]:
+        """Flat, self-describing snapshot: never a dataclass the cache owns.
+
+        A hand-written shape (rather than asdict) means the cached blob
+        cannot silently break every reader when a field is added.
+        """
+        return {
+            "id": gw.id,
+            "guild_id": gw.guild_id,
+            "channel_id": gw.channel_id,
+            "message_id": gw.message_id,
+            "prize": gw.prize,
+            "winner_count": gw.winner_count,
+            "ends_at": gw.ends_at,
+            "status": gw.status,
+            "required_role_id": gw.required_role_id,
+            "required_role_ids": list(gw.required_role_ids),
+            "blocked_role_id": gw.blocked_role_id,
+            "min_account_age_days": gw.min_account_age_days,
+            "min_messages": gw.min_messages,
+            "image_url": gw.image_url,
+            "entrants_role_id": gw.entrants_role_id,
+            "host_id": gw.host_id,
+            "host_name": gw.host_name,
+            "winners": list(gw.winners),
+            "claim_timeout_seconds": gw.claim_timeout_seconds,
+        }
+
+    @staticmethod
+    def _load_gw(blob: Any) -> Giveaway | None:
+        """Rebuild a Giveaway from a cached blob, or None if it is unusable."""
+        if not isinstance(blob, dict) or not blob.get("id"):
+            return None
+        try:
+            return Giveaway(
+                id=str(blob["id"]),
+                guild_id=str(blob.get("guild_id") or ""),
+                channel_id=str(blob.get("channel_id") or ""),
+                message_id=str(blob["message_id"]) if blob.get("message_id") else None,
+                prize=str(blob.get("prize") or ""),
+                winner_count=int(blob.get("winner_count") or 0),
+                ends_at=int(blob.get("ends_at") or 0),
+                status=str(blob.get("status") or ""),
+                required_role_id=(
+                    str(blob["required_role_id"]) if blob.get("required_role_id") else None
+                ),
+                required_role_ids=[str(r) for r in (blob.get("required_role_ids") or [])],
+                blocked_role_id=(
+                    str(blob["blocked_role_id"]) if blob.get("blocked_role_id") else None
+                ),
+                min_account_age_days=int(blob.get("min_account_age_days") or 0),
+                min_messages=int(blob.get("min_messages") or 0),
+                image_url=str(blob["image_url"]) if blob.get("image_url") else None,
+                entrants_role_id=(
+                    str(blob["entrants_role_id"]) if blob.get("entrants_role_id") else None
+                ),
+                host_id=str(blob["host_id"]) if blob.get("host_id") else None,
+                host_name=str(blob["host_name"]) if blob.get("host_name") else None,
+                winners=[str(w) for w in (blob.get("winners") or [])],
+                claim_timeout_seconds=int(blob.get("claim_timeout_seconds") or 0),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
 
     # -- create ---------------------------------------------------------
     def create(
@@ -199,14 +402,43 @@ class GiveawayService:
                 claim_timeout_seconds,
             ),
         )
+        # A brand-new running giveaway changes both the guild list and the
+        # global list; without this an autocomplete would not offer it until
+        # the 8s TTL lapsed.
+        self._mark_stale(f"guild:{guild_id}:active", "all:active")
         return self.get(gid)
 
     # -- guild settings (one-time notify-role setup) ----------------------
-    def get_notify_role(self, guild_id: str) -> str | None:
+    def _get_notify_role_uncached(self, guild_id: str) -> str | None:
         row = self.db.query_one(
             "SELECT notify_role_id FROM simple_guild_settings WHERE guild_id = ?", (guild_id,)
         )
         return str(row["notify_role_id"]) if row and row.get("notify_role_id") else None
+
+    def get_notify_role(self, guild_id: str) -> str | None:
+        return self._get_notify_role_uncached(guild_id)
+
+    async def get_notify_role_cached(self, guild_id: str) -> str | None:
+        """Guild notify-role, served from the cache when warm.
+
+        A guild that has never set one has no row, so the read is cached as
+        the explicit marker 'none' rather than as an absent key: otherwise a
+        repeat visitor would pay a Turso round trip on every join forever.
+        Returns None for both "not configured" and "cache/DB unavailable" --
+        the caller's behavior (no ping) is identical and never unsafe.
+        """
+        key = f"settings:{guild_id}:notify_role"
+        cached = await self._cache_get(key)
+        if cached == "none":
+            return None
+        if isinstance(cached, str) and cached:
+            return cached
+        try:
+            role = self._get_notify_role_uncached(guild_id)
+        except Exception:
+            return None
+        await self._cache_put(key, role if role else "none", SETTINGS_CACHE_TTL)
+        return role
 
     def set_notify_role(self, guild_id: str, role_id: str | None) -> None:
         self.db.execute(
@@ -214,6 +446,15 @@ class GiveawayService:
             " ON CONFLICT (guild_id) DO UPDATE SET notify_role_id = excluded.notify_role_id",
             (guild_id, role_id),
         )
+    async def invalidate_notify_role(self, guild_id: str) -> None:
+        """Drop the cached notify-role after a write.
+
+        Kept separate from set_notify_role, which must stay synchronous (it is
+        called from the same thread path as the rest of the service). The
+        command that changes the role awaits this right after the UPDATE, so
+        the next reader sees the new value instead of waiting out the TTL.
+        """
+        await self._cache_drop(f"settings:{guild_id}:notify_role")
 
     # -- read -----------------------------------------------------------
     def get(self, giveaway_id: str) -> Giveaway:
@@ -246,6 +487,26 @@ class GiveawayService:
             (max(1, min(limit, 200)),),
         )
         return [Giveaway.from_row(r) for r in rows]
+
+    async def list_active_cached(self, guild_id: str) -> list[Giveaway]:
+        """This guild's active giveaways, from the cache when warm.
+
+        Used by the paths where 8s of staleness is cosmetic (an autocomplete
+        list, a role sweep). Anything that must see a giveaway the moment it
+        appears or disappears keeps calling list_active() directly.
+        """
+        key = f"guild:{guild_id}:active"
+        cached = await self._cache_get(key)
+        if isinstance(cached, list):
+            loaded = [self._load_gw(b) for b in cached]
+            return [g for g in loaded if g is not None]
+        try:
+            live = self.list_active(guild_id)
+        except Exception:
+            raise
+        await self._cache_put(key, [self._dump(g) for g in live], LIST_CACHE_TTL)
+        return live
+
 
     def resolve(self, guild_id: str, raw_id: str) -> Giveaway:
         """Find a giveaway by id, falling back to the live one.
@@ -374,6 +635,21 @@ class GiveawayService:
                 pass
         return true_n
 
+    async def entry_count_cached(self, giveaway_id: str) -> int:
+        """Entry count for display paths, cached briefly.
+
+        Returns the same value entry_count() would, only possibly up to a few
+        seconds old. Display-only: nothing that decides an outcome reads this.
+        """
+        key = f"count:{giveaway_id}"
+        cached = await self._cache_get_int(key)
+        if cached is not None:
+            return cached
+        value = self.entry_count(giveaway_id)
+        if value:
+            await self._cache_put(key, value, COUNT_CACHE_TTL)
+        return value
+
     def _sync_counter(self, giveaway_id: str) -> None:
         """Reset counter to COUNT(*) after a bulk drop (ban/timeout).
 
@@ -394,6 +670,9 @@ class GiveawayService:
                 "UPDATE simple_giveaways SET entrant_count = ? WHERE id = ?",
                 (n, giveaway_id),
             )
+            # The cached display count for this giveaway is now wrong: the rows
+            # were dropped here, not through leave(), so nothing else marks it.
+            self._mark_stale(f"count:{giveaway_id}")
         except Exception:
             pass
 
@@ -922,6 +1201,11 @@ class GiveawayService:
             )
         except Exception:
             pass
+        # The cached display count is now one behind. Both cached numbers are
+        # cosmetic (nothing decides eligibility from them) but a fresh joiner
+        # must not be shown a count that predates their own entry, so it is
+        # dropped rather than left to expire.
+        self._mark_stale(f"count:{gw.id}")
         # fetch_count=False skips the COUNT so the ack never waits on it:
         # the post-ack refresh_snapshot() supplies the count for the embed.
         # -1 means "committed, count unknown"; callers must not print it.
@@ -993,6 +1277,7 @@ class GiveawayService:
                 )
             except Exception:
                 pass
+            self._mark_stale(f"count:{giveaway_id}")
         return removed
 
     # -- end / reroll / cancel ------------------------------------------
@@ -1116,6 +1401,13 @@ class GiveawayService:
                 self.repair_missing_claims(gw.id, now=ts)
             except Exception:
                 pass
+        # The row just flipped to 'ended': the cached header, the cached list
+        # and the cached count are all wrong the moment this commits. mark()
+        # inside the write path is enough -- the caller flushes it before it
+        # acknowledges anyone (see flush_invalidations).
+        self._mark_stale(
+            f"gw:{gw.id}", f"guild:{gw.guild_id}:active", "all:active", f"count:{gw.id}"
+        )
         return self.get(gw.id), winners
 
     def reroll(
@@ -1205,6 +1497,7 @@ class GiveawayService:
                         self.repair_missing_claims(gw.id)
                     except Exception:
                         pass
+                self._mark_stale(f"gw:{gw.id}")
                 return self.get(gw.id), use
         raise ServiceError("Reroll collided with another draw. Try again.")
 
@@ -1709,6 +2002,11 @@ class GiveawayService:
         self.db.execute("DELETE FROM simple_claims WHERE giveaway_id = ?", (giveaway_id,))
         self.db.execute("DELETE FROM simple_entries WHERE giveaway_id = ?", (giveaway_id,))
         self.db.execute("DELETE FROM simple_giveaways WHERE id = ?", (giveaway_id,))
+        # The row is gone: a cached active list still holding it would serve a
+        # giveaway that no longer exists. The guild-scoped list key is not
+        # marked because this path has no guild id to build it from; it ages
+        # out on its own short TTL.
+        self._mark_stale("all:active", f"count:{giveaway_id}")
 
     def cancel(self, giveaway_id: str) -> Giveaway:
         gw = self.get(giveaway_id)
@@ -1724,6 +2022,9 @@ class GiveawayService:
         )
         if not _changed(cur):
             raise ServiceError("Only an active giveaway can be cancelled.")
+        self._mark_stale(
+            f"gw:{gw.id}", f"guild:{gw.guild_id}:active", "all:active", f"count:{gw.id}"
+        )
         return self.get(gw.id)
 
     def set_message(self, giveaway_id: str, message_id: str) -> None:
@@ -1744,6 +2045,7 @@ class GiveawayService:
         )
         if not _changed(cur):
             raise ServiceError("Only a running giveaway can be extended.")
+        self._mark_stale(f"gw:{gw.id}", f"guild:{gw.guild_id}:active", "all:active")
         return self.get(gw.id)
 
     def set_entrants_role(self, giveaway_id: str, role_id: str | None) -> None:
