@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import secrets
@@ -36,6 +37,14 @@ COUNT_CACHE_TTL = 4.0
 #: unbounded caller-supplied string would let one odd request write an
 #: arbitrarily long key into a 30 MB plan.
 KEY_SUFFIX_MAX = 96
+#: Suffixes carried by ONE invalidation DEL. A burst (100 joins) plus the
+#: sweep's list keys can queue far more than this; the rest goes back on the
+#: queue for the next flush instead of being dropped.
+FLUSH_BATCH_MAX = 64
+#: Hard cap on the pending queue itself, so a deployment where nothing flushes
+#: for a long stretch cannot grow it without bound. Over cap the OLDEST
+#: suffixes go: their keys expire on their own TTL (4-10s) anyway.
+PENDING_INVALIDATIONS_MAX = 1024
 
 
 def now_ms() -> int:
@@ -214,7 +223,14 @@ class GiveawayService:
             return
         try:
             with self._inval_lock:
-                self._pending_invalidations.extend(suffixes)
+                pending = self._pending_invalidations
+                pending.extend(suffixes)
+                if len(pending) > PENDING_INVALIDATIONS_MAX:
+                    # Bounded queue: the oldest suffixes are the ones whose
+                    # keys have had the longest to expire on their own TTL.
+                    overflow = len(pending) - PENDING_INVALIDATIONS_MAX
+                    del pending[:overflow]
+                    log.debug("invalidation queue over cap, dropped %d oldest", overflow)
         except Exception:
             pass
 
@@ -231,9 +247,12 @@ class GiveawayService:
     async def flush_invalidations(self) -> int:
         """Delete every key a committed write invalidated. Never raises.
 
-        Callers run this right after the write returns, which is still before
-        the user is acknowledged: a member who just joined must not be shown
-        a count or a header served from the pre-join cache.
+        Callers run this right after the write returns, as best-effort
+        housekeeping: the click paths and the tick schedule it in the
+        background so one DEL can never sit between a commit and the member's
+        answer, and a missed batch is harmless because every cached value
+        expires on its own TTL (4-10s). One DEL carries at most
+        FLUSH_BATCH_MAX suffixes; the rest goes back on the queue.
         """
         cache = self._redis
         pending = self.drain_invalidations()
@@ -242,10 +261,24 @@ class GiveawayService:
         # Deduplicate: a burst of joins for one giveaway queues the same
         # count key N times, and one DEL is enough for all of them.
         unique = list(dict.fromkeys(pending))
-        if len(unique) > 64:
-            unique = unique[:64]
+        if not unique:
+            return 0
+        batch, rest = unique[:FLUSH_BATCH_MAX], unique[FLUSH_BATCH_MAX:]
+        if rest:
+            # More suffixes than one DEL should carry (a 100-entry burst plus
+            # the sweep's list keys). The overflow goes BACK on the queue
+            # instead of being dropped, so nothing has to wait out a TTL, and
+            # the queue is re-capped to keep it bounded across repeated bursts.
+            # The rebuild happens INSIDE the lock: a worker thread that marks a
+            # key stale while this runs must not have its suffix overwritten by
+            # the assignment below.
+            with self._inval_lock:
+                keep = list(dict.fromkeys(rest))
+                keep.extend(k for k in self._pending_invalidations if k not in keep)
+                del keep[PENDING_INVALIDATIONS_MAX:]
+                self._pending_invalidations[:] = keep
         try:
-            return await cache.delete(*unique)
+            return await cache.delete(*batch)
         except Exception:
             log.debug("redis invalidation flush failed", exc_info=True)
             return 0
@@ -434,7 +467,12 @@ class GiveawayService:
         if isinstance(cached, str) and cached:
             return cached
         try:
-            role = self._get_notify_role_uncached(guild_id)
+            # Off the event loop: _get_notify_role_uncached is a blocking Turso
+            # read, and every other DB touch in this process is kept off the
+            # loop (bot._db_call). Awaiting it directly here would freeze
+            # heartbeats, ticks and every button click for the length of one
+            # round trip, with no timeout at all.
+            role = await asyncio.to_thread(self._get_notify_role_uncached, guild_id)
         except Exception:
             return None
         await self._cache_put(key, role if role else "none", SETTINGS_CACHE_TTL)
@@ -500,10 +538,9 @@ class GiveawayService:
         if isinstance(cached, list):
             loaded = [self._load_gw(b) for b in cached]
             return [g for g in loaded if g is not None]
-        try:
-            live = self.list_active(guild_id)
-        except Exception:
-            raise
+        # Same rule as the other cached reads: the fallback is blocking Turso
+        # I/O, so it runs in a worker thread instead of on the event loop.
+        live = await asyncio.to_thread(self.list_active, guild_id)
         await self._cache_put(key, [self._dump(g) for g in live], LIST_CACHE_TTL)
         return live
 
@@ -645,7 +682,10 @@ class GiveawayService:
         cached = await self._cache_get_int(key)
         if cached is not None:
             return cached
-        value = self.entry_count(giveaway_id)
+        # Off the event loop for the same reason as the notify-role read: the
+        # counter fallback (and the legacy-row heal it may run) is blocking
+        # Turso I/O, and a display number must never stall the loop.
+        value = await asyncio.to_thread(self.entry_count, giveaway_id)
         if value:
             await self._cache_put(key, value, COUNT_CACHE_TTL)
         return value
@@ -1403,8 +1443,11 @@ class GiveawayService:
                 pass
         # The row just flipped to 'ended': the cached header, the cached list
         # and the cached count are all wrong the moment this commits. mark()
-        # inside the write path is enough -- the caller flushes it before it
-        # acknowledges anyone (see flush_invalidations).
+        # inside the write path is enough: the click paths and the tick fire a
+        # best-effort flush right after the write (see flush_invalidations),
+        # and whatever misses that -- /giveaway_cancel, /giveaway_extend -- is
+        # left to the key's own TTL (4-10s), because each cached value is
+        # derivable from Turso and never decides anything.
         self._mark_stale(
             f"gw:{gw.id}", f"guild:{gw.guild_id}:active", "all:active", f"count:{gw.id}"
         )

@@ -15,7 +15,9 @@ only source of truth in all of them.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
+import threading
 import time
 import unittest
 import uuid
@@ -65,6 +67,11 @@ class FakeRedis:
             if self.data.pop(key, None) is not None:
                 removed += 1
         return removed
+
+    async def aclose(self) -> None:
+        # The cache closes its client on shutdown; the fake only has to survive
+        # the call (the bot's close() path reaches it in the end tests).
+        self.calls.append(("aclose", (), {}))
 
     async def eval(self, script: str, numkeys: int, *args):
         self.calls.append(("eval", (script, numkeys, *args), {}))
@@ -171,7 +178,9 @@ class CachedCountTests(ServiceTestCase):
         self.join(gw, "5" * 18)
         asyncio.run(self.svc.flush_invalidations())
         self.assertEqual(
-            asyncio.run(self.svc.entry_count_cached(gw.id)), 1, "the stale key must not survive"
+            asyncio.run(self.svc.entry_count_cached(gw.id)),
+            1,
+            "the flush must have dropped the key the join invalidated",
         )
         reads = self.count_reads()
         self.assertEqual(asyncio.run(self.svc.entry_count_cached(gw.id)), 1)
@@ -225,6 +234,85 @@ class CachedSettingsTests(ServiceTestCase):
         self.svc.set_notify_role(self.guild, "4242")
         asyncio.run(self.svc.invalidate_notify_role(self.guild))
         self.assertEqual(asyncio.run(self.svc.get_notify_role_cached(self.guild)), "4242")
+
+
+class OffLoopFallbackTests(ServiceTestCase):
+    """A cache miss falls back to BLOCKING Turso I/O, so it must leave the loop.
+
+    Awaiting one of these readers directly runs sqlite3/Turso work on the event
+    loop and freezes heartbeats, the tick and every click for the length of a
+    round trip -- with no timeout at all. These tests fail if that ever comes
+    back: each one replaces the blocking fallback with a slow spy and checks
+    both that it ran on another thread and that the loop kept running while it
+    was there.
+    """
+
+    def _spy(self, name: str):
+        """Make one sync fallback slow, and remember which thread ran it."""
+        seen: dict = {}
+        original = getattr(self.svc, name)
+
+        def blocking(*args, **kwargs):
+            seen["thread"] = threading.get_ident()
+            time.sleep(0.15)
+            return original(*args, **kwargs)
+
+        setattr(self.svc, name, blocking)  # type: ignore[method-assign]
+        return seen
+
+    def _ticks_during(self, call) -> tuple[object, int]:
+        """Run one cached read while a concurrent task counts its own steps."""
+
+        async def run() -> tuple[object, int]:
+            ticks = 0
+
+            async def ticker() -> None:
+                nonlocal ticks
+                while True:
+                    await asyncio.sleep(0.005)
+                    ticks += 1
+
+            task = asyncio.get_running_loop().create_task(ticker())
+            try:
+                result = await call()
+            finally:
+                task.cancel()
+            return result, ticks
+
+        return asyncio.run(run())
+
+    def test_the_count_fallback_leaves_the_event_loop(self) -> None:
+        gw = self.make()
+        self.join(gw, "1" * 18)
+        seen = self._spy("entry_count")
+        value, ticks = self._ticks_during(lambda: self.svc.entry_count_cached(gw.id))
+        self.assertEqual(value, 1, "the fallback still answers correctly")
+        self.assertNotEqual(
+            seen.get("thread"),
+            threading.get_ident(),
+            "entry_count ran its blocking Turso read on the event loop",
+        )
+        self.assertGreater(ticks, 0, "the loop kept running while the read was in a thread")
+
+    def test_the_notify_role_fallback_leaves_the_event_loop(self) -> None:
+        self.svc.set_notify_role(self.guild, "4242")
+        seen = self._spy("_get_notify_role_uncached")
+        value, ticks = self._ticks_during(
+            lambda: self.svc.get_notify_role_cached(self.guild)
+        )
+        self.assertEqual(value, "4242")
+        self.assertNotEqual(seen.get("thread"), threading.get_ident())
+        self.assertGreater(ticks, 0)
+
+    def test_the_active_list_fallback_leaves_the_event_loop(self) -> None:
+        gw = self.make()
+        seen = self._spy("list_active")
+        value, ticks = self._ticks_during(
+            lambda: self.svc.list_active_cached(self.guild)
+        )
+        self.assertEqual([g.id for g in value], [gw.id], "the fallback still lists the live giveaway")
+        self.assertNotEqual(seen.get("thread"), threading.get_ident())
+        self.assertGreater(ticks, 0)
 
 
 class RedisOutageTests(unittest.IsolatedAsyncioTestCase):
@@ -447,5 +535,136 @@ class SweepLeaseTests(CachedBotTestCase):
         )
 
 
-if __name__ == "__main__":
+class FlushOverflowTests(ServiceTestCase):
+    """A flush drops at most one DEL batch, and nothing is lost to the cap."""
+
+    def sent_batches(self) -> list[list[str]]:
+        return [list(call[1]) for call in self.fake.calls if call[0] == 'delete']
+
+    def test_a_full_batch_is_sent_and_the_overflow_stays_queued(self) -> None:
+        queued = [f'suffix:{index}' for index in range(80)]
+        self.svc._mark_stale(*queued)
+        asyncio.run(self.svc.flush_invalidations())
+        batches = self.sent_batches()
+        self.assertEqual(len(batches), 1, 'one DEL per flush')
+        self.assertEqual(len(batches[0]), 64, 'the batch is capped at FLUSH_BATCH_MAX')
+        self.assertEqual(batches[0][0], f'gwbot:v1:{queued[0]}')
+        # Read the queue directly: draining here would eat the very suffixes
+        # the next flush is supposed to send.
+        self.assertEqual(
+            self.svc._pending_invalidations,
+            queued[64:],
+            'the overflow is re-queued in order, not dropped',
+        )
+        asyncio.run(self.svc.flush_invalidations())
+        batches = self.sent_batches()
+        self.assertEqual([len(batch) for batch in batches], [64, 16])
+        self.assertEqual(batches[1][0], f'gwbot:v1:{queued[64]}')
+        self.assertEqual(self.svc.drain_invalidations(), [], 'the queue ends empty')
+        sent = [key for batch in batches for key in batch]
+        self.assertEqual(len(set(sent)), 80, 'every queued suffix went out exactly once')
+
+    def test_the_pending_queue_is_bounded_and_keeps_the_newest(self) -> None:
+        queued = [f'queue:{index}' for index in range(3000)]
+        self.svc._mark_stale(*queued)
+        pending = self.svc.drain_invalidations()
+        self.assertEqual(len(pending), 1024, 'PENDING_INVALIDATIONS_MAX caps the queue')
+        self.assertEqual(pending[-1], 'queue:2999', 'the newest suffix is kept')
+        self.assertEqual(pending[0], 'queue:1976', 'the oldest suffixes made room')
+
+
+class BackgroundFlushTests(CachedBotTestCase):
+    """A cache DEL is housekeeping: it never sits on the reply path."""
+
+    def drain_bg(self) -> None:
+        """Run the bot's background tasks the way a live loop would."""
+
+        async def run() -> None:
+            await asyncio.sleep(0)
+            pending = list(self.bot._bg_tasks)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        asyncio.run(run())
+
+    def test_a_click_still_answers_when_the_cache_never_answers(self) -> None:
+        # A Redis that hangs until the cache's own timeout: 2.0 + 1.5 + 0.5s.
+        self.bot.service._redis = hanging_cache()
+        gw = self.make()
+        member = FakeMember(444444444444444444)
+        started = time.monotonic()
+        interaction = self.press_join(gw.id, member)
+        elapsed = time.monotonic() - started
+        self.assertTrue(any("You're in!" in text for text in interaction.texts))
+        self.assertLess(elapsed, 4.0, 'the reply must not wait out the cache timeout')
+        self.assertTrue(self.svc.has_entry(gw.id, str(member.id)))
+
+    def test_the_join_invalidation_is_scheduled_not_awaited(self) -> None:
+        gw = self.make()
+        member = FakeMember(333333333333333333)
+        self.press_join(gw.id, member)
+        self.assertTrue(
+            any(not task.done() for task in self.bot._bg_tasks)
+            or any(name.endswith(f"count:{gw.id}") for name in self.fake.data)
+            or self.fake.data == {},
+            'the flush must be background work, not a blocking await',
+        )
+        self.drain_bg()
+
+    def test_a_leave_is_answered_before_the_queued_keys_go(self) -> None:
+        gw = self.make()
+        member = FakeMember(222222222222222222)
+        self.press_join(gw.id, member)
+        self.drain_bg()
+        interaction = FakeInteraction(
+            guild=FakeGuild(self.guild, [member]), user=member
+        )
+        asyncio.run(self.bot.handle_leave(interaction, gw.id))
+        self.assertIn('You left the giveaway.', interaction.texts)
+        self.assertEqual(
+            [key for key in self.fake.data if key.endswith(f"count:{gw.id}")],
+            [],
+            'the queued count key is dropped in the background',
+        )
+
+
+class SweepLeaseTests2(SweepLeaseTests):
+    """The lease is freed even when the sweep body dies half way."""
+
+    def test_a_failed_live_list_still_frees_the_lease(self) -> None:
+        self.make()
+
+        def boom(limit=200):
+            raise OSError('turso down')
+
+        self.bot.service.list_all_active = boom  # type: ignore[method-assign]
+        # The failure is expected and logged as an exception; silence it so the
+        # suite output stays readable instead of asserting on the logger.
+        logging.disable(logging.CRITICAL)
+        try:
+            asyncio.run(self.bot.tick.coro(self.bot))
+        finally:
+            logging.disable(logging.NOTSET)
+        self.assertEqual(
+            [key for key in self.fake.data if key.endswith('sweep:live')],
+            [],
+            'a failed sweep must not leak the lease it took',
+        )
+        self.assertEqual(self.bot._last_list_refresh, 0.0)
+
+
+def hanging_cache(delay: float = 30.0) -> RedisCache:
+    """A Redis that accepts nothing: every call sleeps past the cache timeout."""
+
+    class Hanging:
+        async def __getattr__(self, name):
+            async def call(*args, **kwargs):
+                await asyncio.sleep(delay)
+
+            return call
+
+    return RedisCache(url='redis://example.invalid:6379/0', connect=lambda: Hanging())
+
+
+if __name__ == '__main__':
     unittest.main()

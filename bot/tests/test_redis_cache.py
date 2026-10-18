@@ -6,7 +6,7 @@ import asyncio
 import json
 import unittest
 
-from giveaway_bot.redis_cache import RedisCache
+from giveaway_bot.redis_cache import OP_CEILING_PER_SEC, RedisCache
 
 
 class FakeClock:
@@ -189,6 +189,79 @@ class BudgetTests(unittest.IsolatedAsyncioTestCase):
         # The bucket refills over time.
         clock.advance(1.0)
         self.assertEqual(await cache.get("k"), "v")
+
+    async def test_a_sliding_second_stays_under_the_plan_ceiling(self) -> None:
+        """The plan's limit is OPS PER SECOND, so whole seconds must be checked.
+
+        A token bucket cannot promise anything about an interval: it can promise
+        that a burst of its capacity plus one second of refill fits in a second.
+        With capacity == rate that sum is 2*rate, which overshoots the managed
+        plan's ceiling (measured 159 ops in one second at rate 80) even though
+        the sustained rate is exactly right.
+        """
+        fake = FakeRedis()
+        clock = FakeClock()
+        rate = 80.0
+        cache = cache_for(fake, op_budget_per_sec=rate, clock=clock)
+        fake.data["gwbot:v1:k"] = "v"
+        stamps: list[float] = []
+        # One instant: the bucket's whole allowance, with no time passing.
+        for _ in range(int(rate * 2)):
+            if await cache.get("k") == "v":
+                stamps.append(clock.now)
+        # Then exactly one interval between attempts, for 2.0s of virtual time.
+        for _ in range(int(rate * 2)):
+            clock.advance(1.0 / rate)
+            if await cache.get("k") == "v":
+                stamps.append(clock.now)
+        self.assertGreater(len(stamps), rate, "the bucket must still serve its allowance")
+        worst = max(sum(1 for t in stamps if s <= t < s + 1.0) for s in stamps)
+        self.assertLessEqual(
+            worst,
+            OP_CEILING_PER_SEC,
+            f"{worst} ops inside one sliding second exceeds the plan ceiling",
+        )
+
+    async def test_a_partial_interval_buys_nothing(self) -> None:
+        """A partly elapsed interval is not a token, however many callers ask."""
+        fake = FakeRedis()
+        clock = FakeClock()
+        cache = cache_for(fake, op_budget_per_sec=80.0, clock=clock)
+        fake.data["gwbot:v1:k"] = "v"
+        served = 0
+        while await cache.get("k") == "v":  # drain the whole burst allowance
+            served += 1
+        self.assertGreater(served, 0)
+        gets = len([c for c in fake.calls if c[0] == "get"])
+        clock.advance(0.005)  # half an interval at 80/s (0.0125s)
+        self.assertEqual(
+            [await cache.get("k") for _ in range(40)],
+            [None] * 40,
+            "half an interval must not pay for 40 ops",
+        )
+        self.assertEqual(len([c for c in fake.calls if c[0] == "get"]), gets)
+        # One whole interval buys exactly one op -- not two.
+        clock.advance(0.0125)
+        await cache.get("k")
+        await cache.get("k")
+        self.assertEqual(
+            len([c for c in fake.calls if c[0] == "get"]),
+            gets + 1,
+            "one interval, one op",
+        )
+
+    async def test_the_sustained_rate_is_the_ceiling(self) -> None:
+        """Over a long window the bucket may send no more than rate + capacity."""
+        fake = FakeRedis()
+        clock = FakeClock()
+        rate = 10.0
+        cache = cache_for(fake, op_budget_per_sec=rate, clock=clock)
+        for _ in range(500):
+            clock.advance(0.01)  # one interval (0.1s) every ten calls: 5.0s
+            await cache.get("k")
+        sends = len([c for c in fake.calls if c[0] == "get"])
+        self.assertLessEqual(sends, rate * 5.0 + rate, "capacity plus five seconds of refill")
+        self.assertGreaterEqual(sends, rate, "the bucket must still serve its allowance")
 
 
 class OperationTests(unittest.IsolatedAsyncioTestCase):

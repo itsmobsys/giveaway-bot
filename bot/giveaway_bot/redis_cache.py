@@ -8,8 +8,12 @@ module may raise into a click handler.
 
 Two defences protect the managed plan (30 connections, 100 ops/sec):
 
-* a token-bucket governor that silently SKIPS operations over budget, so the
-  bot can never blow the plan ceiling — a skip looks exactly like a miss;
+* a token-bucket governor that silently SKIPS operations over budget, so ONE
+  process can never exceed the plan ceiling in any sliding second — a skip
+  looks exactly like a miss. The budget is PER PROCESS: overlapping instances
+  (a free-plan restart leaves two alive for a moment) each run their own
+  bucket, so the aggregate peaks at the number of live processes times the
+  per-process worst second. A single-process bucket cannot bound that;
 * a circuit breaker that stops hammering a dead server for a cooldown.
 
 Keys handed in by callers are SUFFIXES ('gw:gw_ab12', 'count:gw_ab12'); the
@@ -52,6 +56,12 @@ end
 return n
 """
 
+#: The managed plan's own ceiling, in ops/sec. The governor promises to keep
+#: a SLIDING SECOND under this, which is a stricter promise than keeping the
+#: sustained rate right: the worst second a token bucket can produce is
+#: capacity + rate (spend the whole bucket, then earn a second of refill).
+OP_CEILING_PER_SEC = 100.0
+
 _HOST_PORT = re.compile(r"\b[A-Za-z0-9_.-]+:\d{2,5}\b")
 _LONG_SECRET = re.compile(r"\b[A-Za-z0-9_\-]{24,}\b")
 
@@ -79,7 +89,15 @@ class _Budget:
 
     def __init__(self, rate: float, clock: Callable[[], float]) -> None:
         self.rate = max(1.0, float(rate))
-        self.capacity = self.rate
+        #: The burst allowance is capped so that even the worst sliding second
+        #: stays inside the plan ceiling: capacity + rate <= OP_CEILING_PER_SEC.
+        #: Spending a WHOLE rate instantly (the old rule) let one process emit
+        #: 2 x rate ops inside a single second -- measured 159 ops against a
+        #: 100 ops/sec ceiling at the shipped 80/s, while the sustained rate
+        #: was exactly right. A rate at or above the ceiling cannot be bounded
+        #: by a single bucket; capacity then floors at one token and the
+        #: configured rate is left saying what it says.
+        self.capacity = max(1.0, min(self.rate, OP_CEILING_PER_SEC - self.rate))
         self._tokens = self.capacity
         self._clock = clock
         self._stamp = clock()
@@ -447,7 +465,7 @@ class RedisCache:
         """One-line, log-safe summary of the configuration (no endpoint)."""
         return (
             f"max_connections={self._max_connections},"
-            f" budget={self._budget.rate:.0f} ops/s,"
+            f" budget={self._budget.rate:.0f} ops/s (burst {self._budget.capacity:.0f}),"
             f" breaker={self._breaker_threshold}"
         )
 

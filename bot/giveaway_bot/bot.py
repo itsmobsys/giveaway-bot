@@ -1080,12 +1080,15 @@ class GiveawayBot(commands.Bot):
         # landed, so a dead read still acks honestly, just without the
         # number). The same pair feeds grant-vs-take + refresh with zero
         # further trips.
-        # Invalidation before ack: join() queued the keys its own write just
-        # made wrong (the cached display count) and this drains them in one
-        # DEL. It happens here -- after the Turso commit, before the member is
-        # told anything -- so the number they are shown can never come from a
-        # snapshot that pre-dates their own entry.
-        await self._flush_invalidation()
+        # join() queued the keys its own write just made wrong (the cached
+        # display count). The DEL runs as background work: a cache hop must
+        # never sit between the commit and the member's answer, and on a
+        # blackholed Redis one awaited DEL costs the full cache timeout. The
+        # number the member is told comes out of the join snapshot already in
+        # hand, never from the cache, and anything that does read the count
+        # heals on its 4s TTL -- Turso decided this entry, so a stale display
+        # number is cosmetic.
+        self._spawn_bg(self._flush_invalidation())
         # A committed join is the only thing that sets this marker: the
         # refusal branch above never reaches here, so a refused click can
         # never poison the next one.
@@ -1234,13 +1237,17 @@ class GiveawayBot(commands.Bot):
         # "already entered" for up to ENTERED_TTL.
         if removed:
             self._clear_entered(giveaway_id, str(interaction.user.id))
-        # leave() queued the display-count key it just made wrong; drain it
-        # before the reply so the number the member sees next cannot be the
-        # pre-leave one, and the embed refreshed below shows the true total.
-        await self._flush_invalidation()
+        # Reply first, drop the queued keys afterwards. leave() queued the
+        # display-count key it just made wrong, but a slow Redis DEL must
+        # never sit between the member's action and their answer: the count
+        # key heals on its 4s TTL either way, and the refreshed embed below
+        # is what actually shows the new total. The DEL runs on a background
+        # task so a blackholed Redis (one DEL = the full 4s timeout) cannot
+        # delay it either.
         await self._safe_followup(
             interaction, "You left the giveaway." if removed else "You were not entered."
         )
+        self._spawn_bg(self._flush_invalidation())
         if not removed:
             return
         try:
@@ -1302,6 +1309,10 @@ class GiveawayBot(commands.Bot):
                 log.exception("end failed for %s", gw.id)
                 continue
             self._gw_drop(gw.id)
+            # end() queued the keys its flip invalidated (header, guild list,
+            # global list, count). Fire-and-forget so a slow Redis DEL never
+            # delays the announcement, which is what members actually see.
+            self._spawn_bg(self._flush_invalidation())
             try:
                 await self._announce(ended, winners)
             except Exception:
@@ -1334,6 +1345,9 @@ class GiveawayBot(commands.Bot):
                 log.exception("claim expiry failed for %s/%s", gid, uid)
                 continue
             log.info("claim expired for %s/%s; replacement=%s", gid, uid, fresh)
+            # expire_claim() rerolled the winner, so the count + list keys it
+            # invalidated are dropped in the background (same reason as end).
+            self._spawn_bg(self._flush_invalidation())
             if fresh:
                 try:
                     await self._announce(ended_claim, fresh, reroll=True)
@@ -1372,26 +1386,32 @@ class GiveawayBot(commands.Bot):
             # exactly as it was before Redis existed, or a broken cache
             # would quietly freeze the lists and every countdown.
             may_sweep = lease is not None or not answered
-        if due and may_sweep:
-            try:
+        try:
+            if due and may_sweep:
                 live = await self._db_call(self.service.list_all_active, 200)
-            except Exception:
-                log.exception("live list failed")
-                return
-            self._cache_autocomplete(live)
-            try:
-                ended_list = await self._db_call(self.service.list_all_ended, 200)
-            except Exception:
-                log.exception("ended list failed")
-                ended_list = []
-            self._cache_ended_autocomplete(ended_list)
-            self._last_list_refresh = now_mono
-            await self._refresh_embeds(self._refresh_window(live))
-        if lease is not None:
-            try:
-                await self.redis.release("sweep:live", lease)
-            except Exception:
-                log.debug("sweep lease release failed", exc_info=True)
+                self._cache_autocomplete(live)
+                try:
+                    ended_list = await self._db_call(self.service.list_all_ended, 200)
+                except Exception:
+                    log.exception("ended list failed")
+                    ended_list = []
+                self._cache_ended_autocomplete(ended_list)
+                self._last_list_refresh = now_mono
+                await self._refresh_embeds(self._refresh_window(live))
+        except Exception:
+            # A failed live-list read used to return from here and leak the
+            # lease: this process would then get its OWN token back on the
+            # next tick and read it as "somebody else is sweeping", skipping
+            # the window on every instance for the rest of the 90s TTL. The
+            # sweep body is exactly as unconditional as it was before Redis;
+            # only freeing the lease is new, and it happens on every path.
+            log.exception("live list failed")
+        finally:
+            if lease is not None:
+                try:
+                    await self.redis.release("sweep:live", lease)
+                except Exception:
+                    log.debug("sweep lease release failed", exc_info=True)
         # Privacy sweep: join data (who entered) older than 5h past the end
         # is wiped. Giveaway records + winner lists stay; message counts are
         # already cleared at end-time.

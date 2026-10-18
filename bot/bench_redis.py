@@ -42,7 +42,7 @@ BUDGET_READS = 5  # reads attempted with the op budget already spent
 THROTTLE_OPS_PER_SEC = 1.0
 WRONG_TOKEN = "0" * 32
 CLEANUP_TRIES = 3
-SETTLE_S = 1.0  # refills a drained bucket (capacity 80, refill 80/sec)
+SETTLE_S = 1.0  # refills a drained bucket (refill 80/sec caps at capacity 20)
 
 # redis_cache.py logs its one-per-outage warning with the driver's own
 # exception text. That scrubber is good but not a proof, so this script
