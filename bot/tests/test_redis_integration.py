@@ -529,6 +529,11 @@ class RequestTimeProbeTests(CachedBotTestCase):
         self.assertNotIn("**failed**", text, "a live fake must not report a failed leg")
         self.assertIn("set(s)", text, "the probe's own SET+DEL are counted")
         self.assertIn("Warm cache legs", text)
+        # The cached path leads, with its Turso twin right beside it.
+        self.assertIn("Cached reads this request", text)
+        self.assertIn("Redis (cache) vs Turso (database), same key", text)
+        self.assertIn("repeat click", text.lower())
+        self.assertIn("Same click on a cold cache", text)
         # The probe cleans up after itself in Redis as well as in Turso.
         self.assertNotIn("gwbot:v1:probe:gw_request_time", self.fake.data)
 

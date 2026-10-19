@@ -2489,18 +2489,18 @@ def wire_commands(bot: GiveawayBot) -> None:
     async def gw_request_time(interaction: discord.Interaction) -> None:
         """Live cost of one request, timed leg by leg — not a gateway ping.
 
-        Each leg runs the same call the Join button pays (Redis cache reads,
-        join-shaped SELECT, guarded write, Discord ack + REST send) and times
-        it with perf_counter, lane queue + thread hop included, so the numbers
-        are this server's real Redis + Turso + Discord latency right now.
-
-        The Redis legs and the two cache-warm reads are measured, not
+        The reads are timed twice on their real keys: once from the cache
+        (Redis hit) and once on a cache miss (the Turso read it replaces), so
+        the top of the report shows the cached path a repeat click takes with
+        its Turso twin directly beside it. The Redis legs are measured, never
         simulated: one PING through the governed client, then the real cached
-        readers on their real keys, reported as a HIT or a MISS with the
-        matching cost. A command that showed only the warm path would look
-        fast while saying nothing, so the cold path is always printed next to
-        it. Ephemeral; the write probe touches one probe-only Redis key and
-        one probe-only Turso row and removes both right after.
+        readers reported as HIT or MISS with the matching cost.
+
+        The Turso legs below them are the fallback path — a cache miss, or
+        Redis being down — plus the write every join still pays to Turso,
+        because a join only counts once that write succeeds. Ephemeral; the
+        write probes touch one probe-only Redis key and one probe-only Turso
+        row and remove both right after.
         """
         if interaction.guild is None:
             try:
@@ -2830,6 +2830,34 @@ def wire_commands(bot: GiveawayBot) -> None:
         def _fmt(value: float | None) -> str:
             return f"{value:.0f}ms" if value is not None else "failed"
 
+        # The two paths a real click can take for its reads. Both are honest:
+        # the warm twin is what a repeat click pays, the cold twin is the same
+        # request before the cache is filled (Redis miss + the Turso read).
+        cached_click_ms = (
+            warm_total_ms + write_ms
+            if warm_total_ms is not None and write_ms is not None
+            else None
+        )
+        uncached_click_ms = (
+            cold_total_ms + write_ms
+            if cold_total_ms is not None and write_ms is not None
+            else None
+        )
+        if warm_total_ms is None or cold_total_ms is None:
+            compare_txt = "n/a"
+        else:
+            saved = cold_total_ms - warm_total_ms
+            compare_txt = (
+                f"**{warm_total_ms:.0f}ms cached** vs **{cold_total_ms:.0f}ms "
+                f"on a cache miss** (same key, same request)"
+                + (f" — {saved:.0f}ms less per repeat read" if saved > 0 else "")
+            )
+
+        def _agg(value: float | None) -> str:
+            # An aggregate that was never measured must read as "n/a", never as
+            # a fast zero.
+            return f"{value:.0f}ms" if value is not None else "n/a"
+
         def _ops() -> str:
             if cache_gets is None:
                 return "n/a"
@@ -2875,19 +2903,27 @@ def wire_commands(bot: GiveawayBot) -> None:
             warm_txt = f"{cold_total_ms:.0f}ms cold -> {warm_total_ms:.0f}ms warm"
         lines = [
             "Request-time breakdown — live legs, timed just now:",
+            f"• Cached reads this request (repeat click): **{_agg(warm_total_ms)}**"
+            " — same keys served from the cache, no Turso read at all",
+            f"• Redis (cache) vs Turso (database), same key: {compare_txt}",
             f"• Discord ack (defer): **{_fmt(ack_ms)}**",
             f"• Discord reply (REST send): **{_fmt(rest_ms)}**",
+            "• — Redis: the path a repeat click's reads take —",
             f"• Redis ping: **{_fmt(redis_ms)}** — {redis_note or 'n/a'}",
             f"• Redis cache count: **{_fmt(count_ms)}** — {count_note or 'n/a'}",
             f"• Redis cache notify-role: **{_fmt(role_ms)}** — {role_note or 'n/a'}",
             f"• Redis write: **{_fmt(redis_probe_ms)}** — {redis_probe_note or 'n/a'}",
             f"• Redis ops this command: {_ops()}",
+            "• — the legs below are the fallback path (cache miss) and the "
+            "write every join still pays to Turso —",
             f"• Turso ping: **{_fmt(ping_ms)}** — {ping_note or 'n/a'}",
             f"• Turso lookup (list_active): **{_fmt(lookup_ms)}** — {lookup_note or 'n/a'}",
             f"• Turso read: **{_fmt(read_ms)}** — {read_note or 'n/a'}",
             f"• Turso write: **{_fmt(write_ms)}** — {write_note or 'n/a'}",
             f"• Gateway heartbeat: **{gw_txt}** (websocket, for reference)",
             f"• Event-loop lag: **{lag_txt}** (sleep(0) sample, for reference)",
+            f"• Repeat click, reads + must-succeed Turso write: **{_agg(cached_click_ms)}**",
+            f"• Same click on a cold cache: **{_agg(uncached_click_ms)}**",
             f"• Total measured: **{total_ms:.0f}ms** (excludes this message's edit)",
             f"• Warm cache legs (2nd run, what a repeat click pays): **{warm_txt}** —"
             " timed in this same command, next to the cold/Turso legs above",
