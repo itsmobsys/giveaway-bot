@@ -1602,6 +1602,121 @@ class DbStatsTests(ServiceTestCase):
         self.assertEqual(stats["reads"], 0)
 
 
+class RoundTripBudgetTests(ServiceTestCase):
+    """Statement budgets for the hot DB paths, measured against real SQLite."""
+
+    def test_message_flush_reads_once_per_chunk(self) -> None:
+        rows = [(self.guild, f"u{i:05d}", 1) for i in range(300)]
+        self.db.reset_stats()
+        self.assertEqual(self.svc.add_message_counts(rows), 300)
+        stats = self.db.get_stats()
+        self.assertEqual(stats["reads"], 1, "one batched snapshot read per chunk")
+        self.assertEqual(stats["writes"], 1, "one multi-row insert per chunk")
+
+    def test_ambiguous_flush_still_requeues_only_missing_keys(self) -> None:
+        # The write landed for one key but its response was lost: the retry
+        # must add only the other key, preserving the arithmetic the old
+        # per-key snapshot/reconcile pair used.
+        original = self.db.execute
+        rows = [(self.guild, "a" * 18, 2), (self.guild, "b" * 18, 3)]
+
+        def partial(sql, params=()):
+            if sql.startswith("INSERT INTO simple_message_counts"):
+                original(
+                    "INSERT INTO simple_message_counts (guild_id, user_id, count)"
+                    " VALUES (?, ?, ?)",
+                    (self.guild, "a" * 18, 2),
+                )
+                raise OSError("connection reset by peer")
+            return original(sql, params)
+
+        with self.assertRaises(PartialFlush), unittest.mock.patch.object(
+            self.db, "execute", partial
+        ):
+            self.svc.add_message_counts(rows)
+        # The landed key is not requeued at all; the missing key is requeued
+        # whole and the list keeps its length (the padding adds delta 0).
+        self.assertEqual([uid for _g, uid, _d in rows if uid == "a" * 18], [])
+        self.assertEqual(
+            sum(delta for _g, uid, delta in rows if uid == "b" * 18), 3
+        )
+        self.assertEqual(self.svc.add_message_counts(rows), len(rows))
+        self.assertEqual(self.svc.message_count(self.guild, "a" * 18), 2)
+        self.assertEqual(self.svc.message_count(self.guild, "b" * 18), 3)
+
+    def test_start_claims_is_one_write(self) -> None:
+        gw = self.make(winner_count=10, claim_timeout_seconds=3600)
+        winners = [str(500000 + i) for i in range(10)]
+        self.db.reset_stats()
+        self.svc.start_claims(gw, winners, now=now_ms())
+        stats = self.db.get_stats()
+        self.assertEqual(stats["writes"], 1, "one multi-row claim insert")
+        self.assertEqual(stats["reads"], 0)
+        rows = self.db.query(
+            "SELECT user_id, status FROM simple_claims WHERE giveaway_id = ?", (gw.id,)
+        )
+        self.assertEqual({str(r["user_id"]) for r in rows}, set(winners))
+        self.assertTrue(all(str(r["status"]) == "pending" for r in rows))
+
+    def test_empty_giveaway_count_is_known_zero(self) -> None:
+        gw = self.make()
+        self.db.reset_stats()
+        self.assertEqual(self.svc.entry_count(gw.id), 0)
+        self.assertEqual(self.db.get_stats()["reads"], 1, "0 is an answer, not a miss")
+        self.db.reset_stats()
+        self.assertEqual(self.svc.entry_count(gw.id), 0)
+        self.assertEqual(self.db.get_stats()["reads"], 1, "and it stays one read")
+
+    def test_draw_reads_only_user_ids(self) -> None:
+        gw = self.make(winner_count=2)
+        users = [str(10 ** 17 + i) for i in range(5)]
+        for uid in users:
+            self.join(gw, user_id=uid)
+        original = self.svc.entry_user_ids
+        calls: list[str] = []
+
+        def spy(giveaway_id: str) -> list[str]:
+            calls.append(giveaway_id)
+            return original(giveaway_id)
+
+        with unittest.mock.patch.object(
+            self.svc, "entry_user_ids", side_effect=spy
+        ), unittest.mock.patch.object(
+            self.svc,
+            "entries",
+            side_effect=AssertionError("the draw must not read display columns"),
+        ):
+            ended, winners = self.svc.end(gw.id)
+        self.assertEqual(calls, [gw.id], "exactly one user-id-only pool read")
+        self.assertEqual(len(winners), 2)
+        self.assertEqual(ended.entrant_count, len(users))
+
+    def test_end_reads_the_row_once_after_the_flip(self) -> None:
+        gw = self.make(winner_count=2)
+        for i in range(5):
+            self.join(gw, user_id=str(10 ** 17 + i))
+        self.db.reset_stats()
+        ended, winners = self.svc.end(gw.id)
+        stats = self.db.get_stats()
+        self.assertLessEqual(stats["reads"], 2, "pre-flip get + one pool read")
+        self.assertEqual(stats["writes"], 2, "the flip + the message-count wipe")
+        self.assertEqual(ended.status, "ended")
+        self.assertEqual(sorted(ended.winners), sorted(winners))
+        self.assertEqual(ended.entrant_count, 5)
+
+    def test_healthy_claim_repair_does_not_write(self) -> None:
+        gw = self.make(winner_count=2, claim_timeout_seconds=3600)
+        for i in range(4):
+            self.join(gw, user_id=str(10 ** 17 + i))
+        ended, winners = self.svc.end(gw.id)
+        self.assertEqual(len(winners), 2)
+        self.db.reset_stats()
+        self.assertEqual(self.svc.repair_missing_claims(ended.id), 0)
+        stats = self.db.get_stats()
+        self.assertEqual(stats["writes"], 0, "every claim row belongs to a current winner")
+        self.assertEqual(stats["reads"], 2, "the giveaway row + its claim rows")
+
+
 class AuditRaceTests(ServiceTestCase):
     """Production-safety races for the join fast-path (audit fixes)."""
 
