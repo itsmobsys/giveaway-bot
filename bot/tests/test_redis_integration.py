@@ -537,6 +537,22 @@ class RequestTimeProbeTests(CachedBotTestCase):
         # The probe cleans up after itself in Redis as well as in Turso.
         self.assertNotIn("gwbot:v1:probe:gw_request_time", self.fake.data)
 
+    def test_no_live_giveaway_still_measures_the_cache(self) -> None:
+        """The production case: nothing is live, yet the cache legs must report.
+
+        The Join button only exists on a running giveaway, so without a preview
+        key the report could only ever say "failed" and tell the invoker nothing
+        about Redis at all.
+        """
+        report = self.run_command()
+        text = (report.get("content") if isinstance(report, dict) else "") or ""
+        self.assertIn("preview row this probe deleted", text)
+        self.assertIn("HIT", text, "the second run must be served from the cache")
+        self.assertNotIn("no live giveaway id to read", text)
+        # The preview row must not outlive the probe that made it.
+        self.assertEqual(self.svc.list_active(self.guild), [])
+        self.assertEqual(self.svc.list_all_ended(), [])
+
     def test_the_probe_never_prints_a_host_or_password(self) -> None:
         self.make()
         report = self.run_command()

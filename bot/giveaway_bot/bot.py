@@ -2588,6 +2588,26 @@ def wire_commands(bot: GiveawayBot) -> None:
             live = []
             lookup_ms = None
             lookup_note = "lookup failed"
+        # A preview key must exist, or the cache legs can never report a HIT for
+        # anyone — the Join button only appears on a running giveaway, so a
+        # probe that refuses without one can only ever print "failed" and tell
+        # the invoker nothing about Redis. This read is real: the preview row
+        # is written and read through the same code the create path uses.
+        preview = None
+        if not live:
+            try:
+                preview = svc.create(
+                    guild_id=gid,
+                    channel_id=str(getattr(interaction, "channel_id", 0) or 0),
+                    prize="Cache preview (deleted immediately)",
+                    winner_count=1,
+                    duration_seconds=300,
+                    created_by=str(interaction.user.id),
+                )
+            except Exception:
+                log.exception("request-time preview row could not be created")
+                preview = None
+        preview_id = preview.id if preview is not None else ""
         gw_id = live[0].id if live else ""
         # Leg 1: the real Redis path this request takes, in the order it takes
         # it — one PING through the governed shared client, then the two cached
@@ -2657,8 +2677,8 @@ def wire_commands(bot: GiveawayBot) -> None:
             gwc = bot.service if getattr(bot.service, "_redis", None) is not None else None
             if gwc is None:
                 count_note = role_note = "no cache wired into the service"
-            elif not gw_id:
-                count_note = role_note = "no live giveaway id to read a cached count for"
+            elif not (gw_id or preview_id):
+                count_note = "no live giveaway, and the preview row could not be created"
             else:
                 # Twice on purpose: run 1 is what a cold cache costs (it falls
                 # through to Turso), run 2 is the warm cost a click pays. Both
@@ -2667,9 +2687,10 @@ def wire_commands(bot: GiveawayBot) -> None:
                 count_runs: list[tuple[float | None, str]] = []
                 role_runs: list[tuple[float | None, str]] = []
                 n_cached = None
+                probe_id = gw_id or preview_id
                 for _ in range(2):
                     ms, n_cached, served = await _timed_cached(
-                        gwc.entry_count_cached, gw_id
+                        gwc.entry_count_cached, probe_id
                     )
                     count_runs.append((ms, "failed" if ms is None else _label(served)))
                     ms, _role, served = await _timed_cached(
@@ -2690,6 +2711,12 @@ def wire_commands(bot: GiveawayBot) -> None:
                     warm_total_ms = sum(warm_vals)
                 count_note = f"{_runs_note(count_runs)} - {n_cached} entrant(s)"
                 role_note = _runs_note(role_runs)
+                if not gw_id:
+                    # Say plainly that the per-giveaway key was measured on a
+                    # throwaway row, so nobody reads it as a live giveaway.
+                    note = "(no live giveaway — measured on a preview row this probe deleted)"
+                    count_note = f"{count_note} {note}"
+                    role_note = f"{role_note} {note}"
             try:
                 after = dict(redis.stats().get("counters") or {})
             except Exception:
@@ -2713,6 +2740,13 @@ def wire_commands(bot: GiveawayBot) -> None:
             )
             if before and not after:
                 count_note = role_note = "cache stats unavailable"
+        if preview_id:
+            # The preview exists only to give the cache legs a real key to read.
+            # It must not outlive the probe that made it.
+            try:
+                svc.discard(preview_id)
+            except Exception:
+                log.exception("request-time preview cleanup failed")
         # Leg 3: the exact pre-ack read the Join button runs. With a live
         # giveaway that is join_snapshot (row + 4 eligibility subqueries, one
         # trip); without one, the same-shaped eligibility SELECT, labelled so
