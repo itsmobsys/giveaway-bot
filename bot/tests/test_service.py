@@ -1644,6 +1644,33 @@ class RoundTripBudgetTests(ServiceTestCase):
         self.assertEqual(self.svc.message_count(self.guild, "a" * 18), 2)
         self.assertEqual(self.svc.message_count(self.guild, "b" * 18), 3)
 
+    def test_snapshot_read_failure_requeues_whole_chunk(self) -> None:
+        # When the batched snapshot read itself fails, no key has a baseline:
+        # an ambiguous write must requeue every delta whole rather than risk
+        # dropping a message, and the failure logs once per chunk (not per key).
+        rows = [(self.guild, "c" * 18, 4), (self.guild, "d" * 18, 5)]
+        original = self.db.execute
+
+        def partial(sql, params=()):
+            if sql.startswith("INSERT INTO simple_message_counts"):
+                raise OSError("connection reset by peer")
+            return original(sql, params)
+
+        with self.assertRaises(PartialFlush), unittest.mock.patch.object(
+            self.svc, "_count_rows", return_value=None
+        ), unittest.mock.patch.object(
+            self.db, "execute", partial
+        ), unittest.mock.patch("giveaway_bot.service.log.warning") as warn:
+            self.svc.add_message_counts(rows)
+        warn.assert_called_once_with("flush snapshot batch read failed for %d keys", 2)
+        self.assertEqual(
+            rows, [(self.guild, "c" * 18, 4), (self.guild, "d" * 18, 5)]
+        )
+        # The unmodified deltas retry cleanly, so each message lands once.
+        self.assertEqual(self.svc.add_message_counts(rows), len(rows))
+        self.assertEqual(self.svc.message_count(self.guild, "c" * 18), 4)
+        self.assertEqual(self.svc.message_count(self.guild, "d" * 18), 5)
+
     def test_start_claims_is_one_write(self) -> None:
         gw = self.make(winner_count=10, claim_timeout_seconds=3600)
         winners = [str(500000 + i) for i in range(10)]
@@ -1653,10 +1680,29 @@ class RoundTripBudgetTests(ServiceTestCase):
         self.assertEqual(stats["writes"], 1, "one multi-row claim insert")
         self.assertEqual(stats["reads"], 0)
         rows = self.db.query(
-            "SELECT user_id, status FROM simple_claims WHERE giveaway_id = ?", (gw.id,)
+            "SELECT user_id, status, deadline_ms FROM simple_claims"
+            " WHERE giveaway_id = ?",
+            (gw.id,),
         )
         self.assertEqual({str(r["user_id"]) for r in rows}, set(winners))
         self.assertTrue(all(str(r["status"]) == "pending" for r in rows))
+        first_deadlines = {
+            str(r["user_id"]): int(r["deadline_ms"]) for r in rows
+        }
+        # Retried announce: INSERT OR IGNORE keeps the rows and their original
+        # deadlines, so a restarted announce cannot extend a claim window.
+        self.svc.start_claims(gw, winners, now=now_ms() + 5000)
+        again = self.db.query(
+            "SELECT user_id, status, deadline_ms FROM simple_claims"
+            " WHERE giveaway_id = ?",
+            (gw.id,),
+        )
+        self.assertEqual(len(again), 10)
+        self.assertEqual(
+            {str(r["user_id"]): int(r["deadline_ms"]) for r in again},
+            first_deadlines,
+        )
+        self.assertTrue(all(str(r["status"]) == "pending" for r in again))
 
     def test_empty_giveaway_count_is_known_zero(self) -> None:
         gw = self.make()
@@ -1666,6 +1712,36 @@ class RoundTripBudgetTests(ServiceTestCase):
         self.db.reset_stats()
         self.assertEqual(self.svc.entry_count(gw.id), 0)
         self.assertEqual(self.db.get_stats()["reads"], 1, "and it stays one read")
+
+    def test_failed_counter_bump_resets_known_zero_to_unknown(self) -> None:
+        # A committed entry whose counter bump failed must not leave the new
+        # known-zero behind: the next read has to fall back to COUNT(*) and
+        # heal the row, exactly as a NULL-on-create row did before this task.
+        gw = self.make()
+        original = self.db.execute
+
+        def fail_bump(sql, params=()):
+            if sql.startswith("UPDATE simple_giveaways SET entrant_count = COALESCE"):
+                raise OSError("connection reset by peer")
+            return original(sql, params)
+
+        with unittest.mock.patch.object(self.db, "execute", fail_bump):
+            self.assertEqual(
+                self.join(gw, user_id="444444444444444444", fetch_count=False), -1
+            )
+        row = self.db.query_one(
+            "SELECT entrant_count FROM simple_giveaways WHERE id = ?", (gw.id,)
+        )
+        self.assertIsNone(row.get("entrant_count"), "unknown, not a stale known 0")
+        self.db.reset_stats()
+        self.assertEqual(self.svc.entry_count(gw.id), 1)
+        stats = self.db.get_stats()
+        self.assertEqual(stats["reads"], 2, "counter column + COUNT(*) fallback")
+        self.assertEqual(stats["writes"], 1, "the heal write")
+        healed = self.db.query_one(
+            "SELECT entrant_count FROM simple_giveaways WHERE id = ?", (gw.id,)
+        )
+        self.assertEqual(int(healed["entrant_count"]), 1)
 
     def test_draw_reads_only_user_ids(self) -> None:
         gw = self.make(winner_count=2)
@@ -1690,6 +1766,28 @@ class RoundTripBudgetTests(ServiceTestCase):
         self.assertEqual(calls, [gw.id], "exactly one user-id-only pool read")
         self.assertEqual(len(winners), 2)
         self.assertEqual(ended.entrant_count, len(users))
+
+    def test_pick_reads_only_user_ids(self) -> None:
+        gw = self.make(winner_count=2)
+        for i in range(5):
+            self.join(gw, user_id=str(10 ** 17 + i))
+        original = self.svc.entry_user_ids
+        calls: list[str] = []
+
+        def spy(giveaway_id: str) -> list[str]:
+            calls.append(giveaway_id)
+            return original(giveaway_id)
+
+        with unittest.mock.patch.object(
+            self.svc, "entry_user_ids", side_effect=spy
+        ), unittest.mock.patch.object(
+            self.svc,
+            "entries",
+            side_effect=AssertionError("_pick must not read display columns"),
+        ):
+            picked = self.svc._pick(gw.id, 2)
+        self.assertEqual(calls, [gw.id], "one user-id-only pool read")
+        self.assertEqual(len(picked), 2)
 
     def test_end_reads_the_row_once_after_the_flip(self) -> None:
         gw = self.make(winner_count=2)

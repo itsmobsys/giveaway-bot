@@ -818,9 +818,11 @@ class GiveawayService:
     def entries(self, giveaway_id: str, limit: int | None = None) -> list[dict]:
         """Entrants in entry order. Pass limit for a display path.
 
-        The draw needs the whole pool, but a listing shows the first page only:
-        a giveaway with tens of thousands of entries should not ship all of them
-        over the wire (and allocate them) to print fifty mentions.
+        Omitting limit loads every row (exports and audits). A display path
+        passes it: a giveaway with tens of thousands of entries should not
+        ship all of them over the wire (and allocate them) to print fifty
+        mentions. The draw does not use this method -- it reads ids only via
+        entry_user_ids().
         """
         statement = (
             "SELECT user_id, username, entered_at FROM simple_entries"
@@ -1391,7 +1393,21 @@ class GiveawayService:
                 (gw.id,),
             )
         except Exception:
-            pass
+            # The entry is committed but the cached count did not move. A new
+            # row starts at a known 0, so leaving it there would display 0
+            # entrants for a non-empty giveaway until end/cancel overwrote the
+            # counter. Reset only our own known-zero back to unknown (a
+            # concurrent successful bump has already made it non-zero):
+            # entry_count() then pays the COUNT(*) fallback and heals it,
+            # exactly as the old NULL-on-create rows did on this path.
+            try:
+                self.db.execute(
+                    "UPDATE simple_giveaways SET entrant_count = NULL"
+                    " WHERE id = ? AND entrant_count = 0",
+                    (gw.id,),
+                )
+            except Exception:
+                pass
         # The cached display count is now one behind. Both cached numbers are
         # cosmetic (nothing decides eligibility from them) but a fresh joiner
         # must not be shown a count that predates their own entry, so it is
