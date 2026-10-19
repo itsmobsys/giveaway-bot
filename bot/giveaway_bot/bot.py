@@ -2552,6 +2552,9 @@ def wire_commands(bot: GiveawayBot) -> None:
         # (warm) run, so the repeat-click cost can be compared honestly.
         cold_total_ms: float | None = None
         warm_total_ms: float | None = None
+        # Only true when the second run of the cached pair was answered from
+        # the cache in full; until then the report must not claim a cache hit.
+        warm_pair = False
         cache_gets: int | None = None
         cache_stores: int | None = None
         redis_probe_ms: float | None = None
@@ -2634,11 +2637,21 @@ def wire_commands(bot: GiveawayBot) -> None:
                     return "hit/miss unknown"
                 return "HIT" if served else "MISS (fell through to the database)"
 
-            def _runs_note(runs: list[tuple[float | None, str]]) -> str:
+            def _runs_note(runs: list[tuple[float | None, str, bool | None]]) -> str:
+                if len(runs) == 2 and runs[0][1] == runs[1][1]:
+                    # Both runs took the same path: one phrase says it better
+                    # than "1st X; 2nd X", which reads like a stutter.
+                    label = runs[1][1]
+                    if runs[1][0] is None:
+                        return f"both runs {label}"
+                    return (
+                        f"both runs {label}, 1st {runs[0][0]:.0f}ms"
+                        f" -> 2nd {runs[1][0]:.0f}ms"
+                    )
                 parts = []
-                for index, (ms, label) in enumerate(runs, 1):
-                    shown = "failed" if ms is None else f"{ms:.0f}ms"
-                    parts.append(f"{'1st' if index == 1 else '2nd'} {shown} {label}")
+                for index, (ms, label, _served) in enumerate(runs, 1):
+                    shown = "" if label == "failed" else f" {f'{ms:.0f}ms' if ms is not None else 'n/a'}"
+                    parts.append(f"{'1st' if index == 1 else '2nd'}{shown} {label}")
                 return "; ".join(parts)
 
             try:
@@ -2689,26 +2702,34 @@ def wire_commands(bot: GiveawayBot) -> None:
                 # through to the database), run 2 is the warm cost a click pays. Both
                 # numbers are printed; a report showing only the warm run would
                 # look fast while saying nothing.
-                count_runs: list[tuple[float | None, str]] = []
-                role_runs: list[tuple[float | None, str]] = []
+                count_runs: list[tuple[float | None, str, bool | None]] = []
+                role_runs: list[tuple[float | None, str, bool | None]] = []
                 n_cached = None
                 probe_id = gw_id or preview_id
                 for _ in range(2):
                     ms, n_cached, served = await _timed_cached(
                         gwc.entry_count_cached, probe_id
                     )
-                    count_runs.append((ms, "failed" if ms is None else _label(served)))
+                    count_runs.append((ms, "failed" if ms is None else _label(served), served))
                     ms, _role, served = await _timed_cached(
                         gwc.get_notify_role_cached, gid
                     )
-                    role_runs.append((ms, "failed" if ms is None else _label(served)))
+                    role_runs.append((ms, "failed" if ms is None else _label(served), served))
                 # The headline number is the warm run (what a repeat click
                 # pays); both runs stay visible in the note beside it.
                 warm_count_ms = count_runs[-1][0]
                 warm_role_ms = role_runs[-1][0]
                 count_ms = warm_count_ms
                 role_ms = warm_role_ms
-                cold_vals = [runs[0][0] for runs in (count_runs, role_runs) if runs[0][0]]
+                # "Served from the cache" is a claim, not a label: it may only
+                # be printed when BOTH runs of the pair were answered without a
+                # fall-through. If either read the database, the warm number is
+                # the cost of a read that missed, and calling that the repeat
+                # click's cache cost would flatter the report.
+                warm_pair = count_runs[-1][2] is True and role_runs[-1][2] is True
+                cold_vals = [
+                    runs[0][0] for runs in (count_runs, role_runs) if runs[0][0] is not None
+                ]
                 if len(cold_vals) == 2:
                     cold_total_ms = sum(cold_vals)
                 warm_vals = [v for v in (warm_count_ms, warm_role_ms) if v is not None]
@@ -2841,7 +2862,12 @@ def wire_commands(bot: GiveawayBot) -> None:
         lines = [
             "Request-time breakdown — live legs, timed just now:",
             f"• Cached reads this request (repeat click): **{_leg(warm_total_ms)}**"
-            " — same keys served from the cache, no database read at all",
+            + (
+                " — same keys served from the cache, no database read at all"
+                if warm_pair
+                else " — NOT a cache hit: the second read still fell through to the"
+                " database, so this is not what a warm click pays"
+            ),
             f"• First read on an empty cache: **{_leg(cold_total_ms)}**"
             " (Redis miss) — that path falls through to the database, which is"
             " not timed in this report",

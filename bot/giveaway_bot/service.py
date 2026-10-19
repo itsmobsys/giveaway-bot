@@ -686,7 +686,12 @@ class GiveawayService:
         # counter fallback (and the legacy-row heal it may run) is blocking
         # Turso I/O, and a display number must never stall the loop.
         value = await asyncio.to_thread(self.entry_count, giveaway_id)
-        if value:
+        if value is not None:
+            # A count of zero is a real answer and gets cached like any other.
+            # Skipping it meant a giveaway with no entrants yet could never be
+            # served from the cache: every display read paid the counter
+            # fallback (a second query, and on a remote database a second
+            # round trip) while the surrounding reads were cache hits.
             await self._cache_put(key, value, COUNT_CACHE_TTL)
         return value
 

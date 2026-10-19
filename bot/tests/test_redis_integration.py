@@ -182,10 +182,23 @@ class ServiceTestCase(unittest.TestCase):
 class CachedCountTests(ServiceTestCase):
     """The display count: cached while it is right, dropped when it is not."""
 
+    def test_a_zero_count_is_cached_like_any_other(self) -> None:
+        """Zero entrants is an answer, not a miss.
+
+        Leaving it uncached meant a giveaway with no entrants yet could never
+        be served from the cache: every display read paid the counter fallback,
+        which is a second query and a second round trip on a remote database.
+        """
+        gw = self.make()
+        self.assertEqual(asyncio.run(self.svc.entry_count_cached(gw.id)), 0)
+        self.assertNotEqual(self.fake.data, {}, "a zero count is a real answer")
+        reads = self.count_reads()
+        self.assertEqual(asyncio.run(self.svc.entry_count_cached(gw.id)), 0)
+        self.assertEqual(self.count_reads(), reads, "the second read is a cache hit")
+
     def test_cached_count_heals_after_a_committed_join(self) -> None:
         gw = self.make()
         self.assertEqual(asyncio.run(self.svc.entry_count_cached(gw.id)), 0)
-        self.assertEqual(self.fake.data, {}, "a zero count is not worth a cached key")
         self.join(gw, "5" * 18)
         asyncio.run(self.svc.flush_invalidations())
         self.assertEqual(
