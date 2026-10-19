@@ -829,6 +829,44 @@ class LeaveTests(BotTestCase):
             account_created_ts=time.time() - 400 * 86400,
         )
 
+    def test_a_hot_header_saves_the_post_leave_row_read(self) -> None:
+        """Leaving a giveaway the same burst just touched does not re-read it.
+
+        The header is immutable while a giveaway runs (only the entry counter
+        moves, and the embed refresh reads that itself), so re-reading the row
+        to clear a role and redraw an embed paid a database round trip for data
+        already in hand. A cold header must still read, and must warm the cache
+        the next click uses.
+        """
+        gw = self.make()
+        member = FakeMember(889888888888888888)
+        self.join(gw, str(member.id))
+        self.bot._gw_store(gw.id, gw)
+        reads: list = []
+        original_get = self.bot.service.get
+
+        def spy_get(giveaway_id):
+            reads.append(giveaway_id)
+            return original_get(giveaway_id)
+
+        self.bot.service.get = spy_get  # type: ignore[method-assign]
+        try:
+            interaction = self.press_leave(gw.id, member)
+        finally:
+            self.bot.service.get = original_get  # type: ignore[method-assign]
+        self.assertEqual(reads, [], "the cached header answers this")
+        self.assertIn("You left the giveaway.", interaction.texts)
+
+    def test_a_cold_header_is_read_and_then_cached(self) -> None:
+        gw = self.make()
+        member = FakeMember(887888888888888888)
+        self.join(gw, str(member.id))
+        self.bot._gw_drop(gw.id)
+        self.press_leave(gw.id, member)
+        self.assertIsNotNone(
+            self.bot._gw_cached(gw.id), "the read that had to happen warms the cache"
+        )
+
     def test_leave_removes_the_entry(self) -> None:
         gw = self.make()
         member = FakeMember(888888888888888888)
@@ -853,6 +891,51 @@ class LeaveTests(BotTestCase):
 
 
 class ParticipantsPanelTests(BotTestCase):
+    def join(self, gw, user_id: str) -> int:
+        return self.svc.join(
+            gw,
+            user_id=user_id,
+            username="member",
+            member_roles=[],
+            account_created_ts=time.time() - 400 * 86400,
+        )
+
+    def test_the_panel_asks_the_entries_table_once(self) -> None:
+        """The window carries the count and the membership flag with it.
+
+        Opening the panel used to read the entries table three times -- the
+        count, the window, then "am I in it" -- for one message. All three are
+        answered by the window read now, so the reply must stay correct while
+        the table is touched once.
+        """
+        gw = self.make()
+        member = FakeMember(223222222222222222)
+        interaction = FakeInteraction(guild=FakeGuild(self.guild, [member]), user=member)
+        asyncio.run(self.bot.handle_participants(interaction, gw.id))
+        self.assertIn("no entrants yet", interaction.followup.sent[-1]["content"])
+        self.join(gw, str(member.id))
+        reads: list = []
+        original_query = self.db.query
+
+        def spy_query(statement, params=()):
+            reads.append(statement)
+            return original_query(statement, params)
+
+        self.db.query = spy_query  # type: ignore[method-assign]
+        try:
+            interaction = FakeInteraction(guild=FakeGuild(self.guild, [member]), user=member)
+            asyncio.run(self.bot.handle_participants(interaction, gw.id))
+        finally:
+            self.db.query = original_query  # type: ignore[method-assign]
+        body = interaction.followup.sent[-1]["embed"].description
+        self.assertIn("Total Participants: 1", body)
+        self.assertIn("Your Entries: 1", body, "the caller's own entry is still found")
+        self.assertEqual(
+            len([sql for sql in reads if "FROM simple_entries" in sql]),
+            1,
+            f"the window answers all three questions: {reads}",
+        )
+
     def test_the_page_is_bounded_and_finds_me_by_lookup(self) -> None:
         gw = self.make()
         member = FakeMember(222222222222222222)
@@ -1443,16 +1526,43 @@ class JoinFastPathTests(BotTestCase):
         self.assertEqual(len(snap), 4)
         self.assertTrue(any("You're in!" in t for t in interaction.texts))
 
-    def test_handle_join_none_snapshot_still_enters(self) -> None:
+    def test_a_cached_header_still_checks_eligibility_live(self) -> None:
+        """Second tap in a burst: the row is in hand, the rules are not.
+
+        The hot-header path skips the row read, but the eligibility snapshot
+        still has to be taken: it is what lets check_eligible skip
+        check_timeout_ban's own live read of the row, and dropping it was tried
+        and moved a round trip instead of saving one. So this pins the shape --
+        one live eligibility read, handed to join(), which still commits
+        exactly one entry.
+        """
         gw = self.make()
-        original = self.bot.service.eligibility_snapshot
-        self.bot.service.eligibility_snapshot = lambda *a: None  # type: ignore[method-assign]
+        self.bot._gw_store(gw.id, gw)
+        reads: list = []
+        original_elig = self.bot.service.eligibility_snapshot
+
+        def spy_elig(*args, **kwargs):
+            reads.append(args)
+            return original_elig(*args, **kwargs)
+
+        self.bot.service.eligibility_snapshot = spy_elig  # type: ignore[method-assign]
+        seen: dict = {}
+        original_join = self.bot.service.join_and_refresh
+
+        def spy_join(gw_arg, **kwargs):
+            seen.update(kwargs)
+            return original_join(gw_arg, **kwargs)
+
+        self.bot.service.join_and_refresh = spy_join  # type: ignore[method-assign]
         try:
-            member = FakeMember(556555555555555555)
+            member = FakeMember(557555555555555555)
             interaction = self.press(gw.id, member)
         finally:
-            self.bot.service.eligibility_snapshot = original  # type: ignore[method-assign]
-        self.assertEqual(self.svc.entry_count(gw.id), 1, "None falls back to individual checks")
+            self.bot.service.eligibility_snapshot = original_elig  # type: ignore[method-assign]
+            self.bot.service.join_and_refresh = original_join  # type: ignore[method-assign]
+        self.assertEqual(len(reads), 1, "exactly one live eligibility read")
+        self.assertIsNotNone(seen.get("snapshot"), "the snapshot is handed to join()")
+        self.assertEqual(self.svc.entry_count(gw.id), 1, "exactly one entry, read live")
         self.assertTrue(any("You're in!" in t for t in interaction.texts))
 
     def test_handle_join_reuses_count_for_refresh(self) -> None:

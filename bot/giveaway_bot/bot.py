@@ -959,6 +959,12 @@ class GiveawayBot(commands.Bot):
         try:
             cached = self._gw_cached(giveaway_id)
             if cached is not None and str(getattr(cached, "guild_id", "")) == guild_id_str:
+                # Hot header: the row itself is not re-read, but the
+                # eligibility snapshot still is, and it has to be: it is the
+                # only thing that lets check_eligible skip the timeout-ban
+                # gate's own live row read. Dropping it was measured here and
+                # saved nothing (one read moved from one place to the other),
+                # so it stays.
                 gw = cached
                 try:
                     snapshot = await self._db_call(
@@ -1166,20 +1172,23 @@ class GiveawayBot(commands.Bot):
             return
         try:
             gw = await asyncio.to_thread(self.service.get, giveaway_id)
-            total = await asyncio.to_thread(self.service.entry_count, gw.id)
-            # One bounded window instead of the whole table, and the "am I in it"
-            # question answered by a lookup rather than by scanning the rows we
-            # happened to load.
-            entrants = await asyncio.to_thread(
-                self.service.entries, gw.id, self.PARTICIPANT_WINDOW
+            # One bounded window instead of the whole table, and in the SAME
+            # read: the true total and the "am I in it" answer. Those were a
+            # second COUNT(*) over the entries table plus a membership lookup
+            # -- three reads of one table for one message. A failed read
+            # returns None, which the caller reports rather than printing
+            # zeros as facts.
+            found = await asyncio.to_thread(
+                self.service.entries_snapshot,
+                gw.id,
+                self.PARTICIPANT_WINDOW,
+                str(interaction.user.id),
             )
-            mine = (
-                1
-                if await asyncio.to_thread(
-                    self.service.has_entry, gw.id, str(interaction.user.id)
-                )
-                else 0
-            )
+            total = found[0] if found else 0
+            entrants = found[1] if found else []
+            # No rows means no row can be the caller's, so the flag is false
+            # without asking again; with rows it came from the same statement.
+            mine = found[2] if found else 0
         except ServiceError as exc:
             await self._safe_followup(interaction, f"⚠️ {exc.message}")
             return
@@ -1250,13 +1259,28 @@ class GiveawayBot(commands.Bot):
         self._spawn_bg(self._flush_invalidation())
         if not removed:
             return
-        try:
-            fresh = await asyncio.to_thread(self.service.get, giveaway_id)
-        except ServiceError:
-            return
-        except Exception:
-            log.exception("post-leave lookup failed for %s", giveaway_id)
-            return
+        # The header is immutable for the lifetime of a giveaway except for the
+        # entry counter, which _refresh_embed re-reads on its own. A click that
+        # just came through the join path has it cached for GW_CACHE_TTL, so
+        # re-reading the row here is one more database round trip for data
+        # already in hand; on a cold header the read still happens and warms
+        # the same cache the next click uses.
+        guild_id_str = str(interaction.guild.id) if interaction.guild else ""
+        fresh = None
+        cached_leave = self._gw_cached(giveaway_id)
+        if cached_leave is not None and str(
+            getattr(cached_leave, "guild_id", "")
+        ) == guild_id_str:
+            fresh = cached_leave
+        else:
+            try:
+                fresh = await asyncio.to_thread(self.service.get, giveaway_id)
+            except ServiceError:
+                return
+            except Exception:
+                log.exception("post-leave lookup failed for %s", giveaway_id)
+                return
+            self._gw_store(giveaway_id, fresh)
         await self._take_entrants_role(fresh, str(interaction.user.id))
         await self._refresh_embed(fresh)
 

@@ -721,6 +721,66 @@ class GiveawayService:
         except Exception:
             pass
 
+    def entries_snapshot(
+        self, giveaway_id: str, limit: int | None, user_id: str
+    ) -> tuple[int, list[dict], int] | None:
+        """Window + true count + membership flag in ONE read of the entries table.
+
+        The participants panel used to read the same table three times: the
+        count, the window, then "am I in it". One statement answers all three --
+        the rows the window needs, COUNT(*) OVER () for the true total (SQLite
+        window functions, 3.25+), and whether the caller's own row is among the
+        rows the window returned. Returns None when the read fails, so the
+        caller can keep its own "could not load the list" text rather than
+        printing a zero as if it were a fact.
+        """
+        if limit is None:
+            statement = (
+                "SELECT user_id, username, entered_at,"
+                " COUNT(*) OVER () AS total,"
+                " (user_id = ?) AS me"
+                " FROM simple_entries WHERE giveaway_id = ?"
+                " ORDER BY entered_at ASC"
+            )
+            params: tuple = (str(user_id or ""), giveaway_id)
+        else:
+            statement = (
+                "SELECT user_id, username, entered_at,"
+                " COUNT(*) OVER () AS total,"
+                " (user_id = ?) AS me"
+                " FROM simple_entries WHERE giveaway_id = ?"
+                " ORDER BY entered_at ASC LIMIT ?"
+            )
+            params = (str(user_id or ""), giveaway_id, max(1, int(limit)))
+        try:
+            rows = self.db.query(statement, params)
+        except Exception:
+            return None
+        if not rows:
+            return 0, [], 0
+        try:
+            total = int(rows[0].get("total") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        # COUNT(*) OVER () counts every matching row even though LIMIT caps the
+        # rows we keep, so the header total stays the true one on a giveaway
+        # bigger than the window (the "Showing the first N of T" line depends
+        # on that). The flag is the caller's own row, compared as a string.
+        wanted = str(user_id or "")
+        mine = 0
+        window: list[dict] = []
+        for row in rows:
+            if str(row.get("user_id")) == wanted:
+                mine = 1
+            window.append(
+                {
+                    "user_id": row.get("user_id"),
+                    "username": row.get("username"),
+                    "entered_at": row.get("entered_at"),
+                }
+            )
+        return total, window, mine
+
     def entries(self, giveaway_id: str, limit: int | None = None) -> list[dict]:
         """Entrants in entry order. Pass limit for a display path.
 

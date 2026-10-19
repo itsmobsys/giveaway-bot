@@ -450,8 +450,26 @@ class CachedBotTestCase(unittest.TestCase):
         self.bot = GiveawayBot(self.settings, self.db, self.cache)
         self.svc = GiveawayService(self.db, self.cache)
         self.guild = "111111111111111111"
+        self.reads: list[str] = []
+        self._watch_reads()
         wire_commands(self.bot)
         self.bot.register_components()
+
+    def _watch_reads(self) -> None:
+        """Count the SQL the bot's own database sends.
+
+        query_one() delegates to query(), so wrapping the single read entry
+        point shows every read the button handlers make. Note this is the bot's
+        Database, not the service's: the bot's handlers go through the bot, the
+        service instance here is only a handle onto the same file.
+        """
+        original = self.db.query
+
+        def counting(sql, params=()):
+            self.reads.append(sql)
+            return original(sql, params)
+
+        self.db.query = counting  # type: ignore[method-assign]
 
     def tearDown(self) -> None:
         views._HANDLERS.clear()
@@ -493,6 +511,48 @@ class CachedEmbedTests(CachedBotTestCase):
         rendered = str(channel.message.edits[0]["embed"].to_dict())
         self.assertNotIn("coroutine", rendered.lower())
         self.assertNotIn("object at 0x", rendered)
+
+
+class ClickReadBudgetTests(CachedBotTestCase):
+    """What a second tap in a burst still costs the database.
+
+    Every click re-checks eligibility live (that is correctness), but it must
+    not also re-read a giveaway header the bot already holds, nor ask a
+    question its own reply does not use. These tests pin the read budget so a
+    future change cannot quietly add a round trip back.
+    """
+
+    def test_a_burst_does_not_re_read_the_header(self) -> None:
+        gw = self.make()
+        first = FakeMember(777777777777777771)
+        self.press_join(gw.id, first)
+        baseline = len(self.reads)
+        self.assertGreater(baseline, 0, "the first click reads, as it must")
+        self.assertIsNotNone(self.bot._gw_cached(gw.id), "the header is warm now")
+        second = FakeMember(777777777777777772)
+        self.press_join(gw.id, second)
+        added = self.reads[baseline:]
+        self.assertTrue(added, "eligibility is still checked live, never cached")
+        # The refresh read ("SELECT status, COALESCE(entrant_count, 0) ...") is
+        # expected: it carries the new count back. What must not appear is the
+        # whole-row header read, which the bot already holds.
+        self.assertFalse(
+            [sql for sql in added if "SELECT * FROM simple_giveaways WHERE id" in sql],
+            f"the header is already in hand: {added}",
+        )
+
+    def test_a_second_panel_open_on_an_empty_giveaway_costs_no_lookup(self) -> None:
+        gw = self.make()
+        member = FakeMember(777777777777777773)
+        interaction = FakeInteraction(guild=FakeGuild(self.guild, [member]), user=member)
+        asyncio.run(self.bot.handle_participants(interaction, gw.id))
+        self.assertIn("no entrants yet", interaction.followup.sent[-1]["content"])
+        # "AS one" is the membership lookup (has_entry); the window query on
+        # simple_entries is expected and is not the question this pins.
+        self.assertFalse(
+            [sql for sql in self.reads if "AS one FROM simple_entries" in sql],
+            f"an empty window cannot contain the caller: {self.reads}",
+        )
 
 
 class DuplicateClickTests(CachedBotTestCase):
