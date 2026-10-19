@@ -110,9 +110,13 @@ class SchemaTests(ServiceTestCase):
         names = {str(r["name"]) for r in self.db.query(
             "SELECT name FROM sqlite_master WHERE type = 'index'"
         )}
-        self.assertIn("idx_simple_gw_status_ends", names)
-        self.assertIn("idx_simple_entries_giveaway", names)
+        self.assertIn("idx_simple_gw_status_ends", names, "due() scans on this every tick")
+        self.assertIn("idx_simple_entries_gw_entered", names, "entries reads sort by entered_at")
         self.assertIn("idx_simple_entries_user", names, "blacklist purge needs this")
+        self.assertIn("idx_simple_claims_pending_due", names, "due_claims scans every 30s")
+        # Superseded by idx_simple_entries_gw_entered and dropped on migration;
+        # it only repeated the simple_entries primary-key prefix.
+        self.assertNotIn("idx_simple_entries_giveaway", names)
 
     def test_engine_agnostic_defaults(self) -> None:
         self.assertEqual(self.db.backend, "injected")
@@ -143,6 +147,14 @@ class WriteClassificationTests(unittest.TestCase):
             "",
         ):
             self.assertFalse(_is_write(sql), sql)
+
+    def test_a_pragma_that_assigns_is_a_write(self) -> None:
+        # "PRAGMA user_version = 2" changes the database, so it needs the same
+        # commit as any other write; ignoring it would leave the schema stamp
+        # unapplied and every boot would re-run the whole DDL block.
+        self.assertTrue(_is_write("PRAGMA user_version = 2"))
+        self.assertTrue(_is_write("  pragma journal_mode=wal"))
+        self.assertFalse(_is_write("PRAGMA user_version"), "a bare pragma only reads")
 
 
 class CreateTests(ServiceTestCase):

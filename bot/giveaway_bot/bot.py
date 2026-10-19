@@ -680,18 +680,76 @@ class GiveawayBot(commands.Bot):
         # fresh dict instead of being overwritten by the batch we are sending.
         batch, self._message_buffer = self._message_buffer, {}
         rows = [(guild_id, user_id, n) for (guild_id, user_id), n in batch.items()]
+        # The service reports progress in here. _db_call runs it on a worker
+        # under an 8s wait_for, and a timeout cancels the await, not the
+        # thread: without the receipt a timed-out flush used to requeue the
+        # whole batch while the abandoned worker kept writing it, and the
+        # retry then counted every one of those messages twice.
+        receipt: dict[str, object] = {}
         try:
-            await self._db_call(self.service.add_message_counts, rows)
+            await self._db_call(
+                self.service.add_message_counts, rows, receipt=receipt
+            )
         except PartialFlush as exc:
             # The chunks before the failure are already stored, so only the tail
             # goes back: restoring the whole batch would write the committed head
             # a second time and inflate everybody's count.
             self._requeue(rows[exc.applied :])
             raise
+        except TimeoutError:
+            # The worker may still be writing. Settle it against the table
+            # instead of assuming nothing landed.
+            self._defer_timed_out_flush(rows, receipt)
+            raise
         except Exception:
             # Nothing is known to have landed; hand the whole batch back.
             self._requeue(rows)
             raise
+
+    #: How long a timed-out flush is given to finish on its worker thread
+    #: before the batch is handed back untested. The 8s call budget already
+    #: expired, so this only covers the tail of work already in flight.
+    FLUSH_RECONCILE_GRACE = 10.0
+
+    def _defer_timed_out_flush(
+        self, rows: list[tuple[str, str, int]], receipt: dict[str, object]
+    ) -> None:
+        """Requeue a timed-out batch once its orphaned worker stops writing."""
+        task = asyncio.create_task(self._reconcile_timed_out_flush(rows, receipt))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+
+    async def _reconcile_timed_out_flush(
+        self, rows: list[tuple[str, str, int]], receipt: dict[str, object]
+    ) -> None:
+        """Hand back only what the abandoned worker did not manage to write.
+
+        The receipt's `done` flag is set by the service as it returns, so
+        waiting for it is waiting for the worker. Then the stored table tells
+        the truth: rows the orphan committed are dropped from the requeue, so
+        the next flush cannot add them a second time.
+        """
+        # A bounded poll, not an Event: the flag is set by a worker thread.
+        for _ in range(int(self.FLUSH_RECONCILE_GRACE / 0.05)):
+            if receipt.get("done"):
+                break
+            await asyncio.sleep(0.05)
+        before = receipt.get("before")
+        if not receipt.get("done") or not isinstance(before, dict):
+            # Cannot tell what landed. Requeueing everything risks the double
+            # count this path exists to prevent, but dropping counts silently
+            # is worse than a possible over-count.
+            self._requeue(rows)
+            return
+        try:
+            short = await self._db_call(
+                self.service.reconcile_message_counts, rows, before
+            )
+        except Exception:
+            log.exception("timed-out flush could not be reconciled")
+            self._requeue(rows)
+            return
+        self._requeue(list(short))
 
     def _requeue(self, rows: list[tuple[str, str, int]]) -> None:
         """Put counts that did not reach the database back in the buffer."""
@@ -1174,7 +1232,14 @@ class GiveawayBot(commands.Bot):
         if not await self._safe_defer(interaction):
             return
         try:
-            gw = await self._db_call(self.service.get, giveaway_id)
+            # A header read that this burst already paid for is reused: the
+            # panel needs the prize and the winner count, both immutable for a
+            # giveaway's lifetime except the count, which the window read
+            # supplies anyway. Same rule as the leave path.
+            gw = self._gw_cached(giveaway_id)
+            if gw is None:
+                gw = await self._db_call(self.service.get, giveaway_id)
+                self._gw_store(giveaway_id, gw)
             # One bounded window instead of the whole table, and in the SAME
             # read: the true total and the "am I in it" answer. Those were a
             # second COUNT(*) over the entries table plus a membership lookup
@@ -1235,8 +1300,12 @@ class GiveawayBot(commands.Bot):
         if not await self._safe_defer(interaction):
             return
         try:
-            removed = await self._db_call(
-                self.service.leave, giveaway_id, str(interaction.user.id)
+            # The delete and the counter bump are one lane, and the count comes
+            # back with them. Doing it separately used to cost the member's
+            # click a second read (the row) and a third (the counter, cached or
+            # not) just to refresh an embed whose total we already know here.
+            removed, count, live_status = await self._db_call(
+                self.service.leave_with_count, giveaway_id, str(interaction.user.id)
             )
         except Exception:
             # Previously this escaped the button callback: the member saw a bare
@@ -1285,7 +1354,9 @@ class GiveawayBot(commands.Bot):
                 return
             self._gw_store(giveaway_id, fresh)
         await self._take_entrants_role(fresh, str(interaction.user.id))
-        await self._refresh_embed(fresh)
+        # Status came back with the counter update, so the embed refresh does
+        # not need its own read just to learn the giveaway is still running.
+        await self._refresh_embed(fresh, entry_count=count, live_status=live_status or None)
 
     async def handle_claim(self, interaction: discord.Interaction, giveaway_id: str) -> None:
         if not await self._safe_defer(interaction):
@@ -1324,7 +1395,7 @@ class GiveawayBot(commands.Bot):
                 # B04: stale due rows must not beat a concurrent extend — the
                 # flip re-checks ends_at itself and refuses when extended.
                 ended, winners = await self._db_call(
-                    self.service.end, gw.id, require_due=True
+                    self.service.end, gw.id, require_due=True, known=gw
                 )
             except ServiceError as exc:
                 # Usually another ender won the claim (the tick and
@@ -1504,10 +1575,16 @@ class GiveawayBot(commands.Bot):
             return
         if not isinstance(channel, discord.TextChannel):
             return
-        try:
-            entries = await self._db_call(self.service.entry_count, gw.id)
-        except Exception:
-            entries = 0
+        # end()/reroll() hand back the giveaway with the final count already on
+        # it (the flip wrote it), so a celebration does not re-read the row it
+        # was just given. Only a caller that passes a row without one pays for
+        # the read.
+        entries = gw.entrant_count
+        if entries is None:
+            try:
+                entries = await self._db_call(self.service.entry_count, gw.id)
+            except Exception:
+                entries = 0
         claim_deadline_ms: int | None = None
         claim_deadlines: dict[str, int] = {}
         claim_view = None
@@ -1792,7 +1869,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             gw = await bot._db_call(
                 svc.resolve, str(interaction.guild.id), giveaway_id
             )
-            ended, winners = await bot._db_call(svc.end, gw.id)
+            ended, winners = await bot._db_call(svc.end, gw.id, known=gw)
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return

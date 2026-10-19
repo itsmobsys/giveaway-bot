@@ -168,7 +168,9 @@ class CommandWiringTests(BotTestCase):
     def test_a_failed_flush_keeps_the_counts(self) -> None:
         asyncio.run(self.bot.on_message(fake_message(self.guild, "3" * 18)))
         original = self.bot.service.add_message_counts
-        self.bot.service.add_message_counts = lambda rows: (_ for _ in ()).throw(OSError("turso down"))
+        self.bot.service.add_message_counts = lambda rows, receipt=None: (
+            _ for _ in ()
+        ).throw(OSError("turso down"))
         with self.assertRaises(OSError):
             asyncio.run(self.bot._flush_message_buffer())
         self.bot.service.add_message_counts = original
@@ -183,7 +185,7 @@ class CommandWiringTests(BotTestCase):
         asyncio.run(self.bot.on_message(fake_message(self.guild, "4" * 18)))
         original = self.bot.service.add_message_counts
 
-        def half_written(rows):
+        def half_written(rows, receipt=None):
             # One of the two buffered users made it; the other did not.
             raise PartialFlush(applied=1, error=OSError("turso down"))
 
@@ -198,6 +200,31 @@ class CommandWiringTests(BotTestCase):
         )
         asyncio.run(self.bot._flush_message_buffer())
         self.assertEqual(self.svc.message_count(self.guild, "4" * 18), 1)
+
+    def test_a_timed_out_flush_does_not_count_the_batch_twice(self) -> None:
+        for _ in range(3):
+            asyncio.run(self.bot.on_message(fake_message(self.guild, "3" * 18)))
+        original = self.bot.service.add_message_counts
+
+        def times_out_but_writes(rows, receipt=None):
+            # The worker outlived the await: by the time anybody looks, the
+            # counts are stored and the receipt says so.
+            original(rows, receipt=receipt)
+            raise TimeoutError()
+
+        self.bot.service.add_message_counts = times_out_but_writes
+
+        async def scenario() -> None:
+            with self.assertRaises(TimeoutError):
+                await self.bot._flush_message_buffer()
+            # The settle task is what decides how much goes back.
+            await asyncio.gather(*list(self.bot._bg_tasks))
+
+        asyncio.run(scenario())
+        self.bot.service.add_message_counts = original
+        self.assertEqual(self.bot._message_buffer, {},
+                         "what the abandoned worker wrote must not be requeued")
+        self.assertEqual(self.svc.message_count(self.guild, "3" * 18), 3)
 
     def test_buffer_overflow_flushes_early(self) -> None:
         self.bot.MESSAGE_BUFFER_MAX = 2
@@ -884,7 +911,9 @@ class LeaveTests(BotTestCase):
         def boom(*args, **kwargs):
             raise OSError("turso down")
 
-        self.bot.service.leave = boom
+        # The handler calls leave_with_count (it needs the post-leave total for
+        # the embed), so the failure has to be injected there.
+        self.bot.service.leave_with_count = boom
         asyncio.run(self.bot.handle_leave(interaction, gw.id))
         # This used to escape the button callback: a bare "interaction failed"
         # with nothing tying the error to the giveaway.
@@ -1028,14 +1057,14 @@ class GiveawayLifecycleTests(BotTestCase):
             gw, user_id=str(member.id), username="entrant", member_roles=[],
             account_created_ts=time.time() - 400 * 86400,
         )
-        original_leave = self.bot.service.leave
+        original_leave = self.bot.service.leave_with_count
 
         def leave_then_cancel(*args):
-            removed = original_leave(*args)
+            removed, count, status = original_leave(*args)
             self.svc.cancel(gw.id)
-            return removed
+            return removed, count, status
 
-        self.bot.service.leave = leave_then_cancel
+        self.bot.service.leave_with_count = leave_then_cancel
         interaction = FakeInteraction(guild=FakeGuild(self.guild, [member]), user=member)
         asyncio.run(self.bot.handle_leave(interaction, gw.id))
         self.assertIn("You left the giveaway.", interaction.texts)
