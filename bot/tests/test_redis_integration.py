@@ -28,7 +28,13 @@ from giveaway_bot.config import Settings
 from giveaway_bot.db import Database
 from giveaway_bot.redis_cache import RedisCache
 from giveaway_bot.service import GiveawayService
-from tests.test_bot import FakeGuild, FakeInteraction, FakeMember, FakeTextChannel
+from tests.test_bot import (
+    FakeGuild,
+    FakeInteraction,
+    FakeMember,
+    FakeTextChannel,
+    fake_user,
+)
 
 
 class FakeRedis:
@@ -67,6 +73,11 @@ class FakeRedis:
             if self.data.pop(key, None) is not None:
                 removed += 1
         return removed
+
+    async def ping(self):
+        self.calls.append(("ping", (), {}))
+        self._maybe_fail()
+        return True
 
     async def aclose(self) -> None:
         # The cache closes its client on shutdown; the fake only has to survive
@@ -493,6 +504,40 @@ class DuplicateClickTests(CachedBotTestCase):
         interaction = self.press_join(gw.id, member)
         self.assertTrue(any("You're in!" in text for text in interaction.texts))
         self.assertTrue(self.svc.has_entry(gw.id, str(member.id)))
+
+
+class RequestTimeProbeTests(CachedBotTestCase):
+    """The probe must show the cache it really used, warm and cold."""
+
+    def run_command(self):
+        command = self.bot.tree.get_command("gw_request_time")
+        self.assertIsNotNone(command, "the command must be registered")
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        asyncio.run(command.callback(interaction))
+        # FakeFollowup.send returns None, so the report lands as a follow-up.
+        return interaction.followup.sent[-1]
+
+    def test_the_report_shows_a_hit_for_a_warm_key(self) -> None:
+        gw = self.make()
+        member = FakeMember(888888888888888888)
+        self.press_join(gw.id, member)
+        report = self.run_command()
+        text = (report.get("content") if isinstance(report, dict) else "") or ""
+        self.assertIn("Redis ping", text)
+        self.assertIn("2nd", text, "the warm run has to be reported separately")
+        self.assertIn("HIT", text, "a served read must not be reported as a miss")
+        self.assertNotIn("**failed**", text, "a live fake must not report a failed leg")
+        self.assertIn("set(s)", text, "the probe's own SET+DEL are counted")
+        self.assertIn("Warm cache legs", text)
+        # The probe cleans up after itself in Redis as well as in Turso.
+        self.assertNotIn("gwbot:v1:probe:gw_request_time", self.fake.data)
+
+    def test_the_probe_never_prints_a_host_or_password(self) -> None:
+        self.make()
+        report = self.run_command()
+        text = (report.get("content") if isinstance(report, dict) else "") or ""
+        self.assertNotIn("example.invalid", text)
+        self.assertNotIn("6379", text)
 
 
 class SweepLeaseTests(CachedBotTestCase):

@@ -1835,6 +1835,12 @@ class RequestTimeTests(BotTestCase):
         for leg in (
             "Discord ack (defer)",
             "Discord reply (REST send)",
+            "Redis ping",
+            "Redis cache count",
+            "Redis cache notify-role",
+            "Redis write",
+            "Redis ops this command",
+            "Warm cache legs",
             "Turso ping",
             "Turso read",
             "Turso write",
@@ -1843,6 +1849,16 @@ class RequestTimeTests(BotTestCase):
             "Slowest leg",
         ):
             self.assertIn(leg, text)
+
+    def test_probe_says_so_when_there_is_no_redis(self) -> None:
+        """No cache configured must read as absent, never as a fast zero."""
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        report = self.run_command(interaction)
+        text = report.get("content") if isinstance(report, dict) else getattr(report, "content", "")
+        text = text or ""
+        self.assertIn("no REDIS_URL", text)
+        self.assertIn("not configured", text)
+        self.assertNotIn("HIT", text)
 
     def test_write_probe_leaves_no_row_behind(self) -> None:
         interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())

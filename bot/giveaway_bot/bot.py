@@ -2484,16 +2484,23 @@ def wire_commands(bot: GiveawayBot) -> None:
 
     @bot.tree.command(
         name="gw_request_time",
-        description="Time a real giveaway request (Turso + Discord legs)",
+        description="Time a real giveaway request (Redis + Turso + Discord legs)",
     )
     async def gw_request_time(interaction: discord.Interaction) -> None:
         """Live cost of one request, timed leg by leg — not a gateway ping.
 
-        Each leg runs the same call the Join button pays (join-shaped SELECT,
-        guarded write, Discord ack + REST send) and times it with
-        perf_counter, lane queue + thread hop included, so the numbers are
-        this server's real Turso + Discord latency right now. Ephemeral; the
-        write probe touches one probe-only row and deletes it right after.
+        Each leg runs the same call the Join button pays (Redis cache reads,
+        join-shaped SELECT, guarded write, Discord ack + REST send) and times
+        it with perf_counter, lane queue + thread hop included, so the numbers
+        are this server's real Redis + Turso + Discord latency right now.
+
+        The Redis legs and the two cache-warm reads are measured, not
+        simulated: one PING through the governed client, then the real cached
+        readers on their real keys, reported as a HIT or a MISS with the
+        matching cost. A command that showed only the warm path would look
+        fast while saying nothing, so the cold path is always printed next to
+        it. Ephemeral; the write probe touches one probe-only Redis key and
+        one probe-only Turso row and removes both right after.
         """
         if interaction.guild is None:
             try:
@@ -2529,6 +2536,25 @@ def wire_commands(bot: GiveawayBot) -> None:
                 gateway_ms = None
         except Exception:
             gateway_ms = None
+        redis_ms: float | None = None
+        redis_note = ""
+        cache_ops: int | None = None
+        redis_hits: int | None = None
+        redis_misses: int | None = None
+        redis_skipped: int | None = None
+        redis_failed: int | None = None
+        count_ms: float | None = None
+        count_note = ""
+        role_ms: float | None = None
+        role_note = ""
+        # The same pair of cached reads as a total, first (cold) then second
+        # (warm) run, so the repeat-click cost can be compared honestly.
+        cold_total_ms: float | None = None
+        warm_total_ms: float | None = None
+        cache_gets: int | None = None
+        cache_stores: int | None = None
+        redis_probe_ms: float | None = None
+        redis_probe_note = ""
         ping_ms: float | None = None
         ping_note = ""
         lookup_ms: float | None = None
@@ -2538,7 +2564,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         write_ms: float | None = None
         write_note = ""
         rest_ms: float | None = None
-        # Leg 1: minimal Turso round-trip on the same gated lane Join uses.
+        # Leg 2: minimal Turso round-trip on the same gated lane Join uses.
         # "Ping" is one SELECT 1 query + row fetch, not ICMP: warm it costs
         # ~1 RTT, while a cold/stale lane pays TLS + Turso auth inside this
         # same number (that is the cold-vs-warm gap, not server slowness).
@@ -2550,20 +2576,148 @@ def wire_commands(bot: GiveawayBot) -> None:
         except Exception:
             log.exception("request-time ping probe failed")
             ping_note = "ping probe failed"
-        # Leg 2: the exact pre-ack read the Join button runs. With a live
+        # Leg 0: the same pre-ack list the Join button reads, timed. It also
+        # supplies the giveaway id the cached-count leg below reads, so the
+        # cache is measured on a real key, never a synthetic one.
+        try:
+            t_lookup = time.perf_counter()
+            live = await bot._db_call(svc.list_active, gid)
+            lookup_ms = (time.perf_counter() - t_lookup) * 1000.0
+            lookup_note = f"{len(live)} live giveaway(s) listed"
+        except Exception:
+            live = []
+            lookup_ms = None
+            lookup_note = "lookup failed"
+        gw_id = live[0].id if live else ""
+        # Leg 1: the real Redis path this request takes, in the order it takes
+        # it — one PING through the governed shared client, then the two cached
+        # readers on their real keys. Both readers are read-through, so each run
+        # reports HIT or MISS with the cost that actually came with it; nothing
+        # here is simulated. The pair is run twice on purpose: the second run is
+        # the warm cost a click pays, and the first shows what filling an empty
+        # cache costs. A report that printed only the warm run would look fast
+        # while saying nothing.
+        redis = getattr(bot, "redis", None)
+        if redis is None or not getattr(redis, "configured", False):
+            redis_note = "not configured (no REDIS_URL) — every read here is a Turso read"
+        else:
+
+            async def _timed_cached(reader, *args):
+                """One cached reader call: (ms, value, served).
+
+                'served' is read off the cache's own hit counter, never guessed,
+                so the report can say HIT or MISS with the cost that came with
+                it. A warm read and a fall-through to Turso are very different
+                numbers and must never be blurred into one.
+                """
+                try:
+                    c0 = int((redis.stats().get("counters") or {}).get("hits", 0))
+                except Exception:
+                    c0 = None
+                started = time.perf_counter()
+                try:
+                    value = await reader(*args)
+                except Exception:
+                    return None, None, None
+                elapsed = (time.perf_counter() - started) * 1000.0
+                served = None
+                try:
+                    c1 = int((redis.stats().get("counters") or {}).get("hits", 0))
+                    if c0 is not None:
+                        served = c1 > c0
+                except Exception:
+                    served = None
+                return elapsed, value, served
+
+            def _label(served: bool | None) -> str:
+                if served is None:
+                    return "hit/miss unknown"
+                return "HIT" if served else "MISS (fell through to Turso)"
+
+            def _runs_note(runs: list[tuple[float | None, str]]) -> str:
+                parts = []
+                for index, (ms, label) in enumerate(runs, 1):
+                    shown = "failed" if ms is None else f"{ms:.0f}ms"
+                    parts.append(f"{'1st' if index == 1 else '2nd'} {shown} {label}")
+                return "; ".join(parts)
+
+            try:
+                before = dict(redis.stats().get("counters") or {})
+            except Exception:
+                before = {}
+            try:
+                t_leg = time.perf_counter()
+                redis_ms = await redis.ping_ms()
+                redis_note = "PING through the shared client (auth + pool reuse included)"
+            except Exception:
+                log.exception("request-time redis ping failed")
+                redis_note = "redis ping failed"
+            # The cached readers live on the service; it only has them when a
+            # cache is wired in. Reading through svc is what a real click does.
+            gwc = bot.service if getattr(bot.service, "_redis", None) is not None else None
+            if gwc is None:
+                count_note = role_note = "no cache wired into the service"
+            elif not gw_id:
+                count_note = role_note = "no live giveaway id to read a cached count for"
+            else:
+                # Twice on purpose: run 1 is what a cold cache costs (it falls
+                # through to Turso), run 2 is the warm cost a click pays. Both
+                # numbers are printed; a report showing only the warm run would
+                # look fast while saying nothing.
+                count_runs: list[tuple[float | None, str]] = []
+                role_runs: list[tuple[float | None, str]] = []
+                n_cached = None
+                for _ in range(2):
+                    ms, n_cached, served = await _timed_cached(
+                        gwc.entry_count_cached, gw_id
+                    )
+                    count_runs.append((ms, "failed" if ms is None else _label(served)))
+                    ms, _role, served = await _timed_cached(
+                        gwc.get_notify_role_cached, gid
+                    )
+                    role_runs.append((ms, "failed" if ms is None else _label(served)))
+                # The headline number is the warm run (what a repeat click
+                # pays); both runs stay visible in the note beside it.
+                warm_count_ms = count_runs[-1][0]
+                warm_role_ms = role_runs[-1][0]
+                count_ms = warm_count_ms
+                role_ms = warm_role_ms
+                cold_vals = [runs[0][0] for runs in (count_runs, role_runs) if runs[0][0]]
+                if len(cold_vals) == 2:
+                    cold_total_ms = sum(cold_vals)
+                warm_vals = [v for v in (warm_count_ms, warm_role_ms) if v is not None]
+                if len(warm_vals) == 2:
+                    warm_total_ms = sum(warm_vals)
+                count_note = f"{_runs_note(count_runs)} - {n_cached} entrant(s)"
+                role_note = _runs_note(role_runs)
+            try:
+                after = dict(redis.stats().get("counters") or {})
+            except Exception:
+                after = {}
+            deltas: dict[str, int] = {}
+            for name in ("hits", "misses", "skipped", "failed", "attempted", "ok"):
+                try:
+                    deltas[name] = int(after.get(name, 0)) - int(before.get(name, 0))
+                except Exception:
+                    pass
+            redis_hits = deltas.get("hits")
+            redis_misses = deltas.get("misses")
+            redis_skipped = deltas.get("skipped")
+            redis_failed = deltas.get("failed")
+            cache_ops = deltas.get("attempted")
+            cache_stores = deltas.get("ok")
+            cache_gets = (
+                redis_hits + redis_misses
+                if None not in (redis_hits, redis_misses)
+                else None
+            )
+            if before and not after:
+                count_note = role_note = "cache stats unavailable"
+        # Leg 3: the exact pre-ack read the Join button runs. With a live
         # giveaway that is join_snapshot (row + 4 eligibility subqueries, one
         # trip); without one, the same-shaped eligibility SELECT, labelled so
         # nobody mistakes a synthetic read for a live one.
         try:
-            try:
-                t_lookup = time.perf_counter()
-                live = await bot._db_call(svc.list_active, gid)
-                lookup_ms = (time.perf_counter() - t_lookup) * 1000.0
-                lookup_note = f"{len(live)} live giveaway(s) listed"
-            except Exception:
-                live = []
-                lookup_ms = None
-                lookup_note = "lookup failed"
             t_leg = time.perf_counter()
             if live:
                 target = live[0]
@@ -2580,7 +2734,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             log.exception("request-time read probe failed")
             if not read_note:
                 read_note = "read probe failed"
-        # Leg 3: a real guarded write + cleanup on a probe-only row. The key
+        # Leg 4: a real guarded write + cleanup on a probe-only row. The key
         # is non-numeric so it can never collide with a member snowflake.
         probe_uid = "gw_request_time_probe"
         try:
@@ -2616,7 +2770,32 @@ def wire_commands(bot: GiveawayBot) -> None:
                 )
             except Exception:
                 pass
-        # Leg 4: a real Discord REST send, timed. It is then edited into the
+        # Leg 5: one real SET + DEL on a probe-only Redis key, so the write
+        # path is measured and not just the reads. The key is namespaced and
+        # deleted again on every path, including the failure path below.
+        redis_probe_key = "probe:gw_request_time"
+        if redis is not None and getattr(redis, "configured", False):
+            try:
+                t_probe = time.perf_counter()
+                wrote = await redis.set(redis_probe_key, "1", 10)
+                wrote = wrote and await redis.delete(redis_probe_key) >= 0
+                redis_probe_ms = (time.perf_counter() - t_probe) * 1000.0
+                redis_probe_note = (
+                    "SET then DEL one probe key (2 round trips)"
+                    if wrote
+                    else "SET/DEL refused (Redis degraded or over budget)"
+                )
+            except Exception:
+                log.exception("request-time redis write probe failed")
+                redis_probe_ms = None
+                redis_probe_note = "redis write probe failed"
+                try:
+                    await redis.delete(redis_probe_key)
+                except Exception:
+                    pass
+        else:
+            redis_probe_note = "not configured"
+        # Leg 6: a real Discord REST send, timed. It is then edited into the
         # report so the invoker sees one ephemeral reply, not two.
         probe_msg = None
         try:
@@ -2651,9 +2830,29 @@ def wire_commands(bot: GiveawayBot) -> None:
         def _fmt(value: float | None) -> str:
             return f"{value:.0f}ms" if value is not None else "failed"
 
+        def _ops() -> str:
+            if cache_gets is None:
+                return "n/a"
+            bits = [f"{cache_gets} get(s)"]
+            if cache_stores is not None:
+                bits.append(f"{cache_stores} set(s)")
+            if cache_ops is not None:
+                bits.append(f"{cache_ops} op(s)")
+            if redis_hits is not None and redis_misses is not None:
+                bits.append(f"{redis_hits} hit / {redis_misses} miss")
+            if redis_skipped:
+                bits.append(f"{redis_skipped} skipped over budget")
+            if redis_failed:
+                bits.append(f"{redis_failed} failed")
+            return ", ".join(bits)
+
         short = [
             ("Discord ack", ack_ms),
             ("Discord reply", rest_ms),
+            ("Redis ping", redis_ms),
+            ("Redis cache count", count_ms),
+            ("Redis cache notify-role", role_ms),
+            ("Redis write", redis_probe_ms),
             ("Turso ping", ping_ms),
             ("Turso lookup", lookup_ms),
             ("Turso read", read_ms),
@@ -2668,10 +2867,21 @@ def wire_commands(bot: GiveawayBot) -> None:
         except Exception:
             sess = "n/a"
         where = f" @ {host}" if host else ""
+        if warm_total_ms is None:
+            warm_txt = "n/a"
+        elif cold_total_ms is None or cold_total_ms <= warm_total_ms:
+            warm_txt = f"{warm_total_ms:.0f}ms"
+        else:
+            warm_txt = f"{cold_total_ms:.0f}ms cold -> {warm_total_ms:.0f}ms warm"
         lines = [
             "Request-time breakdown — live legs, timed just now:",
             f"• Discord ack (defer): **{_fmt(ack_ms)}**",
             f"• Discord reply (REST send): **{_fmt(rest_ms)}**",
+            f"• Redis ping: **{_fmt(redis_ms)}** — {redis_note or 'n/a'}",
+            f"• Redis cache count: **{_fmt(count_ms)}** — {count_note or 'n/a'}",
+            f"• Redis cache notify-role: **{_fmt(role_ms)}** — {role_note or 'n/a'}",
+            f"• Redis write: **{_fmt(redis_probe_ms)}** — {redis_probe_note or 'n/a'}",
+            f"• Redis ops this command: {_ops()}",
             f"• Turso ping: **{_fmt(ping_ms)}** — {ping_note or 'n/a'}",
             f"• Turso lookup (list_active): **{_fmt(lookup_ms)}** — {lookup_note or 'n/a'}",
             f"• Turso read: **{_fmt(read_ms)}** — {read_note or 'n/a'}",
@@ -2679,6 +2889,8 @@ def wire_commands(bot: GiveawayBot) -> None:
             f"• Gateway heartbeat: **{gw_txt}** (websocket, for reference)",
             f"• Event-loop lag: **{lag_txt}** (sleep(0) sample, for reference)",
             f"• Total measured: **{total_ms:.0f}ms** (excludes this message's edit)",
+            f"• Warm cache legs (2nd run, what a repeat click pays): **{warm_txt}** —"
+            " timed in this same command, next to the cold/Turso legs above",
             f"• Slowest leg: **{slowest}**",
             f"• Backend: `{backend}`{where} · db lanes free: {lanes} · session: {sess}",
         ]
