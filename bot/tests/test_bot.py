@@ -1837,18 +1837,22 @@ class RequestTimeTests(BotTestCase):
             "Discord reply (REST send)",
             "Redis ping",
             "Redis cache count",
+            "Redis cache list",
             "Redis cache notify-role",
             "Redis write",
             "Redis ops this command",
             "Warm cache legs",
-            "Turso ping",
-            "Turso read",
-            "Turso write",
             "Gateway heartbeat",
             "Total measured",
             "Slowest leg",
         ):
             self.assertIn(leg, text)
+        # The database is not this command's business any more: not one of its
+        # legs, not its slowest, not its total. A cache miss or a Redis outage
+        # falls through to the database, and that cost belongs to another report.
+        self.assertNotIn("Turso", text)
+        self.assertNotIn("database leg is measured or printed", text.replace(
+            "No database leg is measured or printed", ""))
 
     def test_probe_says_so_when_there_is_no_redis(self) -> None:
         """No cache configured must read as absent, never as a fast zero."""
@@ -1877,13 +1881,20 @@ class RequestTimeTests(BotTestCase):
         else:
             text = getattr(report, "content", "") or ""
         for leg in (
-            "Turso lookup",
             "Event-loop lag",
-            "SELECT 1 round-trip",
-            "insert",
-            "delete",
+            "Redis cache list",
         ):
             self.assertIn(leg, text)
+        # This bot has no cache wired in, so the list leg must say it was not
+        # measured instead of borrowing a number from somewhere else.
+        self.assertIn("not measured", text)
+        # The write probe is Redis-only now: no probe row may be written.
+        rows = self.db.query(
+            "SELECT * FROM simple_message_counts WHERE user_id = ?",
+            ("gw_request_time_probe",),
+        )
+        self.assertEqual(rows, [])
+        self.assertNotIn("Turso", text)
 
     def test_dm_says_to_use_a_server(self) -> None:
         interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
