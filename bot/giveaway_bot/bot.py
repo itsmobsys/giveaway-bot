@@ -365,7 +365,7 @@ class GiveawayBot(commands.Bot):
         try:
             # Off the event loop: this is a network round-trip, and blocking
             # here delays the gateway heartbeat that keeps the bot online.
-            live = await asyncio.to_thread(self.service.list_all_active, 200)
+            live = await self._db_call(self.service.list_all_active, 200)
         except Exception:
             log.exception("could not preload active giveaways")
             live = []
@@ -394,7 +394,7 @@ class GiveawayBot(commands.Bot):
             log.exception("db pool warmup failed")
         self._cache_autocomplete(live)
         try:
-            ended_pre = await asyncio.to_thread(self.service.list_all_ended, 200)
+            ended_pre = await self._db_call(self.service.list_all_ended, 200)
         except Exception:
             log.exception("could not preload ended giveaways")
             ended_pre = []
@@ -403,7 +403,7 @@ class GiveawayBot(commands.Bot):
         # deleted (bot was down during the 5-minute window, or the delete
         # failed). Clean the pileup now instead of leaving roles forever.
         try:
-            leftovers = await asyncio.to_thread(self.service.ended_with_roles)
+            leftovers = await self._db_call(self.service.ended_with_roles)
         except Exception:
             log.exception("leftover role sweep failed")
             leftovers = []
@@ -678,7 +678,7 @@ class GiveawayBot(commands.Bot):
         batch, self._message_buffer = self._message_buffer, {}
         rows = [(guild_id, user_id, n) for (guild_id, user_id), n in batch.items()]
         try:
-            await asyncio.to_thread(self.service.add_message_counts, rows)
+            await self._db_call(self.service.add_message_counts, rows)
         except PartialFlush as exc:
             # The chunks before the failure are already stored, so only the tail
             # goes back: restoring the whole batch would write the committed head
@@ -808,7 +808,7 @@ class GiveawayBot(commands.Bot):
         if role is None:
             return
         try:
-            entrants = await asyncio.to_thread(self.service.entries, gw.id)
+            entrants = await self._db_call(self.service.entries, gw.id)
         except Exception:
             log.exception("could not list entrants for role strip (%s)", gw.id)
             entrants = []
@@ -881,7 +881,7 @@ class GiveawayBot(commands.Bot):
                     "guild %s unavailable; dropping entrants role cleanup for %s",
                     guild_id, giveaway_id,
                 )
-                await asyncio.to_thread(self.service.set_entrants_role, giveaway_id, None)
+                await self._db_call(self.service.set_entrants_role, giveaway_id, None)
                 return
             role = guild.get_role(int(role_id)) if role_id.isdigit() else None
             if role is not None:
@@ -902,7 +902,7 @@ class GiveawayBot(commands.Bot):
             # Role already gone (or the delete failed for good): record that so
             # the restart sweep stops queueing it.
             try:
-                await asyncio.to_thread(self.service.set_entrants_role, giveaway_id, None)
+                await self._db_call(self.service.set_entrants_role, giveaway_id, None)
             except Exception:
                 log.exception("could not clear entrants role for %s", giveaway_id)
         except Exception:
@@ -1171,14 +1171,14 @@ class GiveawayBot(commands.Bot):
         if not await self._safe_defer(interaction):
             return
         try:
-            gw = await asyncio.to_thread(self.service.get, giveaway_id)
+            gw = await self._db_call(self.service.get, giveaway_id)
             # One bounded window instead of the whole table, and in the SAME
             # read: the true total and the "am I in it" answer. Those were a
             # second COUNT(*) over the entries table plus a membership lookup
             # -- three reads of one table for one message. A failed read
             # returns None, which the caller reports rather than printing
             # zeros as facts.
-            found = await asyncio.to_thread(
+            found = await self._db_call(
                 self.service.entries_snapshot,
                 gw.id,
                 self.PARTICIPANT_WINDOW,
@@ -1232,7 +1232,7 @@ class GiveawayBot(commands.Bot):
         if not await self._safe_defer(interaction):
             return
         try:
-            removed = await asyncio.to_thread(
+            removed = await self._db_call(
                 self.service.leave, giveaway_id, str(interaction.user.id)
             )
         except Exception:
@@ -1274,7 +1274,7 @@ class GiveawayBot(commands.Bot):
             fresh = cached_leave
         else:
             try:
-                fresh = await asyncio.to_thread(self.service.get, giveaway_id)
+                fresh = await self._db_call(self.service.get, giveaway_id)
             except ServiceError:
                 return
             except Exception:
@@ -1288,7 +1288,7 @@ class GiveawayBot(commands.Bot):
         if not await self._safe_defer(interaction):
             return
         try:
-            await asyncio.to_thread(
+            await self._db_call(
                 self.service.claim, giveaway_id, str(interaction.user.id)
             )
         except ServiceError as exc:
@@ -1442,7 +1442,7 @@ class GiveawayBot(commands.Bot):
         self._tick_count += 1
         if self._tick_count % 20 == 0:
             try:
-                wiped = await asyncio.to_thread(self.service.wipe_stale_entries)
+                wiped = await self._db_call(self.service.wipe_stale_entries)
             except Exception:
                 log.exception("entry wipe failed")
             else:
@@ -1480,7 +1480,7 @@ class GiveawayBot(commands.Bot):
                 return resp.status, (time.perf_counter() - started) * 1000
 
         try:
-            status, ms = await asyncio.to_thread(_ping)
+            status, ms = await self._db_call(_ping)
         except Exception as exc:
             log.warning("health check failed: %s", exc)
             return
@@ -1502,7 +1502,7 @@ class GiveawayBot(commands.Bot):
         if not isinstance(channel, discord.TextChannel):
             return
         try:
-            entries = await asyncio.to_thread(self.service.entry_count, gw.id)
+            entries = await self._db_call(self.service.entry_count, gw.id)
         except Exception:
             entries = 0
         claim_deadline_ms: int | None = None
@@ -1510,7 +1510,7 @@ class GiveawayBot(commands.Bot):
         claim_view = None
         try:
             if gw.claim_enabled and winners:
-                pending = await asyncio.to_thread(self.service.pending_claims, gw.id)
+                pending = await self._db_call(self.service.pending_claims, gw.id)
                 for r in pending:
                     uid = str(r.get("user_id") or "")
                     if uid in winners and r.get("deadline_ms"):
@@ -1692,7 +1692,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         role_slots = [required_role_1, required_role_2, required_role_3, required_role_4, required_role_5]
         need_roles = [str(r.id) for r in role_slots if r is not None]
         try:
-            gw = await asyncio.to_thread(
+            gw = await bot._db_call(
                 svc.create,
                 guild_id=str(interaction.guild.id),
                 channel_id=str(channel.id),
@@ -1742,7 +1742,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             # see and then auto-draw winners into a channel that already refused
             # the bot, so the record is dropped and the reason reported.
             log.warning("cannot post giveaway %s in %s: %s", gw.id, channel.id, exc)
-            await asyncio.to_thread(svc.discard, gw.id)
+            await bot._db_call(svc.discard, gw.id)
             await bot._safe_followup(
                 interaction,
                 f"⚠️ I cannot post in {channel.mention}. Give me **Send Messages**"
@@ -1751,7 +1751,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             return
         message_note = ""
         try:
-            await asyncio.to_thread(svc.set_message, gw.id, str(msg.id))
+            await bot._db_call(svc.set_message, gw.id, str(msg.id))
         except Exception:
             log.exception("could not save message id for giveaway %s", gw.id)
             message_note = " (message tracking could not be saved)"
@@ -1764,7 +1764,7 @@ def wire_commands(bot: GiveawayBot) -> None:
                     reason=f"Entrants role for giveaway {gw.id}",
                 )
                 try:
-                    await asyncio.to_thread(svc.set_entrants_role, gw.id, str(role.id))
+                    await bot._db_call(svc.set_entrants_role, gw.id, str(role.id))
                 except Exception:
                     role_note = " (entrants role could not be saved)"
                     log.exception("could not save entrants role for giveaway %s", gw.id)
@@ -1786,10 +1786,10 @@ def wire_commands(bot: GiveawayBot) -> None:
         except (discord.NotFound, discord.HTTPException):
             return
         try:
-            gw = await asyncio.to_thread(
+            gw = await bot._db_call(
                 svc.resolve, str(interaction.guild.id), giveaway_id
             )
-            ended, winners = await asyncio.to_thread(svc.end, gw.id)
+            ended, winners = await bot._db_call(svc.end, gw.id)
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
@@ -1819,15 +1819,15 @@ def wire_commands(bot: GiveawayBot) -> None:
         except (discord.NotFound, discord.HTTPException):
             return
         try:
-            gw = await asyncio.to_thread(
+            gw = await bot._db_call(
                 svc.resolve_ended, str(interaction.guild.id), giveaway_id
             )
             if user is not None:
-                ended, fresh = await asyncio.to_thread(
+                ended, fresh = await bot._db_call(
                     svc.reroll, gw.id, 1, str(user.id)
                 )
             else:
-                ended, fresh = await asyncio.to_thread(svc.reroll, gw.id, max(1, count))
+                ended, fresh = await bot._db_call(svc.reroll, gw.id, max(1, count))
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
@@ -1853,10 +1853,10 @@ def wire_commands(bot: GiveawayBot) -> None:
         except (discord.NotFound, discord.HTTPException):
             return
         try:
-            gw = await asyncio.to_thread(
+            gw = await bot._db_call(
                 svc.resolve_ended, str(interaction.guild.id), giveaway_id
             )
-            await asyncio.to_thread(
+            await bot._db_call(
                 svc.skip_claim, gw.id, str(user.id), str(interaction.user.id)
             )
         except ServiceError as exc:
@@ -1882,10 +1882,10 @@ def wire_commands(bot: GiveawayBot) -> None:
         except (discord.NotFound, discord.HTTPException):
             return
         try:
-            gw = await asyncio.to_thread(
+            gw = await bot._db_call(
                 svc.resolve, str(interaction.guild.id), giveaway_id
             )
-            ended = await asyncio.to_thread(svc.cancel, gw.id)
+            ended = await bot._db_call(svc.cancel, gw.id)
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
@@ -1941,10 +1941,10 @@ def wire_commands(bot: GiveawayBot) -> None:
         except (discord.NotFound, discord.HTTPException):
             return
         try:
-            gw = await asyncio.to_thread(
+            gw = await bot._db_call(
                 svc.resolve, str(interaction.guild.id), giveaway_id
             )
-            fresh = await asyncio.to_thread(svc.extend, gw.id, max(1, minutes) * 60)
+            fresh = await bot._db_call(svc.extend, gw.id, max(1, minutes) * 60)
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
@@ -1956,7 +1956,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         )
         # Tell the people waiting: ping every entrant in the giveaway channel.
         try:
-            entrants = await asyncio.to_thread(svc.entries, fresh.id)
+            entrants = await bot._db_call(svc.entries, fresh.id)
         except Exception:
             log.exception("entrant lookup failed for extend notice (%s)", fresh.id)
             entrants = []
@@ -2017,14 +2017,14 @@ def wire_commands(bot: GiveawayBot) -> None:
         gid = str(interaction.guild.id)
         if giveaway_id:
             try:
-                gw = await asyncio.to_thread(svc.resolve, gid, giveaway_id)
+                gw = await bot._db_call(svc.resolve, gid, giveaway_id)
             except ServiceError as exc:
                 await bot._safe_followup(interaction, f"⚠️ {exc.message}")
                 return
             # Count and page separately: the total is what the header needs, and
             # only 50 of them are ever printed.
-            total = await asyncio.to_thread(svc.entry_count, gw.id)
-            entrants = await asyncio.to_thread(svc.entries, gw.id, 50)
+            total = await bot._db_call(svc.entry_count, gw.id)
+            entrants = await bot._db_call(svc.entries, gw.id, 50)
             host = f" by <@{gw.host_id}>" if gw.host_id else ""
             chance = min(100.0, gw.winner_count / total * 100) if total else 0.0
             odds = (
@@ -2047,13 +2047,13 @@ def wire_commands(bot: GiveawayBot) -> None:
                 + extra,
             )
             return
-        active = await asyncio.to_thread(svc.list_active, gid)
+        active = await bot._db_call(svc.list_active, gid)
         if not active:
             await bot._safe_followup(interaction, "No active giveaways.")
             return
         lines = []
         for gw in active[:10]:
-            n = await asyncio.to_thread(svc.entry_count, gw.id)
+            n = await bot._db_call(svc.entry_count, gw.id)
             each = f" — **{min(100.0, gw.winner_count / n * 100):.1f}%** each" if n else ""
             # Ten lines carrying full 256-character prizes pass Discord's 2000
             # character cap, and the resulting 400 would be swallowed by
@@ -2085,7 +2085,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             return
         if role is None:
             try:
-                current = await asyncio.to_thread(svc.get_notify_role, gid)
+                current = await bot._db_call(svc.get_notify_role, gid)
             except Exception:
                 current = None
             # A hand-edited non-numeric id must read as "unset", not crash the
@@ -2115,7 +2115,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             log.warning("could not make notify role %s mentionable", role.id)
             note = " — but I could not make it mentionable (I need **Manage Roles**)"
         try:
-            await asyncio.to_thread(svc.set_notify_role, gid, str(role.id))
+            await bot._db_call(svc.set_notify_role, gid, str(role.id))
         except Exception:
             log.exception("notify role save failed")
             await bot._safe_followup(interaction, "⚠️ Could not save. Try again.")
@@ -2146,10 +2146,10 @@ def wire_commands(bot: GiveawayBot) -> None:
         except (discord.NotFound, discord.HTTPException):
             return
         try:
-            gw = await asyncio.to_thread(
+            gw = await bot._db_call(
                 svc.resolve, str(interaction.guild.id), giveaway_id
             )
-            entrants = await asyncio.to_thread(svc.entries, gw.id)
+            entrants = await bot._db_call(svc.entries, gw.id)
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
@@ -2218,8 +2218,8 @@ def wire_commands(bot: GiveawayBot) -> None:
             return
         gid, uid = str(interaction.guild.id), str(user.id)
         try:
-            await asyncio.to_thread(svc.blacklist_add, gid, uid)
-            active = await asyncio.to_thread(svc.list_active, gid)
+            await bot._db_call(svc.blacklist_add, gid, uid)
+            active = await bot._db_call(svc.list_active, gid)
         except Exception:
             log.exception("blacklist add failed for %s", uid)
             await bot._safe_followup(interaction, "⚠️ Could not update the blacklist. Try again.")
@@ -2250,7 +2250,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         except (discord.NotFound, discord.HTTPException):
             return
         try:
-            removed = await asyncio.to_thread(
+            removed = await bot._db_call(
                 svc.blacklist_remove, str(interaction.guild.id), str(user.id)
             )
         except Exception:
@@ -2276,10 +2276,10 @@ def wire_commands(bot: GiveawayBot) -> None:
         except (discord.NotFound, discord.HTTPException):
             return
         try:
-            ids = await asyncio.to_thread(
+            ids = await bot._db_call(
                 svc.blacklist_list, str(interaction.guild.id)
             )
-            total = await asyncio.to_thread(
+            total = await bot._db_call(
                 svc.count_blacklisted, str(interaction.guild.id)
             )
         except Exception:
@@ -2325,12 +2325,12 @@ def wire_commands(bot: GiveawayBot) -> None:
             )
             return
         try:
-            info = await asyncio.to_thread(
+            info = await bot._db_call(
                 svc.blacklist_add, gid, uid,
                 hours=hours_int, reason=reason or "",
                 banned_by=str(getattr(interaction.user, "id", "")),
             )
-            active = await asyncio.to_thread(svc.list_active, gid)
+            active = await bot._db_call(svc.list_active, gid)
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
@@ -2382,7 +2382,7 @@ def wire_commands(bot: GiveawayBot) -> None:
         except (discord.NotFound, discord.HTTPException):
             return
         try:
-            removed = await asyncio.to_thread(
+            removed = await bot._db_call(
                 svc.blacklist_remove, str(interaction.guild.id), str(user.id)
             )
         except Exception:
@@ -2410,11 +2410,11 @@ def wire_commands(bot: GiveawayBot) -> None:
         try:
             gid = str(interaction.guild.id)
             try:
-                await asyncio.to_thread(svc.purge_expired_bans)
+                await bot._db_call(svc.purge_expired_bans)
             except Exception:
                 log.exception("ban purge failed")
-            rows = await asyncio.to_thread(svc.blacklist_list_detailed, gid)
-            total = await asyncio.to_thread(svc.count_blacklisted, gid)
+            rows = await bot._db_call(svc.blacklist_list_detailed, gid)
+            total = await bot._db_call(svc.count_blacklisted, gid)
         except Exception:
             log.exception("ban list failed")
             await bot._safe_followup(
@@ -2460,10 +2460,10 @@ def wire_commands(bot: GiveawayBot) -> None:
         except (discord.NotFound, discord.HTTPException):
             return
         try:
-            rows = await asyncio.to_thread(svc.list_timeout_bans, str(guild.id))
+            rows = await bot._db_call(svc.list_timeout_bans, str(guild.id))
             # A second cheap query: the listing is capped, and the embed has to
             # state the real total instead of the size of the page set.
-            total = await asyncio.to_thread(svc.count_timeout_bans, str(guild.id))
+            total = await bot._db_call(svc.count_timeout_bans, str(guild.id))
         except Exception:
             log.exception("timeout ban list failed")
             await bot._safe_followup(

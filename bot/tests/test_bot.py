@@ -8,6 +8,7 @@ snapshot, the entrants-role task bookkeeping -- can be driven directly here.
 from __future__ import annotations
 
 import asyncio
+import pathlib
 import signal
 import sqlite3
 import time
@@ -2014,6 +2015,52 @@ class RequestTimeTests(BotTestCase):
         asyncio.run(command.callback(interaction))
         self.assertEqual(interaction.response.sent[0]["content"], "Use this in a server.")
         self.assertEqual(interaction.followup.sent, [])
+
+
+class OffLoopReadPoolTests(BotTestCase):
+    """Blocking reads must ride the pinned pool, not the default executor.
+
+    The loop's default executor is min(32, cpu+4) workers -- 5 on the 1-CPU
+    instance this bot is deployed on -- and every cold worker opens its own
+    database stream (a fresh TLS + auth handshake). The pinned pool is 64
+    lanes, warm after the first burst, and gated. Two call sites used to run
+    their blocking read on the default executor: the heartbeat's /health
+    probe and the active-giveaway lookup the request probe needs for its key.
+    """
+
+    def spy_on_db_call(self) -> list:
+        seen: list = []
+        real = self.bot._db_call
+
+        async def spy(func, *args, **kwargs):
+            seen.append(getattr(func, "__name__", repr(func)))
+            return await real(func, *args, **kwargs)
+
+        self.bot._db_call = spy  # type: ignore[method-assign]
+        self.addCleanup(setattr, self.bot, "_db_call", real)
+        return seen
+
+    def test_the_request_probe_lookup_rides_the_pinned_pool(self) -> None:
+        seen = self.spy_on_db_call()
+        command = self.bot.tree.get_command("gw_request_time")
+        self.assertIsNotNone(command)
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        asyncio.run(command.callback(interaction))
+        self.assertIn("list_active", seen, f"the probe's own read went elsewhere: {seen}")
+
+    def test_the_health_probe_rides_the_pinned_pool(self) -> None:
+        seen = self.spy_on_db_call()
+        asyncio.run(self.bot.heartbeat.coro(self.bot))
+        self.assertIn("_ping", seen, f"the health probe went elsewhere: {seen}")
+
+    def test_no_blocking_read_is_left_on_the_default_executor(self) -> None:
+        source = pathlib.Path(__file__).resolve().parent.parent / "giveaway_bot" / "bot.py"
+        text = source.read_text(encoding="utf-8")
+        self.assertNotIn(
+            "await asyncio.to_thread(",
+            text,
+            "every off-loop database read must go through _db_call (the pinned pool)",
+        )
 
 
 if __name__ == "__main__":
