@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 from .db import Database, _is_ambiguous_loss
@@ -167,8 +168,18 @@ class GiveawayService:
     #: the winner announcement has to fit in one Discord message.
     MAX_WINNERS = 25
 
-    def __init__(self, db: Database, redis: RedisCache | None = None) -> None:
+    def __init__(
+        self, db: Database, redis: RedisCache | None = None, off_loop: Any | None = None
+    ) -> None:
         self.db = db
+        #: How a blocking read gets off the event loop. The cached readers
+        #: used the loop's default executor, which is min(32, cpu+4) workers
+        #: -- 5 on the deployed 1-CPU instance -- and every cold worker opens
+        #: its own database stream. The bot injects its pinned, gated 64-lane
+        #: pool so a click's display read queues with the rest of the database
+        #: work instead of competing for five threads. Defaults to
+        #: asyncio.to_thread, which is what every existing test builds.
+        self._off_loop = off_loop or asyncio.to_thread
         #: Optional short-TTL read cache. Turso is the source of truth: every
         #: write goes straight there, and a cache miss/error/timeout simply
         #: falls through to a normal query. None = every read hits the DB.
@@ -472,7 +483,11 @@ class GiveawayService:
             # loop (bot._db_call). Awaiting it directly here would freeze
             # heartbeats, ticks and every button click for the length of one
             # round trip, with no timeout at all.
-            role = await asyncio.to_thread(self._get_notify_role_uncached, guild_id)
+            # The injected runner (the bot's pinned pool) is a callable
+            # runner, not a deferral helper: _db_call takes a zero-arg
+            # callable, so the partial binds the argument here.
+            role = await self._off_loop(
+                partial(self._get_notify_role_uncached, guild_id))
         except Exception:
             return None
         await self._cache_put(key, role if role else "none", SETTINGS_CACHE_TTL)
@@ -540,7 +555,7 @@ class GiveawayService:
             return [g for g in loaded if g is not None]
         # Same rule as the other cached reads: the fallback is blocking Turso
         # I/O, so it runs in a worker thread instead of on the event loop.
-        live = await asyncio.to_thread(self.list_active, guild_id)
+        live = await self._off_loop(partial(self.list_active, guild_id))
         await self._cache_put(key, [self._dump(g) for g in live], LIST_CACHE_TTL)
         return live
 
@@ -685,7 +700,7 @@ class GiveawayService:
         # Off the event loop for the same reason as the notify-role read: the
         # counter fallback (and the legacy-row heal it may run) is blocking
         # Turso I/O, and a display number must never stall the loop.
-        value = await asyncio.to_thread(self.entry_count, giveaway_id)
+        value = await self._off_loop(partial(self.entry_count, giveaway_id))
         if value is not None:
             # A count of zero is a real answer and gets cached like any other.
             # Skipping it meant a giveaway with no entrants yet could never be

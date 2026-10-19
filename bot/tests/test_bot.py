@@ -2053,14 +2053,37 @@ class OffLoopReadPoolTests(BotTestCase):
         asyncio.run(self.bot.heartbeat.coro(self.bot))
         self.assertIn("_ping", seen, f"the health probe went elsewhere: {seen}")
 
-    def test_no_blocking_read_is_left_on_the_default_executor(self) -> None:
-        source = pathlib.Path(__file__).resolve().parent.parent / "giveaway_bot" / "bot.py"
-        text = source.read_text(encoding="utf-8")
-        self.assertNotIn(
-            "await asyncio.to_thread(",
-            text,
-            "every off-loop database read must go through _db_call (the pinned pool)",
+    def test_cached_reads_ride_the_pinned_pool_too(self) -> None:
+        """The service's cache-fallback reads share the bot's lanes.
+
+        entry_count_cached / get_notify_role_cached / list_active_cached run
+        their blocking fallback through whatever off-loop runner the service
+        was built with. With a cache wired in, that must be the bot's pinned
+        pool -- otherwise a display read queues behind the loop's five-worker
+        default executor while the database burst is already flowing.
+        """
+        runner = self.bot.service._off_loop
+        self.assertIs(
+            runner.__func__,
+            GiveawayBot._db_call,
+            "the bot must inject its pinned pool into the service",
         )
+        self.assertIs(
+            runner.__self__,
+            self.bot,
+            "the injected runner must be this bot's own bound _db_call",
+        )
+
+    def test_no_blocking_read_is_left_on_the_default_executor(self) -> None:
+        package = pathlib.Path(__file__).resolve().parent.parent / "giveaway_bot"
+        for name in ("bot.py", "service.py"):
+            text = (package / name).read_text(encoding="utf-8")
+            self.assertNotIn(
+                "asyncio.to_thread(",
+                text,
+                f"{name}: every off-loop database read must go through _db_call"
+                " (the pinned pool)",
+            )
 
 
 if __name__ == "__main__":

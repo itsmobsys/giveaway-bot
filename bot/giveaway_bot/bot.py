@@ -92,7 +92,10 @@ class GiveawayBot(commands.Bot):
         #: Turso stays the single source of truth: nothing here is ever
         #: confirmed to a member from cached data alone.
         self.redis = redis
-        self.service = GiveawayService(db, redis)
+        #: The service's cached readers take the same pinned lanes as _db_call,
+        #: so a display read cannot queue behind the loop's small default
+        #: executor. Bound here, where the bot owns the pool.
+        self.service = GiveawayService(db, redis, off_loop=self._db_call)
         #: guild_id -> [(giveaway_id, prize)] rebuilt every tick. Discord kills
         #: autocomplete after 3s and a Turso round-trip can exceed that, so
         #: suggestions come from this snapshot — never from the database.
