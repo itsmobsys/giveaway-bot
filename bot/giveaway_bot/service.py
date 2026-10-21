@@ -2011,6 +2011,10 @@ class GiveawayService:
                     pass
         return written
 
+    #: Rows per multi-row INSERT in the claim sweep. SQLite's default parameter
+    #: limit is 999 and each row binds 4, so 150 rows = 600 params.
+    CLAIM_SWEEP_INSERT_CHUNK = 150
+
     def repair_all_missing_claims(self, now: int | None = None, limit: int = 25) -> int:
         """Heal every stranded claim window. due_claims() runs this per tick.
 
@@ -2019,6 +2023,12 @@ class GiveawayService:
         (oldest ended first) recreates those windows, and the tick then picks
         them up like any restart recovery. Idempotent; failures heal on a
         later tick. Returns rows written.
+
+        Batched: one bounded id read, one giveaway-column read and one claim
+        read cover the whole sweep, and inserts are multi-row. A healthy sweep
+        therefore costs 3 reads and 0 writes however many giveaways it visits
+        (the previous per-giveaway loop cost 3 statements each, including an
+        UPDATE that wrote nothing, and ran the tick into DB_CALL_TIMEOUT).
         """
         ts = now if now is not None else now_ms()
         try:
@@ -2035,19 +2045,166 @@ class GiveawayService:
             )
         except Exception:
             return 0
-        total = 0
+        ids: list[str] = []
+        seen_ids: set[str] = set()
         for r in rows:
             try:
                 gid = str(r.get("id"))
             except Exception:
                 log.warning("claim repair sweep row skipped")
                 continue
-            try:
-                total += self.repair_missing_claims(gid, now=ts)
-            except Exception:
-                log.warning("claim repair sweep failed for a giveaway")
+            if gid in seen_ids:
                 continue
-        return total
+            seen_ids.add(gid)
+            ids.append(gid)
+        if not ids:
+            return 0
+        marks = ", ".join("?" for _ in ids)
+        try:
+            gw_rows = self.db.query(
+                "SELECT id, winners_json, claim_timeout_seconds, ended_at"  # noqa: S608
+                f" FROM simple_giveaways WHERE id IN ({marks})",
+                tuple(ids),
+            )
+            claim_rows = self.db.query(
+                "SELECT giveaway_id, user_id, status, deadline_ms FROM simple_claims"  # noqa: S608
+                f" WHERE giveaway_id IN ({marks})",
+                tuple(ids),
+            )
+        except Exception:
+            log.warning("claim repair sweep read failed")
+            return 0
+        by_id: dict[str, dict] = {}
+        for r in gw_rows:
+            try:
+                gid = r.get("id")
+            except Exception:
+                log.warning("claim repair sweep row skipped")
+                continue
+            if gid is not None:
+                by_id[str(gid)] = r
+        claims: dict[str, list[dict]] = {}
+        for r in claim_rows:
+            try:
+                gid = str(r.get("giveaway_id"))
+            except Exception:
+                log.warning("claim repair sweep claim row skipped")
+                continue
+            claims.setdefault(gid, []).append(r)
+
+        inserts: list[tuple[str, str, int, int]] = []
+        stale: list[tuple[str, list[str]]] = []
+        for gid in ids:
+            gw_row = by_id.get(gid)
+            if gw_row is None:
+                # Deleted between the id read and the column read.
+                continue
+            try:
+                timeout_s = int(gw_row.get("claim_timeout_seconds") or 0)
+            except (TypeError, ValueError):
+                log.warning("claim repair sweep failed for %s", gid)
+                continue
+            if timeout_s <= 0:
+                continue
+            try:
+                parsed = json.loads(gw_row.get("winners_json") or "[]")
+            except (ValueError, TypeError):
+                parsed = []
+            if not isinstance(parsed, list):
+                parsed = []
+            winners = [str(w) for w in dict.fromkeys(str(w) for w in parsed)]
+            if not winners:
+                continue
+            winner_set = set(winners)
+            have: set[str] = set()
+            latest = 0
+            stale_pending = False
+            for r in claims.get(gid, ()):
+                try:
+                    uid = str(r.get("user_id"))
+                except Exception:
+                    log.warning("claim repair row skipped for %s", gid)
+                    continue
+                have.add(uid)
+                try:
+                    latest = max(latest, int(r.get("deadline_ms") or 0))
+                except (TypeError, ValueError):
+                    log.warning("claim repair deadline skipped for %s", gid)
+                if (
+                    str(r.get("status")) == self.CLAIM_PENDING
+                    and r.get("user_id") is not None
+                    and uid not in winner_set
+                ):
+                    stale_pending = True
+            if latest > 0:
+                # Never hand a repaired winner an already-past deadline: a later
+                # draw (reroll/expire) must start its own window at repair time,
+                # while a partially inserted initial batch simply gains a few ms.
+                deadline = max(latest, ts + timeout_s * 1000)
+            else:
+                try:
+                    base = int(gw_row.get("ended_at") or ts)
+                except (TypeError, ValueError):
+                    base = ts
+                deadline = base + timeout_s * 1000
+            for uid in winners:
+                if uid not in have:
+                    inserts.append((gid, uid, deadline, ts))
+            if stale_pending:
+                stale.append((gid, winners))
+
+        written = 0
+        for start in range(0, len(inserts), self.CLAIM_SWEEP_INSERT_CHUNK):
+            chunk = inserts[start : start + self.CLAIM_SWEEP_INSERT_CHUNK]
+            values = ", ".join("(?, ?, 0, 'pending', ?, ?)" for _ in chunk)
+            params: list[Any] = []
+            for gid, uid, deadline, created in chunk:
+                params.extend((gid, uid, deadline, created))
+            try:
+                cur = self.db.execute(
+                    "INSERT OR IGNORE INTO simple_claims"  # noqa: S608
+                    " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
+                    f" VALUES {values}",
+                    params,
+                )
+            except Exception:
+                # Keep today's per-row best effort when a whole chunk fails:
+                # one bad row must not take the rest of the batch down with it.
+                log.warning("claim repair insert batch failed")
+                for gid, uid, deadline, created in chunk:
+                    try:
+                        self.db.execute(
+                            "INSERT OR IGNORE INTO simple_claims"
+                            " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
+                            " VALUES (?, ?, 0, 'pending', ?, ?)",
+                            (gid, uid, deadline, created),
+                        )
+                    except Exception:
+                        log.warning("claim repair insert failed for %s/%s", gid, uid)
+                        continue
+                    written += 1
+                continue
+            try:
+                changed = int(cur.rowcount)
+            except (TypeError, ValueError):
+                changed = -1
+            written += changed if changed >= 0 else len(chunk)
+        for gid, winners in stale:
+            marks = ", ".join("?" for _ in winners)
+            try:
+                cur = self.db.execute(
+                    "UPDATE simple_claims SET status = ? WHERE giveaway_id = ?"  # noqa: S608
+                    f" AND status = 'pending' AND user_id NOT IN ({marks})",  # noqa: S608
+                    (self.CLAIM_REPLACED, gid, *winners),
+                )
+            except Exception:
+                log.warning("claim repair settle failed for %s", gid)
+                continue
+            try:
+                written += int(cur.rowcount or 0)
+            except (TypeError, ValueError):
+                pass
+        return written
 
     def pending_claims(self, giveaway_id: str) -> list[dict]:
         """Pending claim rows for a giveaway, oldest deadline first.

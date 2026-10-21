@@ -1554,7 +1554,12 @@ class GiveawayBot(commands.Bot):
                 return resp.status, (time.perf_counter() - started) * 1000
 
         try:
-            status, ms = await self._db_call(_ping)
+            # /health is liveness, not database work: sharing the DB lane made
+            # the probe inherit the 8 s DB timeout, so a busy claim sweep could
+            # manufacture a false "health check failed" while also holding one
+            # of the 64 lanes. to_thread keeps the blocking urllib call off the
+            # loop without touching _db_gate or DB_CALL_TIMEOUT.
+            status, ms = await asyncio.to_thread(_ping)
         except Exception as exc:
             log.warning("health check failed: %s", exc)
             return

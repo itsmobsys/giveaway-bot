@@ -2052,9 +2052,10 @@ class OffLoopReadPoolTests(BotTestCase):
     The loop's default executor is min(32, cpu+4) workers -- 5 on the 1-CPU
     instance this bot is deployed on -- and every cold worker opens its own
     database stream (a fresh TLS + auth handshake). The pinned pool is 64
-    lanes, warm after the first burst, and gated. Two call sites used to run
-    their blocking read on the default executor: the heartbeat's /health
-    probe and the active-giveaway lookup the request probe needs for its key.
+    lanes, warm after the first burst, and gated. The active-giveaway lookup
+    the request probe needs for its key used to run on the default executor.
+    The heartbeat's /health probe is the one exception: it is liveness, not a
+    database read, and must not consume a DB lane or inherit the 8s DB timeout.
     """
 
     def spy_on_db_call(self) -> list:
@@ -2077,10 +2078,23 @@ class OffLoopReadPoolTests(BotTestCase):
         asyncio.run(command.callback(interaction))
         self.assertIn("list_active", seen, f"the probe's own read went elsewhere: {seen}")
 
-    def test_the_health_probe_rides_the_pinned_pool(self) -> None:
+    def test_heartbeat_does_not_take_a_db_lane(self) -> None:
+        class _Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
         seen = self.spy_on_db_call()
-        asyncio.run(self.bot.heartbeat.coro(self.bot))
-        self.assertIn("_ping", seen, f"the health probe went elsewhere: {seen}")
+        gate = self.bot._db_gate
+        before = gate._value
+        with patch("urllib.request.urlopen", return_value=_Response()):
+            asyncio.run(self.bot.heartbeat.coro(self.bot))
+        self.assertEqual(gate._value, before, "the liveness probe took a DB lane")
+        self.assertEqual(seen, [], f"the health probe used the DB runner: {seen}")
 
     def test_cached_reads_ride_the_pinned_pool_too(self) -> None:
         """The service's cache-fallback reads share the bot's lanes.
@@ -2103,16 +2117,19 @@ class OffLoopReadPoolTests(BotTestCase):
             "the injected runner must be this bot's own bound _db_call",
         )
 
-    def test_no_blocking_read_is_left_on_the_default_executor(self) -> None:
+    def test_no_blocking_database_read_is_left_on_the_default_executor(self) -> None:
+        """Only the /health liveness probe may bypass the pinned DB pool."""
         package = pathlib.Path(__file__).resolve().parent.parent / "giveaway_bot"
         for name in ("bot.py", "service.py"):
             text = (package / name).read_text(encoding="utf-8")
-            self.assertNotIn(
-                "asyncio.to_thread(",
-                text,
-                f"{name}: every off-loop database read must go through _db_call"
-                " (the pinned pool)",
-            )
+            for line in text.splitlines():
+                if "asyncio.to_thread(" in line:
+                    self.assertIn(
+                        "asyncio.to_thread(_ping)",
+                        line,
+                        f"{name}: every off-loop database read must go through"
+                        " _db_call (the pinned pool); only the liveness probe is exempt",
+                    )
 
 
 if __name__ == "__main__":

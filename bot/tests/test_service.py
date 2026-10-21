@@ -1417,6 +1417,82 @@ class ClaimAtomicityTests(ServiceTestCase):
         again = self.svc.repair_missing_claims(ended.id)
         self.assertEqual(again, 0, "second sweep must be a no-op")
 
+    def test_healthy_claim_sweep_is_three_reads_and_no_writes(self) -> None:
+        for i in range(25):
+            gw = self.make(winner_count=2, claim_timeout_seconds=3600)
+            for j in range(4):
+                self.join(gw, user_id=str(10 ** 17 + i * 10 + j))
+            _ended, winners = self.svc.end(gw.id)
+            self.assertEqual(len(winners), 2)
+        self.db.reset_stats()
+        written = self.svc.repair_all_missing_claims()
+        stats = self.db.get_stats()
+        self.assertEqual(written, 0)
+        self.assertLessEqual(int(stats["reads"]), 3)
+        self.assertEqual(int(stats["writes"]), 0)
+
+    def test_claim_sweep_recreates_a_stranded_window_in_one_batch(self) -> None:
+        ended, winner, _users = self._three_entrant_ended()
+        row = self.db.query_one(
+            "SELECT ended_at FROM simple_giveaways WHERE id = ?", (ended.id,)
+        )
+        ended_at = int(row["ended_at"])
+        self.db.execute("DELETE FROM simple_claims WHERE giveaway_id = ?", (ended.id,))
+        # Second stranded giveaway with no ended_at: its fallback base is now.
+        gw2 = self.make(winner_count=1, claim_timeout_seconds=3600)
+        self.join(gw2, user_id="555555555555555555")
+        ended2, _winners2 = self.svc.end(gw2.id)
+        self.db.execute(
+            "UPDATE simple_giveaways SET ended_at = NULL WHERE id = ?", (ended2.id,)
+        )
+        self.db.execute("DELETE FROM simple_claims WHERE giveaway_id = ?", (ended2.id,))
+        ts = ended_at + 5000
+        written = self.svc.repair_all_missing_claims(now=ts)
+        self.assertEqual(written, 2)
+        rows = {str(r["user_id"]): r for r in self.svc.claim_status(ended.id)}
+        self.assertEqual(list(rows), [winner])
+        self.assertEqual(str(rows[winner]["status"]), "pending")
+        self.assertEqual(int(rows[winner]["deadline_ms"]), ended_at + 3600 * 1000)
+        rows2 = self.svc.claim_status(ended2.id)
+        self.assertEqual(len(rows2), 1)
+        self.assertEqual(str(rows2[0]["status"]), "pending")
+        self.assertEqual(int(rows2[0]["deadline_ms"]), ts + 3600 * 1000)
+        self.assertEqual(self.svc.repair_all_missing_claims(now=ts), 0)
+
+    def test_claim_sweep_settles_a_stale_pending_row(self) -> None:
+        ended, winner, users = self._three_entrant_ended()
+        loser = next(u for u in users if u != winner)
+        self.db.execute(
+            "INSERT OR IGNORE INTO simple_claims"
+            " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
+            " VALUES (?, ?, 0, 'pending', ?, ?)",
+            (ended.id, loser, now_ms() + 3600 * 1000, now_ms()),
+        )
+        self.assertEqual(self.svc.repair_all_missing_claims(), 1)
+        statuses = {
+            str(r["user_id"]): str(r["status"]) for r in self.svc.claim_status(ended.id)
+        }
+        self.assertEqual(statuses[winner], "pending")
+        self.assertEqual(statuses[loser], "replaced")
+        self.assertEqual(self.svc.repair_all_missing_claims(), 0)
+
+    def test_claim_sweep_survives_one_bad_row(self) -> None:
+        bad, _bad_winner, _users = self._three_entrant_ended()
+        good = self.make(winner_count=1, claim_timeout_seconds=3600)
+        self.join(good, user_id="444444444444444444")
+        good_ended, good_winners = self.svc.end(good.id)
+        self.db.execute(
+            "UPDATE simple_giveaways SET winners_json = 'not json' WHERE id = ?",
+            (bad.id,),
+        )
+        self.db.execute(
+            "DELETE FROM simple_claims WHERE giveaway_id = ?", (good_ended.id,)
+        )
+        self.svc.repair_all_missing_claims()
+        rows = self.svc.claim_status(good_ended.id)
+        self.assertEqual([str(r["user_id"]) for r in rows], good_winners)
+        self.assertEqual({str(r["status"]) for r in rows}, {"pending"})
+
     def test_reroll_insert_crash_heals_fresh_window(self) -> None:
         ended, winner, users = self._three_entrant_ended()
         with unittest.mock.patch.object(
