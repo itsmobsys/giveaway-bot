@@ -2089,11 +2089,10 @@ class OffLoopReadPoolTests(BotTestCase):
                 return False
 
         seen = self.spy_on_db_call()
-        gate = self.bot._db_gate
-        before = gate._value
         with patch("urllib.request.urlopen", return_value=_Response()):
             asyncio.run(self.bot.heartbeat.coro(self.bot))
-        self.assertEqual(gate._value, before, "the liveness probe took a DB lane")
+        # The spy is the real pin: a released semaphore is back to 64, so
+        # _db_gate._value cannot tell a lane from no lane after the await.
         self.assertEqual(seen, [], f"the health probe used the DB runner: {seen}")
 
     def test_cached_reads_ride_the_pinned_pool_too(self) -> None:

@@ -2048,11 +2048,7 @@ class GiveawayService:
         ids: list[str] = []
         seen_ids: set[str] = set()
         for r in rows:
-            try:
-                gid = str(r.get("id"))
-            except Exception:
-                log.warning("claim repair sweep row skipped")
-                continue
+            gid = str(r.get("id"))
             if gid in seen_ids:
                 continue
             seen_ids.add(gid)
@@ -2154,6 +2150,26 @@ class GiveawayService:
                 stale.append((gid, winners))
 
         written = 0
+        # Settle before inserting: it depends only on the rows read above, so a
+        # driver failure in the insert loop cannot leave stale pending rows
+        # behind (today's per-giveaway loop degraded one giveaway at a time).
+        for gid, winners in stale:
+            marks = ", ".join("?" for _ in winners)
+            try:
+                cur = self.db.execute(
+                    "UPDATE simple_claims SET status = ? WHERE giveaway_id = ?"  # noqa: S608
+                    f" AND status = 'pending' AND user_id NOT IN ({marks})",  # noqa: S608
+                    (self.CLAIM_REPLACED, gid, *winners),
+                )
+            except Exception:
+                log.warning("claim repair settle failed for %s", gid)
+                continue
+            try:
+                written += int(cur.rowcount or 0)
+            except Exception:
+                # Accounting must never abort the sweep: a cursor without a
+                # usable rowcount costs us the count, not the write.
+                pass
         for start in range(0, len(inserts), self.CLAIM_SWEEP_INSERT_CHUNK):
             chunk = inserts[start : start + self.CLAIM_SWEEP_INSERT_CHUNK]
             values = ", ".join("(?, ?, 0, 'pending', ?, ?)" for _ in chunk)
@@ -2186,24 +2202,11 @@ class GiveawayService:
                 continue
             try:
                 changed = int(cur.rowcount)
-            except (TypeError, ValueError):
+            except Exception:
+                # Same rule as the settle loop: never let accounting abort the
+                # sweep or skip the remaining chunks.
                 changed = -1
             written += changed if changed >= 0 else len(chunk)
-        for gid, winners in stale:
-            marks = ", ".join("?" for _ in winners)
-            try:
-                cur = self.db.execute(
-                    "UPDATE simple_claims SET status = ? WHERE giveaway_id = ?"  # noqa: S608
-                    f" AND status = 'pending' AND user_id NOT IN ({marks})",  # noqa: S608
-                    (self.CLAIM_REPLACED, gid, *winners),
-                )
-            except Exception:
-                log.warning("claim repair settle failed for %s", gid)
-                continue
-            try:
-                written += int(cur.rowcount or 0)
-            except (TypeError, ValueError):
-                pass
         return written
 
     def pending_claims(self, giveaway_id: str) -> list[dict]:
