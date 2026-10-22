@@ -50,7 +50,7 @@ Vercel never asks for Next.js).
 
 Query params: `guild_id` (optional filter), `previous_limit` (1–10, default 5).
 
-Privacy: usernames only, capped at 100 — **user ids never leave the DB**.
+Privacy: usernames only, capped at 8 per card — **user ids never leave the DB**.
 Entry rows are wiped 5h after end by the bot. Finished giveaways keep
 their final `entrants.count`; older rows without a stored count use live entries.
 

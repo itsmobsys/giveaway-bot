@@ -92,7 +92,7 @@ TABLE_ENTRIES = "simple_entries"
 #: that finds this number already set skips the whole DDL block; bump it on any
 #: change to SCHEMA_TABLES, SCHEMA_DROPS, SCHEMA_INDEXES or a column map below,
 #: and the next boot re-runs everything (all of it is idempotent).
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_TABLES = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_GIVEAWAYS} (
@@ -152,6 +152,13 @@ DROP INDEX IF EXISTS idx_simple_bl_cover;
 #:                            all, so both scanned and sorted.
 #:   - (giveaway_id, ...)     every entries read sorts by entered_at; the same
 #:                            index replaces the old giveaway_id-only one.
+#:   - (COALESCE(ended_at, created_at) DESC, id DESC)
+#:                            the dashboard's finished list orders exactly like
+#:                            this after filtering status IN ('ended',
+#:                            'cancelled'); that filter cannot use a status
+#:                            prefix, so only this expression index lets the
+#:                            page walk rows in order instead of scanning and
+#:                            sorting the whole table.
 #:   - simple_claims(deadline_ms) WHERE pending — due_claims runs every 30s over
 #:                            a table nothing ever prunes, so it must not scan.
 #:   - entries(user_id) stays: the blacklist purge looks members up by user.
@@ -162,6 +169,8 @@ CREATE INDEX IF NOT EXISTS idx_simple_gw_guild_status_ends
 ON {TABLE_GIVEAWAYS}(guild_id, status, ends_at);
 CREATE INDEX IF NOT EXISTS idx_simple_gw_guild_status_ended
 ON {TABLE_GIVEAWAYS}(guild_id, status, ended_at);
+CREATE INDEX IF NOT EXISTS idx_simple_gw_ended
+ON {TABLE_GIVEAWAYS}(COALESCE(ended_at, created_at) DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_simple_entries_gw_entered ON {TABLE_ENTRIES}(giveaway_id, entered_at);
 CREATE INDEX IF NOT EXISTS idx_simple_entries_user ON {TABLE_ENTRIES}(user_id);
 CREATE INDEX IF NOT EXISTS idx_simple_claims_pending_due

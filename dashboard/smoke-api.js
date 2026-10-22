@@ -102,9 +102,11 @@ try {
     ["gw_active", "Active1"], ["gw_active", "Active2"],
     ["gw_empty", "Stale1"], ["gw_empty", "Stale2"],
     ["gw_fallback", "Old1"], ["gw_fallback", "Old2"], ["gw_fallback", "Old3"],
+    ["gw_legacy", "Legacy1"], ["gw_legacy", "Legacy2"],
   ]) {
     await client.execute({ sql: "INSERT INTO simple_entries VALUES (?,?,?)", args: [id, name, now] });
   }
+  await client.execute("UPDATE simple_giveaways SET host_name = 'alice' WHERE id = 'gw_stored'");
   for (const query of [
     { guild_id: "garbage" }, { guild_id: "1".repeat(21) }, { guild_id: "123", id: "../gw_active" },
     { id: "" }, { id: "gw_x;DROP" }, { id: ["gw_active"] }, { guild_id: ["123"] },
@@ -117,6 +119,9 @@ try {
   assert.equal(publicList.body.previous.find((x) => x.id === "gw_stored").entrants.count, 12);
   assert.equal(publicList.body.previous.find((x) => x.id === "gw_empty").entrants.count, 0);
   assert.equal(publicList.body.previous.find((x) => x.id === "gw_fallback").entrants.count, 3);
+  assert.equal(publicList.body.previous.find((x) => x.id === "gw_legacy").entrants.count, 2,
+    "a stored NULL count falls back to live entries");
+  assert.equal(publicList.headers["cache-control"], "s-maxage=30, stale-while-revalidate=30");
   assert.equal(publicList.body.previous.find((x) => x.id === "gw_legacy").timer.ended_at, now - 4000);
   assert.deepEqual(publicList.body.previous.slice(-2).map((x) => x.id), ["gw_tieb", "gw_tiea"]);
   assert.equal((await request(giveaways, "GET", {}, { id: "gw_legacy" })).body.giveaway.timer.ended_at, now - 4000);
@@ -133,6 +138,40 @@ try {
   assert.equal((await post({ action: "list", limit: 2, offset: 1e100 })).body.previous.length, 0);
   assert.equal((await post({ action: "list", limit: -10, offset: -50 })).body.previous[0].id, "gw_stored");
   assert.equal((await post({ action: "list", limit: -10, offset: -50 })).body.previous.length, 1);
+
+  // Everything the panel needs in one response: page, filtered total, live count.
+  const allListed = await post({ action: "list", limit: 100, offset: 0 });
+  assert.equal(allListed.body.previous.length, 6);
+  assert.equal(allListed.body.previous.find((x) => x.id === "gw_legacy").entrants.count, 2,
+    "a legacy NULL entrant_count is counted in the same statement");
+  const legacyRow = await client.execute("SELECT entrant_count FROM simple_giveaways WHERE id='gw_legacy'");
+  assert.equal(legacyRow.rows[0].entrant_count, null, "the fallback count is not written back");
+
+  const byPrize = await post({ action: "list", q: "  FALLB  ", limit: 100 });
+  assert.equal(byPrize.body.total, 1);
+  assert.deepEqual(byPrize.body.previous.map((x) => x.id), ["gw_fallback"]);
+  assert.equal((await post({ action: "list", q: "ALICE", limit: 100 })).body.previous[0].id,
+    "gw_stored", "q also matches host_name, case-insensitively");
+
+  const endedOnly = await post({ action: "list", status: "ended", limit: 100 });
+  assert.equal(endedOnly.body.total, 5);
+  assert.equal(endedOnly.body.previous.length, 5);
+  assert.ok(endedOnly.body.previous.every((x) => x.status === "ended"));
+  assert.equal(endedOnly.body.live, 1, "live is the whole live count, not the filtered one");
+  assert.deepEqual((await post({ action: "list", status: "cancelled", limit: 100 })).body.previous.map((x) => x.id), ["gw_empty"]);
+
+  const activeOnly = await post({ action: "list", status: "active", limit: 100 });
+  assert.equal(activeOnly.body.previous.length, 1);
+  assert.equal(activeOnly.body.previous[0].entrants.count, 2, "live rows count entries, not the stale snapshot");
+
+  const unknownStatus = await post({ action: "list", status: "ended'; DROP TABLE simple_giveaways; --", limit: 100 });
+  assert.equal(unknownStatus.statusCode, 200);
+  assert.equal(unknownStatus.body.total, 6, "an unknown status falls back to the default filter");
+  const capped = await post({ action: "list", q: "x".repeat(500), limit: 100 });
+  assert.equal(capped.body.total, 0, "long queries are truncated, never interpolated");
+  assert.equal((await client.execute("SELECT COUNT(*) AS n FROM simple_giveaways")).rows[0].n, 7);
+  assert.equal((await post({ action: "list", limit: 5 })).headers["cache-control"], "no-store");
+
   const active = await post({ action: "delete", ids: ["gw_active"] });
   assert.equal(active.statusCode, 409);
   assert.equal(active.body.deleted, 0);

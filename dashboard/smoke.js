@@ -46,7 +46,8 @@ assert.ok(!html.includes("<card>"), "no raw tag from prize");
 assert.ok(html.includes("1:00:00"), "countdown rendered");
 assert.ok(html.includes('data-live="true"'), "live timer marked for ticking");
 assert.ok(html.includes("1 in 14"), "odds one_in");
-// 14 entrants total, 8 chips shown (the API caps the list at 100 names).
+// 14 entrants total, 8 chips shown (the API caps the list at 8 names, which is
+// what the wall renders — the whole page stays under the payload budget).
 assert.ok(html.includes("+6 more"), "overflow chip counts unreshown entrants");
 assert.strictEqual((html.match(/class="face"/g) || []).length, 8);
 assert.ok(html.includes("14 entrants"), "entrant count");

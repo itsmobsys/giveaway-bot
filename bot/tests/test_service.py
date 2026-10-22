@@ -111,6 +111,7 @@ class SchemaTests(ServiceTestCase):
             "SELECT name FROM sqlite_master WHERE type = 'index'"
         )}
         self.assertIn("idx_simple_gw_status_ends", names, "due() scans on this every tick")
+        self.assertIn("idx_simple_gw_ended", names, "dashboard finished list orders by COALESCE")
         self.assertIn("idx_simple_entries_gw_entered", names, "entries reads sort by entered_at")
         self.assertIn("idx_simple_entries_user", names, "blacklist purge needs this")
         self.assertIn("idx_simple_claims_pending_due", names, "due_claims scans every 30s")

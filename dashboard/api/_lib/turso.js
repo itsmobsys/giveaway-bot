@@ -1,6 +1,39 @@
-import { createClient } from "@libsql/client";
+import { createClient } from "@libsql/client/http";
 
 let client = null;
+
+/** `file:` URLs are the offline test database, never a production Turso URL. */
+function isLocal(url) {
+  return /^file:/i.test(url);
+}
+
+/**
+ * A client-shaped proxy that resolves the real client on first use.
+ *
+ * The Node entry of `@libsql/client` pulls in the 8.9 MB native addon, which an
+ * `libsql://` production URL never touches — import time is ~30 ms faster
+ * without it. Local `file:` URLs (the smoke tests) still need the addon, so it
+ * is loaded lazily and only for them. db() stays synchronous for every caller:
+ * the proxy is returned immediately and its methods await the import.
+ */
+function lazyClient(load) {
+  let real = null;
+  const pending = load();
+  // Attach a no-op rejection handler so a failed import is only reported to the
+  // caller that awaits a method, not as an unhandled rejection.
+  pending.then((c) => { real = c; }, () => {});
+  const call = (method) => (...args) =>
+    real ? Promise.resolve(real[method](...args)) : pending.then((c) => c[method](...args));
+  return new Proxy({}, {
+    get(_target, prop) {
+      // Never awaitable: db() is documented and used as synchronous.
+      if (prop === "then") return undefined;
+      // Inspection/iteration hooks belong to the proxy, not the real client.
+      if (typeof prop === "symbol") return undefined;
+      return call(String(prop));
+    },
+  });
+}
 
 /** Shared Turso client (HTTP, safe for Vercel serverless). */
 export function db() {
@@ -14,7 +47,15 @@ export function db() {
     throw err;
   }
   if (!client) {
-    client = createClient({ url, authToken: authToken || undefined });
+    if (isLocal(url)) {
+      client = lazyClient(() =>
+        import("@libsql/client").then(({ createClient: createLocal }) =>
+          createLocal({ url, authToken: authToken || undefined })
+        )
+      );
+    } else {
+      client = createClient({ url, authToken: authToken || undefined });
+    }
   }
   return client;
 }
@@ -25,7 +66,7 @@ export function cors(res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-export function send(res, status, body, cache = "s-maxage=10, stale-while-revalidate=20") {
+export function send(res, status, body, cache = "s-maxage=30, stale-while-revalidate=30") {
   res.setHeader("Content-Type", "application/json");
   if (cache) res.setHeader("Cache-Control", cache);
   res.status(status).json(body);

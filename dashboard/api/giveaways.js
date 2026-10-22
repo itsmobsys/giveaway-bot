@@ -1,7 +1,7 @@
 import { card, cors, db, placeholders, send } from "./_lib/turso.js";
 
-/** How many usernames one card may show (privacy + payload size). */
-const NAME_LIMIT = 100;
+/** How many usernames one card shows (the wall renders 8; privacy + payload). */
+const NAME_LIMIT = 8;
 
 const CARD_COLUMNS = `id, guild_id, prize, winner_count, ends_at,
          COALESCE(ended_at, created_at) AS ended_at, entrant_count, status,
@@ -16,7 +16,7 @@ const LIVE_SQL = `
 const PREV_SQL = `
   SELECT ${CARD_COLUMNS}
   FROM simple_giveaways
-  WHERE status != 'active' AND ($guild = '' OR guild_id = $guild)
+  WHERE status IN ('ended', 'cancelled') AND ($guild = '' OR guild_id = $guild)
   ORDER BY COALESCE(ended_at, created_at) DESC, id DESC LIMIT $limit`;
 
 const ONE_SQL = `
@@ -28,21 +28,31 @@ const ONE_SQL = `
  *
  * This used to run two queries per card (a count and a name list), so a page of
  * 35 cards cost 70 round-trips to Turso. Both are now one grouped query each,
- * and the names query ranks rows per giveaway so the 100-row cap still applies
+ * and the names query ranks rows per giveaway so the 8-row cap still applies
  * per card rather than to the page as a whole.
+ *
+ * The counts query is skipped when every card is finished and carries its
+ * final entrant_count: card() prefers that snapshot, so the round-trip would
+ * tell us nothing. Live cards still need it (entries can be ahead of the stored
+ * counter, which is only refreshed on the bot's side) and so do legacy rows
+ * with a NULL count. Names stay for every card, because finished cards show
+ * them too.
  */
-async function hydrateMany(ids) {
-  const out = new Map(ids.map((id) => [String(id), { n: 0, names: [] }]));
+async function hydrateMany(rows) {
+  const out = new Map(rows.map((gw) => [String(gw.id), { n: 0, names: [] }]));
   const unique = [...out.keys()];
   if (!unique.length) return out;
   const list = placeholders(unique.length);
+  const needCounts = rows.some((gw) => gw.status === "active" || gw.entrant_count == null);
 
   const [countRs, namesRs] = await Promise.all([
-    db().execute({
-      sql: `SELECT giveaway_id, COUNT(*) AS n FROM simple_entries
-            WHERE giveaway_id IN (${list}) GROUP BY giveaway_id`,
-      args: unique,
-    }),
+    needCounts
+      ? db().execute({
+          sql: `SELECT giveaway_id, COUNT(*) AS n FROM simple_entries
+                WHERE giveaway_id IN (${list}) GROUP BY giveaway_id`,
+          args: unique,
+        })
+      : null,
     db().execute({
       sql: `SELECT giveaway_id, username FROM (
               SELECT giveaway_id, username,
@@ -53,7 +63,7 @@ async function hydrateMany(ids) {
     }),
   ]);
 
-  for (const row of countRs.rows || []) {
+  for (const row of countRs?.rows || []) {
     const entry = out.get(String(row.giveaway_id));
     if (entry) entry.n = Number(row.n) || 0;
   }
@@ -87,7 +97,7 @@ export default async function handler(req, res) {
       const rs = await db().execute({ sql: ONE_SQL, args: [id] });
       const gw = rs.rows?.[0];
       if (!gw) return send(res, 404, { error: "Giveaway not found" }, "no-store");
-      const hydrated = await hydrateMany([gw.id]);
+      const hydrated = await hydrateMany([gw]);
       const { n, names } = hydrated.get(String(gw.id));
       return send(res, 200, { now, giveaway: card(gw, n, names, now) });
     }
@@ -98,7 +108,7 @@ export default async function handler(req, res) {
       db().execute({ sql: PREV_SQL, args: { guild, limit: prevLimit } }),
     ]);
     const rows = [...(liveRs.rows || []), ...(prevRs.rows || [])];
-    const hydrated = await hydrateMany(rows.map((gw) => gw.id));
+    const hydrated = await hydrateMany(rows);
     const cards = rows.map((gw) => {
       const { n, names } = hydrated.get(String(gw.id)) || { n: 0, names: [] };
       return card(gw, n, names, now);
