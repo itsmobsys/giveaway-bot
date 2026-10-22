@@ -165,6 +165,10 @@ class GiveawayBot(commands.Bot):
         #: on_ready on every reconnect, not just startup, so the sweep below
         #: must run once per process, never per reconnect.
         self._guild_cmd_cleanup_done = False
+        #: Same rule for the 64-lane pool warmup: a reconnect reuses lanes that
+        #: are already warm, so repeating 64 SELECTs per gateway flap only adds
+        #: load and delays the real preload work.
+        self._pool_warmed = False
 
     # -- bounded DB lane --------------------------------------------------
     #: Seconds a single DB call may hold a lane before the join gives up.
@@ -208,18 +212,42 @@ class GiveawayBot(commands.Bot):
 
 
     async def _db_call(self, func, *args, **kwargs):
-        """Run a blocking service/DB call on the pinned pool, gated."""
+        """Run a blocking service/DB call on the pinned pool, gated.
+
+        The lane is released by the executor future's done-callback, not by the
+        awaiting coroutine. `wait_for` cancelling the await (timeout, or the
+        caller itself being cancelled) must not free a lane whose worker thread
+        is still talking to Turso: the 64-lane cap is only honest if a timed-out
+        statement keeps its lane until it really finishes.
+        """
         loop = asyncio.get_running_loop()
         pool = self._pool()
-        async with self._db_gate:
-            try:
-                return await asyncio.wait_for(
-                    loop.run_in_executor(pool, lambda: func(*args, **kwargs)),
-                    timeout=self.DB_CALL_TIMEOUT,
-                )
-            except TimeoutError:
-                log.warning("db call %s timed out", getattr(func, "__name__", func))
-                raise
+        await self._db_gate.acquire()
+        try:
+            fut = loop.run_in_executor(pool, lambda: func(*args, **kwargs))
+        except BaseException:
+            # Submitting failed, so no worker will ever exist to release it.
+            self._db_gate.release()
+            raise
+        released = False
+
+        def _release(_fut) -> None:
+            nonlocal released
+            if not released:
+                released = True
+                self._db_gate.release()
+
+        # Runs on the event loop when the thread finishes. It holds the lane
+        # even if the shield below was cancelled by a timeout.
+        fut.add_done_callback(_release)
+        try:
+            return await asyncio.wait_for(
+                asyncio.shield(fut),
+                timeout=self.DB_CALL_TIMEOUT,
+            )
+        except TimeoutError:
+            log.warning("db call %s timed out", getattr(func, "__name__", func))
+            raise
 
     #: Seconds a cached giveaway header stays valid mid-burst.
     GW_CACHE_TTL = 2.0
@@ -258,6 +286,39 @@ class GiveawayBot(commands.Bot):
     def _gw_drop(self, giveaway_id: str) -> None:
         try:
             self._gw_cache.pop(giveaway_id, None)
+        except Exception:
+            pass
+
+    def _prune_caches(self) -> None:
+        """Forget cache entries that have already expired.
+
+        Both dicts only ever dropped entries when this process changed them, so
+        a giveaway ended by another instance stayed resident for the life of the
+        process. Pruning once per tick keeps them proportional to what is live;
+        the fresh rows a burst is using are younger than the TTL/debounce and
+        survive. O(len(cache)); only ever touched from the event loop, so no
+        lock is needed.
+        """
+        now = time.monotonic()
+        try:
+            for giveaway_id, entry in list(self._gw_cache.items()):
+                try:
+                    _gw, ts = entry
+                    stale = now - float(ts) > self.GW_CACHE_TTL
+                except Exception:
+                    stale = True
+                if stale:
+                    self._gw_cache.pop(giveaway_id, None)
+        except Exception:
+            pass
+        try:
+            for giveaway_id, ts in list(self._refresh_stamp.items()):
+                try:
+                    stale = now - float(ts) > self.REFRESH_DEBOUNCE_SECONDS
+                except Exception:
+                    stale = True
+                if stale:
+                    self._refresh_stamp.pop(giveaway_id, None)
         except Exception:
             pass
 
@@ -365,42 +426,57 @@ class GiveawayBot(commands.Bot):
                 )
             except Exception:
                 log.exception("guild command cleanup sweep failed")
-        try:
-            # Off the event loop: this is a network round-trip, and blocking
-            # here delays the gateway heartbeat that keeps the bot online.
-            live = await self._db_call(self.service.list_all_active, 200)
-        except Exception:
-            log.exception("could not preload active giveaways")
-            live = []
+        # Active + ended preloads are independent reads, so run them together:
+        # sequential awaits put two Turso round-trips back-to-back on every
+        # gateway connect. Each keeps its own failure handling.
+        async def _preload_active():
+            try:
+                # Off the event loop: this is a network round-trip, and blocking
+                # here delays the gateway heartbeat that keeps the bot online.
+                return await self._db_call(self.service.list_all_active, 200)
+            except Exception:
+                log.exception("could not preload active giveaways")
+                return []
+
+        async def _preload_ended():
+            try:
+                return await self._db_call(self.service.list_all_ended, 200)
+            except Exception:
+                log.exception("could not preload ended giveaways")
+                return []
+
+        live, ended_pre = await asyncio.gather(_preload_active(), _preload_ended())
         log.info("tracking %d active giveaway(s) from the database", len(live))
         # P1-1 warmup: spin all 64 pool threads now so the first real burst
         # never pays thread-spawn + TLS + Turso-auth per cold lane (~342ms).
         # One cheap SELECT per lane, every lane: a partial warm left most lanes
         # cold, so the first burst still paid ~340ms+ on them. Failures only
-        # log (first burst warms it).
-        try:
-            pool = self._pool()
-            warm = asyncio.get_running_loop()
-            # return_exceptions=True: one flaky lane must not fail the other
-            # 63 warms, and a single reconnect storm must not read as fatal.
-            results = await asyncio.gather(
-                *(
-                    warm.run_in_executor(pool, self.db.query_one, "SELECT 1", ())
-                    for _ in range(64)
-                ),
-                return_exceptions=True,
-            )
-            failed = sum(1 for r in results if isinstance(r, Exception))
-            if failed:
-                log.warning("db pool warmup: %d/64 lane(s) failed", failed)
-        except Exception:
-            log.exception("db pool warmup failed")
+        # log (first burst warms it). Once per process: a reconnect reuses the
+        # same warm pool, so rerunning 64 SELECTs there is pure overhead.
+        if not self._pool_warmed:
+            try:
+                pool = self._pool()
+                warm = asyncio.get_running_loop()
+                # return_exceptions=True: one flaky lane must not fail the other
+                # 63 warms, and a single reconnect storm must not read as fatal.
+                results = await asyncio.gather(
+                    *(
+                        warm.run_in_executor(pool, self.db.query_one, "SELECT 1", ())
+                        for _ in range(64)
+                    ),
+                    return_exceptions=True,
+                )
+                failed = sum(1 for r in results if isinstance(r, Exception))
+                if failed:
+                    log.warning("db pool warmup: %d/64 lane(s) failed", failed)
+            except Exception:
+                log.exception("db pool warmup failed")
+            finally:
+                # Set even after a partial/failed attempt, exactly as the old
+                # per-connect warmup behaved: the first real burst warms what
+                # is still cold, and a reconnect must not retry 64 lanes.
+                self._pool_warmed = True
         self._cache_autocomplete(live)
-        try:
-            ended_pre = await self._db_call(self.service.list_all_ended, 200)
-        except Exception:
-            log.exception("could not preload ended giveaways")
-            ended_pre = []
         self._cache_ended_autocomplete(ended_pre)
         # Restart recovery: finished giveaways whose entrants role was never
         # deleted (bot was down during the 5-minute window, or the delete
@@ -559,14 +635,24 @@ class GiveawayBot(commands.Bot):
     #: not pull every row into memory, for every member who clicks the button.
     PARTICIPANT_WINDOW = 500
 
-    async def _refresh_embeds(self, giveaways: list[Giveaway]) -> None:
-        """Re-render several embeds concurrently, a few at a time."""
+    async def _refresh_embeds(
+        self, giveaways: list[Giveaway], *, statuses: dict[str, str] | None = None
+    ) -> None:
+        """Re-render several embeds concurrently, a few at a time.
+
+        `statuses` is the batched live-status map the tick already read (one
+        SELECT for the whole window). A missing id falls back to the per-row
+        recheck inside _refresh_embed, so a partial/failed batch only costs the
+        old round trips, never correctness.
+        """
         gate = asyncio.Semaphore(self.REFRESH_CONCURRENCY)
 
         async def one(gw: Giveaway) -> None:
             async with gate:
                 try:
-                    await self._refresh_embed(gw)
+                    await self._refresh_embed(
+                        gw, live_status=(statuses or {}).get(gw.id)
+                    )
                 except Exception:
                     log.exception("embed refresh failed for %s", gw.id)
 
@@ -811,7 +897,9 @@ class GiveawayBot(commands.Bot):
         if role is None:
             return
         try:
-            entrants = await self._db_call(self.service.entries, gw.id)
+            # Ids only: the strip never reads username/entered_at, and on a
+            # large giveaway that is a much smaller payload to load.
+            entrants = await self._db_call(self.service.entry_user_ids, gw.id)
         except Exception:
             log.exception("could not list entrants for role strip (%s)", gw.id)
             entrants = []
@@ -837,7 +925,7 @@ class GiveawayBot(commands.Bot):
 
             for start in range(0, len(entrants), self.STRIP_BATCH):
                 window = entrants[start : start + self.STRIP_BATCH]
-                await asyncio.gather(*(strip_one(str(row["user_id"])) for row in window))
+                await asyncio.gather(*(strip_one(user_id) for user_id in window))
         self._schedule_role_delete(
             str(gw.guild_id), str(role.id), gw.id, delay=self.ROLE_DELETE_DELAY
         )
@@ -1174,19 +1262,25 @@ class GiveawayBot(commands.Bot):
         if not await self._safe_defer(interaction):
             return
         try:
-            gw = await self._db_call(self.service.get, giveaway_id)
+            # Independent reads, so both lanes are used at once: the header row
+            # and the bounded window/count/membership snapshot never depend on
+            # each other. gather propagates the first failure exactly like the
+            # two sequential awaits did.
+            gw, found = await asyncio.gather(
+                self._db_call(self.service.get, giveaway_id),
+                self._db_call(
+                    self.service.entries_snapshot,
+                    giveaway_id,
+                    self.PARTICIPANT_WINDOW,
+                    str(interaction.user.id),
+                ),
+            )
             # One bounded window instead of the whole table, and in the SAME
             # read: the true total and the "am I in it" answer. Those were a
             # second COUNT(*) over the entries table plus a membership lookup
             # -- three reads of one table for one message. A failed read
             # returns None, which the caller reports rather than printing
             # zeros as facts.
-            found = await self._db_call(
-                self.service.entries_snapshot,
-                gw.id,
-                self.PARTICIPANT_WINDOW,
-                str(interaction.user.id),
-            )
             total = found[0] if found else 0
             entrants = found[1] if found else []
             # No rows means no row can be the caller's, so the flag is false
@@ -1314,6 +1408,15 @@ class GiveawayBot(commands.Bot):
 
     @tasks.loop(seconds=30)
     async def tick(self) -> None:
+        self._tick_count += 1
+        self._prune_caches()
+        # Heal stranded claim rows on the first pass (cold start) and every
+        # 10th tick (5 min at the 30s cadence). The sweep no longer writes on
+        # the healthy path after Task 1, but it still reads every ended
+        # giveaway; running it every tick bought nothing. A delayed heal
+        # cannot expire a claim early: deadlines are rebuilt from
+        # ended_at + timeout, so the reconstructed window is never short.
+        repair_claims = self._tick_count == 1 or self._tick_count % 10 == 0
         try:
             due = await self._db_call(self.service.due)
         except Exception:
@@ -1344,15 +1447,23 @@ class GiveawayBot(commands.Bot):
                 await self._announce(ended, winners)
             except Exception:
                 log.exception("announcement failed for %s", gw.id)
-            try:
-                await self._strip_entrants_role(ended)
-            except Exception:
-                log.exception("role strip failed for %s", gw.id)
+            async def _strip_later(giveaway: Giveaway = ended) -> None:
+                try:
+                    await self._strip_entrants_role(giveaway)
+                except Exception:
+                    log.exception("role strip failed for %s", giveaway.id)
+
+            # Announce first (members need the winners while the role still
+            # exists), then strip off-loop: one guild round-trip per member
+            # must not hold up the next due giveaway or the claim sweep.
+            self._spawn_bg(_strip_later())
         # Claim expiry: sweep due pending claims, expire + auto-reroll.
         # Restart recovery lives here too: deadlines are durable rows, so a
         # restart just picks up whatever is due on the next tick.
         try:
-            due_claims = await self._db_call(self.service.due_claims)
+            due_claims = await self._db_call(
+                self.service.due_claims, repair=repair_claims
+            )
         except Exception:
             log.exception("due claims check failed")
             due_claims = []
@@ -1424,7 +1535,22 @@ class GiveawayBot(commands.Bot):
                     ended_list = []
                 self._cache_ended_autocomplete(ended_list)
                 self._last_list_refresh = now_mono
-                await self._refresh_embeds(self._refresh_window(live))
+                window = self._refresh_window(live)
+                window_ids = [gw.id for gw in window]
+                if window_ids:
+                    try:
+                        status_map = await self._db_call(
+                            self.service.statuses, window_ids
+                        )
+                    except Exception:
+                        # A timed-out batch must not suppress the refresh: an
+                        # empty map makes every embed fall back to its per-row
+                        # status recheck, i.e. the old behaviour.
+                        log.exception("live status batch failed")
+                        status_map = {}
+                else:
+                    status_map = {}
+                await self._refresh_embeds(window, statuses=status_map)
         except Exception:
             # A failed live-list read used to return from here and leak the
             # lease: this process would then get its OWN token back on the
@@ -1442,7 +1568,6 @@ class GiveawayBot(commands.Bot):
         # Privacy sweep: join data (who entered) older than 5h past the end
         # is wiped. Giveaway records + winner lists stay; message counts are
         # already cleared at end-time.
-        self._tick_count += 1
         if self._tick_count % 20 == 0:
             try:
                 wiped = await self._db_call(self.service.wipe_stale_entries)
@@ -1552,7 +1677,10 @@ class GiveawayBot(commands.Bot):
         try:
             if gw.message_id and not reroll:
                 try:
-                    msg = await channel.fetch_message(int(gw.message_id))
+                    # Edit/reply by id: the announcement only needs a message
+                    # reference, and fetch_message() spent a full GET per end
+                    # just to obtain one.
+                    msg = channel.get_partial_message(int(gw.message_id))
                     await msg.edit(embed=embed, view=claim_view)
                 except discord.HTTPException:
                     pass
@@ -2606,7 +2734,10 @@ def wire_commands(bot: GiveawayBot) -> None:
         preview = None
         if not live:
             try:
-                preview = svc.create(
+                # Blocking Turso write: keep it on the pinned DB lanes like
+                # every other round-trip in this file.
+                preview = await bot._db_call(
+                    svc.create,
                     guild_id=gid,
                     channel_id=str(getattr(interaction, "channel_id", 0) or 0),
                     prize="Cache preview (deleted immediately)",
@@ -2798,7 +2929,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             # The preview exists only to give the cache legs a real key to read.
             # It must not outlive the probe that made it.
             try:
-                svc.discard(preview_id)
+                await bot._db_call(svc.discard, preview_id)
             except Exception:
                 log.exception("request-time preview cleanup failed")
         # Leg 2: one real SET + DEL on a probe-only Redis key, so the write

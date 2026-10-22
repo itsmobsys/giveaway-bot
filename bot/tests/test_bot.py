@@ -11,6 +11,7 @@ import asyncio
 import pathlib
 import signal
 import sqlite3
+import threading
 import time
 import unittest
 import uuid
@@ -312,6 +313,25 @@ class GuildSyncTests(BotTestCase):
             return True
 
         self.assertTrue(asyncio.run(scenario()))
+
+    def test_on_ready_warms_all_pool_lanes_once_per_process(self) -> None:
+        self.bot._guild_cmd_cleanup_done = True
+        original = self.db.query_one
+        warmed: list[int] = []
+
+        def counting_query_one(sql, params=()):
+            if sql == "SELECT 1":
+                warmed.append(1)
+            return original(sql, params)
+
+        self.db.query_one = counting_query_one  # type: ignore[method-assign]
+
+        async def scenario() -> None:
+            await self.bot.on_ready()
+            await self.bot.on_ready()
+
+        asyncio.run(scenario())
+        self.assertEqual(len(warmed), 64, "one SELECT per lane, reconnects reuse them")
 
 
 class RoleTaskTests(BotTestCase):
@@ -1041,31 +1061,122 @@ class GiveawayLifecycleTests(BotTestCase):
         self.assertIn("You left the giveaway.", interaction.texts)
         self.assertEqual(channel.message.edits, [])
 
-    def test_tick_continues_after_announcement_and_role_strip_failures(self) -> None:
+    def test_tick_starts_strips_without_awaiting_them_and_survives_failures(self) -> None:
         first, second = self.make(), self.make()
         self.bot.service.due = lambda: [first, second]
         # B04: tick ends with require_due=True, so the stub accepts it.
         self.bot.service.end = lambda gw_id, *args, **kwargs: (self.svc.get(gw_id), [])
-        calls: list[tuple[str, str]] = []
+        events: list[tuple[str, str]] = []
+        release = asyncio.Event()
 
         async def announce(gw, winners) -> None:
-            calls.append(("announce", gw.id))
+            events.append(("announce", gw.id))
             if gw.id == first.id:
                 raise RuntimeError("send failed")
 
         async def strip(gw) -> None:
-            calls.append(("strip", gw.id))
+            events.append(("strip", gw.id))
+            await release.wait()
+            events.append(("stripped", gw.id))
             if gw.id == first.id:
                 raise RuntimeError("role failed")
 
         self.bot._announce = announce
         self.bot._strip_entrants_role = strip
-        with self.assertLogs("giveaway_bot", level="ERROR"):
+
+        async def scenario() -> None:
+            with self.assertLogs("giveaway_bot", level="ERROR") as logs:
+                # wait_for turns an accidental await-of-strip inside tick into
+                # a visible timeout instead of a hung test.
+                await asyncio.wait_for(self.bot.tick.coro(self.bot), timeout=2.0)
+                # Let already-scheduled tasks reach their release.wait().
+                await asyncio.sleep(0)
+                self.assertEqual(
+                    [event for event in events if event[0] == "strip"],
+                    [("strip", first.id), ("strip", second.id)],
+                )
+                for gw in (first, second):
+                    self.assertLess(
+                        events.index(("announce", gw.id)),
+                        events.index(("strip", gw.id)),
+                        "announce must start before that giveaway's strip",
+                    )
+                self.assertNotIn(("stripped", first.id), events)
+                self.assertNotIn(("stripped", second.id), events)
+                release.set()
+                await asyncio.gather(*list(self.bot._bg_tasks))
+            output = "\n".join(logs.output)
+            self.assertIn("announcement failed", output)
+            self.assertIn("role strip failed", output)
+
+        asyncio.run(scenario())
+
+    def test_tick_repairs_claim_windows_first_and_every_tenth_tick(self) -> None:
+        self.bot.service.due = lambda: []
+        flags: list[bool] = []
+
+        def due_claims(*, repair: bool = True) -> list:
+            flags.append(repair)
+            return []
+
+        self.bot.service.due_claims = due_claims
+        # Skip the cosmetic list sweep so this test only observes repair gating.
+        self.bot._last_list_refresh = time.monotonic()
+        self.bot._autocomplete_cache = {self.guild: []}
+        for _ in range(10):
             asyncio.run(self.bot.tick.coro(self.bot))
-        self.assertEqual(calls, [
-            ("announce", first.id), ("strip", first.id),
-            ("announce", second.id), ("strip", second.id),
-        ])
+        self.assertEqual(flags, [True] + [False] * 8 + [True])
+
+    def test_tick_reads_live_statuses_in_one_batch(self) -> None:
+        gw = self.make(prize="batched")
+        self.bot.service.due = lambda: []
+        self.bot.service.due_claims = lambda **kwargs: []
+        self.bot.service.list_all_active = lambda limit: [gw]
+        self.bot.service.list_all_ended = lambda limit: []
+        self.bot._last_list_refresh = 0.0
+        captured: dict = {}
+
+        async def refresh(giveaways, *, statuses=None) -> None:
+            captured["ids"] = [item.id for item in giveaways]
+            captured["statuses"] = statuses
+
+        self.bot._refresh_embeds = refresh
+        with patch.object(self.bot.service, "get_status") as get_status:
+            asyncio.run(self.bot.tick.coro(self.bot))
+        get_status.assert_not_called()
+        self.assertEqual(captured["ids"], [gw.id])
+        self.assertEqual(captured["statuses"], {gw.id: "active"})
+
+    def test_missing_batched_status_falls_back_to_one_recheck(self) -> None:
+        gw = self.make(prize="fallback")
+        channel = FakeTextChannel()
+        self.svc.set_message(gw.id, str(channel.message.id))
+        gw = self.svc.get(gw.id)
+        self.bot.get_channel = lambda channel_id: channel
+        with patch.object(self.bot.service, "get_status", return_value="active") as get_status:
+            asyncio.run(self.bot._refresh_embeds([gw], statuses={}))
+        get_status.assert_called_once_with(gw.id)
+        self.assertEqual(len(channel.message.edits), 1)
+
+    def test_tick_prunes_expired_cache_entries_but_keeps_fresh_ones(self) -> None:
+        now = time.monotonic()
+        stale = now - (self.bot.GW_CACHE_TTL * 2)
+        self.bot._gw_cache["stale"] = (object(), stale)
+        self.bot._gw_cache["fresh"] = (object(), now)
+        self.bot._refresh_stamp["stale"] = stale
+        self.bot._refresh_stamp["fresh"] = now
+        self.bot.service.due = lambda: []
+        self.bot.service.due_claims = lambda **kwargs: []
+        # Keep the cosmetic sweep out of this test's snapshot bookkeeping.
+        self.bot._last_list_refresh = now
+        self.bot._autocomplete_cache = {self.guild: []}
+
+        asyncio.run(self.bot.tick.coro(self.bot))
+
+        self.assertNotIn("stale", self.bot._gw_cache)
+        self.assertIn("fresh", self.bot._gw_cache)
+        self.assertNotIn("stale", self.bot._refresh_stamp)
+        self.assertIn("fresh", self.bot._refresh_stamp)
 
     def test_tick_error_handler_logs_and_restarts_loop(self) -> None:
         with (patch.object(self.bot.tick, "restart") as restart,
@@ -1081,6 +1192,18 @@ class AnnouncementTests(BotTestCase):
         self.bot.get_channel = lambda channel_id: channel
         self.svc.set_message(gw.id, str(channel.message.id))
         return channel
+
+    def test_announce_edits_by_partial_message_without_a_fetch(self) -> None:
+        gw = self.make()
+        channel = self.channel_for(gw)
+
+        async def fail_fetch(_message_id):
+            raise AssertionError("announcement must not fetch the whole message")
+
+        channel.fetch_message = fail_fetch
+        asyncio.run(self.bot._announce(self.svc.get(gw.id), ["4" * 18]))
+        self.assertEqual(len(channel.message.edits), 1)
+        self.assertEqual(len(channel.message.replies), 1)
 
     def test_a_failed_reply_after_edit_does_not_duplicate_winner_embed(self) -> None:
         gw = self.make()
@@ -2052,6 +2175,39 @@ class OffLoopReadPoolTests(BotTestCase):
         seen = self.spy_on_db_call()
         asyncio.run(self.bot.heartbeat.coro(self.bot))
         self.assertIn("_ping", seen, f"the health probe went elsewhere: {seen}")
+
+    def test_request_time_preview_writes_ride_the_pinned_pool(self) -> None:
+        seen = self.spy_on_db_call()
+        command = self.bot.tree.get_command("gw_request_time")
+        self.assertIsNotNone(command)
+        interaction = FakeInteraction(guild=FakeGuild(self.guild), user=fake_user())
+        asyncio.run(command.callback(interaction))
+        self.assertIn("create", seen, f"preview create went elsewhere: {seen}")
+        self.assertIn("discard", seen, f"preview cleanup went elsewhere: {seen}")
+
+    def test_db_call_holds_its_lane_until_a_timed_out_worker_finishes(self) -> None:
+        release = threading.Event()
+
+        def blocked() -> None:
+            release.wait(2.0)
+
+        async def scenario() -> None:
+            with (
+                patch.object(self.bot, "DB_CALL_TIMEOUT", 0.05),
+                self.assertRaises(TimeoutError),
+            ):
+                await self.bot._db_call(blocked)
+            # The caller timed out, but the worker still holds its lane.
+            self.assertEqual(self.bot._db_gate._value, 63)
+            release.set()
+            for _ in range(200):
+                if self.bot._db_gate._value == 64:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertEqual(self.bot._db_gate._value, 64)
+
+        self.addCleanup(release.set)
+        asyncio.run(scenario())
 
     def test_cached_reads_ride_the_pinned_pool_too(self) -> None:
         """The service's cache-fallback reads share the bot's lanes.

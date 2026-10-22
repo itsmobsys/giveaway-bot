@@ -956,6 +956,33 @@ class GiveawayService:
         )
         return str(row["status"]) if row and row.get("status") else None
 
+    def statuses(self, ids: list[str]) -> dict[str, str]:
+        """Statuses for a batch of giveaways in one round-trip.
+
+        The tick refreshes a window of embeds; one status read for the whole
+        window replaces one get_status() per giveaway. A missing id is simply
+        absent from the result, which makes the caller fall back to its
+        per-row recheck instead of treating it as "no status".
+        """
+        if not ids:
+            return {}
+        marks = ", ".join("?" for _ in ids)
+        try:
+            rows = self.db.query(
+                "SELECT id, status FROM simple_giveaways"  # noqa: S608
+                f" WHERE id IN ({marks})",
+                tuple(str(i) for i in ids),
+            )
+        except Exception:
+            return {}
+        out: dict[str, str] = {}
+        for row in rows:
+            gid = row.get("id")
+            status = row.get("status")
+            if gid is not None and status:
+                out[str(gid)] = str(status)
+        return out
+
     def refresh_snapshot(self, giveaway_id: str) -> tuple[str | None, int]:
         """Status + entry count in one round-trip for the post-ack refresh.
 
@@ -1966,13 +1993,16 @@ class GiveawayService:
         return written
 
     def repair_all_missing_claims(self, now: int | None = None, limit: int = 25) -> int:
-        """Heal every stranded claim window. due_claims() runs this per tick.
+        """Heal every stranded claim window. due_claims(repair=True) runs this.
 
         A giveaway stranded with zero pending rows never appears in due_claims,
         so per-giveaway repair alone would never visit it: this bounded sweep
         (oldest ended first) recreates those windows, and the tick then picks
-        them up like any restart recovery. Idempotent; failures heal on a
-        later tick. Returns rows written.
+        them up like any restart recovery. The tick requests a repair on its
+        first pass and every 10th tick (5 minutes at the 30s cadence), so a
+        crash heals within that window without paying this sweep's reads on
+        every healthy pass. Idempotent; failures heal on a later tick. Returns
+        rows written.
         """
         ts = now if now is not None else now_ms()
         try:
@@ -2024,17 +2054,26 @@ class GiveawayService:
             (giveaway_id,),
         )
 
-    def due_claims(self, now: int | None = None, limit: int = 25) -> list[dict]:
+    def due_claims(
+        self,
+        now: int | None = None,
+        limit: int = 25,
+        repair: bool = True,
+    ) -> list[dict]:
         """Pending claims past their deadline. Tick feeds on this.
 
         Heals stranded windows first (bounded sweep, oldest ended first), so a
         crash between a draw and its inserts never hides as "no due claims".
+        `repair` lets the tick skip that sweep on healthy passes: it repairs on
+        the first tick and every 10th (5 min). A delayed heal cannot expire a
+        claim early because deadlines are rebuilt from ended_at + timeout.
         """
         ts = now if now is not None else now_ms()
-        try:
-            self.repair_all_missing_claims(now=ts)
-        except Exception:
-            pass
+        if repair:
+            try:
+                self.repair_all_missing_claims(now=ts)
+            except Exception:
+                pass
         return self.db.query(
             "SELECT giveaway_id, user_id, round, status, deadline_ms, claimed_at,"
             " skipped_by, skipped_at, created_at FROM simple_claims"

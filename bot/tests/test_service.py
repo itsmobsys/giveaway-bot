@@ -1814,6 +1814,32 @@ class RoundTripBudgetTests(ServiceTestCase):
         self.assertEqual(stats["writes"], 0, "every claim row belongs to a current winner")
         self.assertEqual(stats["reads"], 2, "the giveaway row + its claim rows")
 
+    def test_statuses_reads_the_whole_window_in_one_statement(self) -> None:
+        first = self.make(prize="first")
+        second = self.make(prize="second")
+        self.svc.end(second.id)
+        self.db.reset_stats()
+        statuses = self.svc.statuses([first.id, second.id])
+        stats = self.db.get_stats()
+        self.assertEqual(statuses, {first.id: "active", second.id: "ended"})
+        self.assertEqual(stats["reads"], 1, "one IN(...) statement for the refresh window")
+
+    def test_statuses_failure_is_an_empty_map_not_an_exception(self) -> None:
+        self.assertEqual(self.svc.statuses([]), {})
+        with unittest.mock.patch.object(
+            self.db, "query", side_effect=RuntimeError("turso down")
+        ):
+            self.assertEqual(self.svc.statuses(["missing"]), {})
+
+    def test_due_claims_repair_is_gated_by_the_caller(self) -> None:
+        with unittest.mock.patch.object(
+            self.svc, "repair_all_missing_claims"
+        ) as repair:
+            self.assertEqual(self.svc.due_claims(repair=False), [])
+            repair.assert_not_called()
+            self.svc.due_claims(repair=True)
+            repair.assert_called_once()
+
 
 class AuditRaceTests(ServiceTestCase):
     """Production-safety races for the join fast-path (audit fixes)."""
