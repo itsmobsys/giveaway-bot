@@ -115,6 +115,7 @@ class Giveaway:
     claim_timeout_seconds: int = 0
     #: Cached entrant count. None means "unknown" (a row that predates the
     #: counter column, or a read that never stored one); 0 is a known answer.
+    #: A drawn giveaway sets it from its own pool size so readers need no read.
     entrant_count: int | None = None
 
     @property
@@ -361,6 +362,7 @@ class GiveawayService:
             "host_name": gw.host_name,
             "winners": list(gw.winners),
             "claim_timeout_seconds": gw.claim_timeout_seconds,
+            "entrant_count": gw.entrant_count,
         }
 
     @staticmethod
@@ -395,6 +397,9 @@ class GiveawayService:
                 host_name=str(blob["host_name"]) if blob.get("host_name") else None,
                 winners=[str(w) for w in (blob.get("winners") or [])],
                 claim_timeout_seconds=int(blob.get("claim_timeout_seconds") or 0),
+                entrant_count=(
+                    int(blob["entrant_count"]) if blob.get("entrant_count") is not None else None
+                ),
             )
         except (KeyError, TypeError, ValueError):
             return None
@@ -465,7 +470,31 @@ class GiveawayService:
         # global list; without this an autocomplete would not offer it until
         # the 8s TTL lapsed.
         self._mark_stale(f"guild:{guild_id}:active", "all:active")
-        return self.get(gid)
+        # Read-after-write removed: every value in this row is one we just
+        # supplied, so selecting it back was a full round trip (~170ms here) to
+        # learn what we already know.
+        return Giveaway(
+            id=gid,
+            guild_id=guild_id,
+            channel_id=channel_id,
+            message_id=None,
+            prize=prize,
+            winner_count=winner_count,
+            ends_at=created + duration_seconds * 1000,
+            status="active",
+            required_role_id=role_ids[0] if role_ids else None,
+            required_role_ids=list(role_ids),
+            blocked_role_id=blocked_role_id or None,
+            min_account_age_days=max(0, min_account_age_days),
+            min_messages=max(0, min_messages),
+            image_url=image_url,
+            entrants_role_id=None,
+            host_id=host_id or created_by,
+            host_name=(host_name or "")[:64] or None,
+            winners=[],
+            claim_timeout_seconds=claim_timeout_seconds,
+            entrant_count=0,
+        )
 
     # -- guild settings (one-time notify-role setup) ----------------------
     def _get_notify_role_uncached(self, guild_id: str) -> str | None:
@@ -1139,7 +1168,11 @@ class GiveawayService:
     #: limit is 999 and each row takes 3, so 300 leaves plenty of headroom.
     MESSAGE_FLUSH_CHUNK = 300
 
-    def add_message_counts(self, rows: list[tuple[str, str, int]]) -> int:
+    def add_message_counts(
+        self,
+        rows: list[tuple[str, str, int]],
+        receipt: dict[str, Any] | None = None,
+    ) -> int:
         """Apply many (guild_id, user_id, delta) counts. Returns rows applied.
 
         One statement per flush instead of one per message is the entire point:
@@ -1150,15 +1183,40 @@ class GiveawayService:
         chunks stored. The failure is raised as PartialFlush, which says how many
         rows landed: the caller hands back only the tail, because restoring the
         whole batch would write the committed head a second time.
+
+        `receipt`, when the caller passes one, is filled in place while the work
+        runs: `before` (the snapshot taken for each chunk), `applied` (rows
+        committed so far) and `done` (set once this call has stopped writing,
+        on success or failure alike). The bot runs this on a worker thread under
+        a timeout, and asyncio.wait_for cancels only the await: a timed-out
+        flush keeps writing. The receipt is how the bot learns what the
+        abandoned worker actually committed instead of re-sending the batch.
         """
+        if receipt is not None:
+            receipt["before"] = {}
+            receipt["applied"] = 0
+        applied = 0
+        try:
+            applied = self._apply_message_chunks(rows, receipt)
+        finally:
+            if receipt is not None:
+                receipt["done"] = True
+        return applied
+
+    def _apply_message_chunks(
+        self, rows: list[tuple[str, str, int]], receipt: dict[str, Any] | None
+    ) -> int:
+        """Write the batch chunk by chunk; see add_message_counts."""
         applied = 0
         for start in range(0, len(rows), self.MESSAGE_FLUSH_CHUNK):
             chunk = rows[start : start + self.MESSAGE_FLUSH_CHUNK]
             # Snapshot first: if this chunk later fails ambiguously (a mid-write
             # "connection reset" db.execute will not replay), the snapshot
             # lets the retry requeue only what is still missing instead of the
-            # whole chunk. One extra read per chunk, not per key.
+            # whole chunk. One batched read per chunk, never one per key.
             before = self._read_counts(chunk)
+            if receipt is not None:
+                receipt["before"].update(before)
             values = ", ".join("(?, ?, ?)" for _ in chunk)
             params: list[Any] = []
             for guild_id, user_id, count in chunk:
@@ -1184,6 +1242,8 @@ class GiveawayService:
                     rows[start : start + len(chunk)] = short + filler
                 raise PartialFlush(applied, exc) from exc
             applied += len(chunk)
+            if receipt is not None:
+                receipt["applied"] = applied
         return applied
 
     def _count_rows(self, keys: list[tuple[str, str]]) -> dict[tuple[str, str], int] | None:
@@ -1219,6 +1279,19 @@ class GiveawayService:
             except (KeyError, TypeError, ValueError):
                 continue
         return found
+
+    def reconcile_message_counts(
+        self, rows: list[tuple[str, str, int]], before: dict[tuple[str, str], int]
+    ) -> list[tuple[str, str, int]]:
+        """Requeue only what a timed-out flush has not already written.
+
+        `rows` is a batch whose worker may still have been running when the
+        caller gave up waiting, and `before` is that batch's pre-write snapshot
+        (handed over in the receipt). Requeueing the whole batch in that case
+        double-counted every message the abandoned worker went on to commit, so
+        the shortfall is measured against the stored table instead.
+        """
+        return self._reconcile_chunk(rows, before)
 
     def _read_counts(
         self, chunk: list[tuple[str, str, int]]
@@ -1480,6 +1553,10 @@ class GiveawayService:
             snapshot=snapshot,
             fetch_count=False,
         )
+        # This read has to happen AFTER the write, not be folded into it: a draw
+        # or a cancel that lands between the INSERT and the reply must be seen,
+        # so the handler can strip the role instead of restoring a live embed.
+        # The counter bump cannot answer that -- its status is the pre-race one.
         return self.refresh_snapshot(gw.id)
 
     def leave(self, giveaway_id: str, user_id: str) -> bool:
@@ -1488,6 +1565,17 @@ class GiveawayService:
         Leaving an ended giveaway would rewrite who took part after the draw (and
         a cancelled one keeps its entries on purpose), so it reads as "not
         entered" there: the caller already reports False that way.
+        """
+        return self.leave_with_count(giveaway_id, user_id)[0]
+
+    def leave_with_count(self, giveaway_id: str, user_id: str) -> tuple[bool, int, str]:
+        """leave(), plus the entry count and status afterwards, in one round trip.
+
+        The click path used to issue the DELETE, a counter UPDATE, then two more
+        reads (the row and its status) purely to refresh the panel it was about
+        to draw. The counter bump below already produces the exact number, and
+        the row's status is read by the same statement, so both are returned with
+        the cursor instead of being selected back.
         """
         cur = self.db.execute(
             "DELETE FROM simple_entries WHERE giveaway_id = ? AND user_id = ? AND EXISTS ("
@@ -1498,21 +1586,43 @@ class GiveawayService:
             removed = (cur.rowcount or 0) > 0
         except Exception:
             removed = True
-        if removed:
-            # Keep the live counter exact: a leave must undo the join bump.
-            # GREATEST-equivalent via CASE (portable sqlite/libsql) so a
-            # racing double-leave can never drive it negative.
+        if not removed:
+            return False, 0, ""
+        # Keep the live counter exact: a leave must undo the join bump.
+        # GREATEST-equivalent via CASE (portable sqlite/libsql) so a
+        # racing double-leave can never drive it negative. RETURNING hands back
+        # the value the row now holds, which is the number the panel needs --
+        # the alternative was selecting it back, one more hop for one integer.
+        # The statement stays inside this try/except: if the driver rejects
+        # RETURNING (unverified over libsql), the count is simply re-read and
+        # the caller still shows the right number.
+        count = 0
+        status = ""
+        try:
+            cur = self.db.execute(
+                "UPDATE simple_giveaways SET entrant_count ="
+                " CASE WHEN COALESCE(entrant_count, 0) > 0"
+                " THEN entrant_count - 1 ELSE 0 END WHERE id = ?"
+                " RETURNING entrant_count, status",
+                (giveaway_id,),
+            )
+            row = cur.fetchone()
+            count = int(row[0])
+            status = str(row[1] or "")
+        except Exception:
             try:
-                self.db.execute(
-                    "UPDATE simple_giveaways SET entrant_count ="
-                    " CASE WHEN COALESCE(entrant_count, 0) > 0"
-                    " THEN entrant_count - 1 ELSE 0 END WHERE id = ?",
+                got = self.db.query_one(
+                    "SELECT COALESCE(entrant_count, 0) AS n, status"
+                    " FROM simple_giveaways WHERE id = ?",
                     (giveaway_id,),
                 )
+                count = int(got.get("n") or 0) if got else 0
+                status = str(got.get("status") or "") if got else ""
             except Exception:
-                pass
-            self._mark_stale(f"count:{giveaway_id}")
-        return removed
+                count = 0
+                status = ""
+        self._mark_stale(f"count:{giveaway_id}")
+        return True, max(0, count), status
 
     # -- end / reroll / cancel ------------------------------------------
     def _pick(self, giveaway_id: str, n: int, exclude: list[str] | None = None) -> list[str]:
@@ -1543,7 +1653,12 @@ class GiveawayService:
         return winners, raw
 
     def end(
-        self, giveaway_id: str, *, now: int | None = None, require_due: bool = False
+        self,
+        giveaway_id: str,
+        *,
+        now: int | None = None,
+        require_due: bool = False,
+        known: Giveaway | None = None,
     ) -> tuple[Giveaway, list[str]]:
         """End a running giveaway and draw its winners.
 
@@ -1568,7 +1683,12 @@ class GiveawayService:
         extended (or already ended). Manual /giveaway_end leaves require_due
         off and keeps the early-end behavior.
         """
-        gw = self.get(giveaway_id)
+        # A caller that already holds the row (the tick's due() snapshot, or
+        # /giveaway_end's resolve) passes it in instead of being served a second
+        # full SELECT. A stale copy cannot change the outcome: the guarded flip
+        # below re-checks status and (for the tick) the deadline in the
+        # statement itself, and the losing branch re-reads live to explain why.
+        gw = known if known is not None else self.get(giveaway_id)
         if not gw.active:
             raise ServiceError("This giveaway has already ended.")
         # One timestamp for the due check, the flip and the claim windows: the
@@ -1592,6 +1712,9 @@ class GiveawayService:
                 (ts, json.dumps(winners), len(pool), gw.id),
             )
         if not _changed(cur):
+            # The draw lost the claim. Only this branch needs to know *why*,
+            # because it is about to tell the user, so the re-read lives here
+            # instead of on the winning path where the row is already known.
             try:
                 live = self.get(gw.id)
             except ServiceError:
@@ -1624,6 +1747,8 @@ class GiveawayService:
         # another row read: the success path used to read the row here and
         # again for the return. The losers/race branch above still reads
         # live data, because there the CAS did not store a draw.
+        # The pool that was just drawn IS the final entry count, and the flip
+        # wrote it to the row; carrying it here saves the announcement a read.
         ended = replace(
             gw,
             status="ended",
@@ -1992,41 +2117,203 @@ class GiveawayService:
                         pass
         return written
 
+    #: Rows per multi-row INSERT in the claim sweep. SQLite's default parameter
+    #: limit is 999 and each row binds 4, so 150 rows = 600 params.
+    CLAIM_SWEEP_INSERT_CHUNK = 150
+
     def repair_all_missing_claims(self, now: int | None = None, limit: int = 25) -> int:
         """Heal every stranded claim window. due_claims(repair=True) runs this.
 
         A giveaway stranded with zero pending rows never appears in due_claims,
         so per-giveaway repair alone would never visit it: this bounded sweep
         (oldest ended first) recreates those windows, and the tick then picks
-        them up like any restart recovery. The tick requests a repair on its
-        first pass and every 10th tick (5 minutes at the 30s cadence), so a
-        crash heals within that window without paying this sweep's reads on
-        every healthy pass. Idempotent; failures heal on a later tick. Returns
-        rows written.
+        them up like any restart recovery. Idempotent; failures heal on a
+        later tick. Returns rows written.
+
+        Batched: one bounded id read, one giveaway-column read and one claim
+        read cover the whole sweep, and inserts are multi-row. A healthy sweep
+        therefore costs 3 reads and 0 writes however many giveaways it visits
+        (the previous per-giveaway loop cost 3 statements each, including an
+        UPDATE that wrote nothing, and ran the tick into DB_CALL_TIMEOUT).
         """
         ts = now if now is not None else now_ms()
         try:
             rows = self.db.query(
+                # Plain ended_at, not COALESCE(ended_at, 0): the COALESCE
+                # wrapped the column in an expression, so no index could serve
+                # the order and every tick sorted the whole ended set. Rows from
+                # before the column existed have claim_timeout_seconds = 0 and
+                # are excluded by the line above anyway.
                 "SELECT id FROM simple_giveaways WHERE status = 'ended'"
                 " AND claim_timeout_seconds > 0 AND winners_json != '[]'"
-                " ORDER BY COALESCE(ended_at, 0) ASC LIMIT ?",
+                " ORDER BY ended_at ASC LIMIT ?",
                 (max(1, min(int(limit), 100)),),
             )
         except Exception:
             return 0
-        total = 0
+        ids: list[str] = []
+        seen_ids: set[str] = set()
         for r in rows:
+            gid = str(r.get("id"))
+            if gid in seen_ids:
+                continue
+            seen_ids.add(gid)
+            ids.append(gid)
+        if not ids:
+            return 0
+        marks = ", ".join("?" for _ in ids)
+        try:
+            gw_rows = self.db.query(
+                "SELECT id, winners_json, claim_timeout_seconds, ended_at"  # noqa: S608
+                f" FROM simple_giveaways WHERE id IN ({marks})",
+                tuple(ids),
+            )
+            claim_rows = self.db.query(
+                "SELECT giveaway_id, user_id, status, deadline_ms FROM simple_claims"  # noqa: S608
+                f" WHERE giveaway_id IN ({marks})",
+                tuple(ids),
+            )
+        except Exception:
+            log.warning("claim repair sweep read failed")
+            return 0
+        by_id: dict[str, dict] = {}
+        for r in gw_rows:
             try:
-                gid = str(r.get("id"))
+                gid = r.get("id")
             except Exception:
                 log.warning("claim repair sweep row skipped")
                 continue
+            if gid is not None:
+                by_id[str(gid)] = r
+        claims: dict[str, list[dict]] = {}
+        for r in claim_rows:
             try:
-                total += self.repair_missing_claims(gid, now=ts)
+                gid = str(r.get("giveaway_id"))
             except Exception:
-                log.warning("claim repair sweep failed for a giveaway")
+                log.warning("claim repair sweep claim row skipped")
                 continue
-        return total
+            claims.setdefault(gid, []).append(r)
+
+        inserts: list[tuple[str, str, int, int]] = []
+        stale: list[tuple[str, list[str]]] = []
+        for gid in ids:
+            gw_row = by_id.get(gid)
+            if gw_row is None:
+                # Deleted between the id read and the column read.
+                continue
+            try:
+                timeout_s = int(gw_row.get("claim_timeout_seconds") or 0)
+            except (TypeError, ValueError):
+                log.warning("claim repair sweep failed for %s", gid)
+                continue
+            if timeout_s <= 0:
+                continue
+            try:
+                parsed = json.loads(gw_row.get("winners_json") or "[]")
+            except (ValueError, TypeError):
+                parsed = []
+            if not isinstance(parsed, list):
+                parsed = []
+            winners = [str(w) for w in dict.fromkeys(str(w) for w in parsed)]
+            if not winners:
+                continue
+            winner_set = set(winners)
+            have: set[str] = set()
+            latest = 0
+            stale_pending = False
+            for r in claims.get(gid, ()):
+                try:
+                    uid = str(r.get("user_id"))
+                except Exception:
+                    log.warning("claim repair row skipped for %s", gid)
+                    continue
+                have.add(uid)
+                try:
+                    latest = max(latest, int(r.get("deadline_ms") or 0))
+                except (TypeError, ValueError):
+                    log.warning("claim repair deadline skipped for %s", gid)
+                if (
+                    str(r.get("status")) == self.CLAIM_PENDING
+                    and r.get("user_id") is not None
+                    and uid not in winner_set
+                ):
+                    stale_pending = True
+            if latest > 0:
+                # Never hand a repaired winner an already-past deadline: a later
+                # draw (reroll/expire) must start its own window at repair time,
+                # while a partially inserted initial batch simply gains a few ms.
+                deadline = max(latest, ts + timeout_s * 1000)
+            else:
+                try:
+                    base = int(gw_row.get("ended_at") or ts)
+                except (TypeError, ValueError):
+                    base = ts
+                deadline = base + timeout_s * 1000
+            for uid in winners:
+                if uid not in have:
+                    inserts.append((gid, uid, deadline, ts))
+            if stale_pending:
+                stale.append((gid, winners))
+
+        written = 0
+        # Settle before inserting: it depends only on the rows read above, so a
+        # driver failure in the insert loop cannot leave stale pending rows
+        # behind (today's per-giveaway loop degraded one giveaway at a time).
+        for gid, winners in stale:
+            marks = ", ".join("?" for _ in winners)
+            try:
+                cur = self.db.execute(
+                    "UPDATE simple_claims SET status = ? WHERE giveaway_id = ?"  # noqa: S608
+                    f" AND status = 'pending' AND user_id NOT IN ({marks})",  # noqa: S608
+                    (self.CLAIM_REPLACED, gid, *winners),
+                )
+            except Exception:
+                log.warning("claim repair settle failed for %s", gid)
+                continue
+            try:
+                written += int(cur.rowcount or 0)
+            except Exception:
+                # Accounting must never abort the sweep: a cursor without a
+                # usable rowcount costs us the count, not the write.
+                pass
+        for start in range(0, len(inserts), self.CLAIM_SWEEP_INSERT_CHUNK):
+            chunk = inserts[start : start + self.CLAIM_SWEEP_INSERT_CHUNK]
+            values = ", ".join("(?, ?, 0, 'pending', ?, ?)" for _ in chunk)
+            params: list[Any] = []
+            for gid, uid, deadline, created in chunk:
+                params.extend((gid, uid, deadline, created))
+            try:
+                cur = self.db.execute(
+                    "INSERT OR IGNORE INTO simple_claims"  # noqa: S608
+                    " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
+                    f" VALUES {values}",
+                    params,
+                )
+            except Exception:
+                # Keep today's per-row best effort when a whole chunk fails:
+                # one bad row must not take the rest of the batch down with it.
+                log.warning("claim repair insert batch failed")
+                for gid, uid, deadline, created in chunk:
+                    try:
+                        self.db.execute(
+                            "INSERT OR IGNORE INTO simple_claims"
+                            " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
+                            " VALUES (?, ?, 0, 'pending', ?, ?)",
+                            (gid, uid, deadline, created),
+                        )
+                    except Exception:
+                        log.warning("claim repair insert failed for %s/%s", gid, uid)
+                        continue
+                    written += 1
+                continue
+            try:
+                changed = int(cur.rowcount)
+            except Exception:
+                # Same rule as the settle loop: never let accounting abort the
+                # sweep or skip the remaining chunks.
+                changed = -1
+            written += changed if changed >= 0 else len(chunk)
+        return written
 
     def pending_claims(self, giveaway_id: str) -> list[dict]:
         """Pending claim rows for a giveaway, oldest deadline first.
@@ -2301,6 +2588,8 @@ class GiveawayService:
         self.db.execute(
             "UPDATE simple_giveaways SET message_id = ? WHERE id = ?", (message_id, giveaway_id)
         )
+
+
 
     def extend(self, giveaway_id: str, extra_seconds: int) -> Giveaway:
         """Push the deadline back. Only on a running giveaway."""

@@ -169,7 +169,9 @@ class CommandWiringTests(BotTestCase):
     def test_a_failed_flush_keeps_the_counts(self) -> None:
         asyncio.run(self.bot.on_message(fake_message(self.guild, "3" * 18)))
         original = self.bot.service.add_message_counts
-        self.bot.service.add_message_counts = lambda rows: (_ for _ in ()).throw(OSError("turso down"))
+        self.bot.service.add_message_counts = lambda rows, receipt=None: (
+            _ for _ in ()
+        ).throw(OSError("turso down"))
         with self.assertRaises(OSError):
             asyncio.run(self.bot._flush_message_buffer())
         self.bot.service.add_message_counts = original
@@ -184,7 +186,7 @@ class CommandWiringTests(BotTestCase):
         asyncio.run(self.bot.on_message(fake_message(self.guild, "4" * 18)))
         original = self.bot.service.add_message_counts
 
-        def half_written(rows):
+        def half_written(rows, receipt=None):
             # One of the two buffered users made it; the other did not.
             raise PartialFlush(applied=1, error=OSError("turso down"))
 
@@ -199,6 +201,31 @@ class CommandWiringTests(BotTestCase):
         )
         asyncio.run(self.bot._flush_message_buffer())
         self.assertEqual(self.svc.message_count(self.guild, "4" * 18), 1)
+
+    def test_a_timed_out_flush_does_not_count_the_batch_twice(self) -> None:
+        for _ in range(3):
+            asyncio.run(self.bot.on_message(fake_message(self.guild, "3" * 18)))
+        original = self.bot.service.add_message_counts
+
+        def times_out_but_writes(rows, receipt=None):
+            # The worker outlived the await: by the time anybody looks, the
+            # counts are stored and the receipt says so.
+            original(rows, receipt=receipt)
+            raise TimeoutError()
+
+        self.bot.service.add_message_counts = times_out_but_writes
+
+        async def scenario() -> None:
+            with self.assertRaises(TimeoutError):
+                await self.bot._flush_message_buffer()
+            # The settle task is what decides how much goes back.
+            await asyncio.gather(*list(self.bot._bg_tasks))
+
+        asyncio.run(scenario())
+        self.bot.service.add_message_counts = original
+        self.assertEqual(self.bot._message_buffer, {},
+                         "what the abandoned worker wrote must not be requeued")
+        self.assertEqual(self.svc.message_count(self.guild, "3" * 18), 3)
 
     def test_buffer_overflow_flushes_early(self) -> None:
         self.bot.MESSAGE_BUFFER_MAX = 2
@@ -904,7 +931,9 @@ class LeaveTests(BotTestCase):
         def boom(*args, **kwargs):
             raise OSError("turso down")
 
-        self.bot.service.leave = boom
+        # The handler calls leave_with_count (it needs the post-leave total for
+        # the embed), so the failure has to be injected there.
+        self.bot.service.leave_with_count = boom
         asyncio.run(self.bot.handle_leave(interaction, gw.id))
         # This used to escape the button callback: a bare "interaction failed"
         # with nothing tying the error to the giveaway.
@@ -1048,14 +1077,14 @@ class GiveawayLifecycleTests(BotTestCase):
             gw, user_id=str(member.id), username="entrant", member_roles=[],
             account_created_ts=time.time() - 400 * 86400,
         )
-        original_leave = self.bot.service.leave
+        original_leave = self.bot.service.leave_with_count
 
         def leave_then_cancel(*args):
-            removed = original_leave(*args)
+            removed, count, status = original_leave(*args)
             self.svc.cancel(gw.id)
-            return removed
+            return removed, count, status
 
-        self.bot.service.leave = leave_then_cancel
+        self.bot.service.leave_with_count = leave_then_cancel
         interaction = FakeInteraction(guild=FakeGuild(self.guild, [member]), user=member)
         asyncio.run(self.bot.handle_leave(interaction, gw.id))
         self.assertIn("You left the giveaway.", interaction.texts)
@@ -1111,7 +1140,7 @@ class GiveawayLifecycleTests(BotTestCase):
 
         asyncio.run(scenario())
 
-    def test_tick_repairs_claim_windows_first_and_every_tenth_tick(self) -> None:
+    def test_tick_repairs_claim_windows_every_tick(self) -> None:
         self.bot.service.due = lambda: []
         flags: list[bool] = []
 
@@ -1125,7 +1154,8 @@ class GiveawayLifecycleTests(BotTestCase):
         self.bot._autocomplete_cache = {self.guild: []}
         for _ in range(10):
             asyncio.run(self.bot.tick.coro(self.bot))
-        self.assertEqual(flags, [True] + [False] * 8 + [True])
+        # The batched sweep is cheap enough to heal on every pass.
+        self.assertEqual(flags, [True] * 10)
 
     def test_tick_reads_live_statuses_in_one_batch(self) -> None:
         gw = self.make(prize="batched")
@@ -2146,9 +2176,10 @@ class OffLoopReadPoolTests(BotTestCase):
     The loop's default executor is min(32, cpu+4) workers -- 5 on the 1-CPU
     instance this bot is deployed on -- and every cold worker opens its own
     database stream (a fresh TLS + auth handshake). The pinned pool is 64
-    lanes, warm after the first burst, and gated. Two call sites used to run
-    their blocking read on the default executor: the heartbeat's /health
-    probe and the active-giveaway lookup the request probe needs for its key.
+    lanes, warm after the first burst, and gated. The active-giveaway lookup
+    the request probe needs for its key used to run on the default executor.
+    The heartbeat's /health probe is the one exception: it is liveness, not a
+    database read, and must not consume a DB lane or inherit the 8s DB timeout.
     """
 
     def spy_on_db_call(self) -> list:
@@ -2171,10 +2202,22 @@ class OffLoopReadPoolTests(BotTestCase):
         asyncio.run(command.callback(interaction))
         self.assertIn("list_active", seen, f"the probe's own read went elsewhere: {seen}")
 
-    def test_the_health_probe_rides_the_pinned_pool(self) -> None:
+    def test_heartbeat_does_not_take_a_db_lane(self) -> None:
+        class _Response:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
         seen = self.spy_on_db_call()
-        asyncio.run(self.bot.heartbeat.coro(self.bot))
-        self.assertIn("_ping", seen, f"the health probe went elsewhere: {seen}")
+        with patch("urllib.request.urlopen", return_value=_Response()):
+            asyncio.run(self.bot.heartbeat.coro(self.bot))
+        # The spy is the real pin: a released semaphore is back to 64, so
+        # _db_gate._value cannot tell a lane from no lane after the await.
+        self.assertEqual(seen, [], f"the health probe used the DB runner: {seen}")
 
     def test_request_time_preview_writes_ride_the_pinned_pool(self) -> None:
         seen = self.spy_on_db_call()
@@ -2230,16 +2273,19 @@ class OffLoopReadPoolTests(BotTestCase):
             "the injected runner must be this bot's own bound _db_call",
         )
 
-    def test_no_blocking_read_is_left_on_the_default_executor(self) -> None:
+    def test_no_blocking_database_read_is_left_on_the_default_executor(self) -> None:
+        """Only the /health liveness probe may bypass the pinned DB pool."""
         package = pathlib.Path(__file__).resolve().parent.parent / "giveaway_bot"
         for name in ("bot.py", "service.py"):
             text = (package / name).read_text(encoding="utf-8")
-            self.assertNotIn(
-                "asyncio.to_thread(",
-                text,
-                f"{name}: every off-loop database read must go through _db_call"
-                " (the pinned pool)",
-            )
+            for line in text.splitlines():
+                if "asyncio.to_thread(" in line:
+                    self.assertIn(
+                        "asyncio.to_thread(_ping)",
+                        line,
+                        f"{name}: every off-loop database read must go through"
+                        " _db_call (the pinned pool); only the liveness probe is exempt",
+                    )
 
 
 if __name__ == "__main__":

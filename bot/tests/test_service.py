@@ -110,9 +110,13 @@ class SchemaTests(ServiceTestCase):
         names = {str(r["name"]) for r in self.db.query(
             "SELECT name FROM sqlite_master WHERE type = 'index'"
         )}
-        self.assertIn("idx_simple_gw_status_ends", names)
-        self.assertIn("idx_simple_entries_giveaway", names)
+        self.assertIn("idx_simple_gw_status_ends", names, "due() scans on this every tick")
+        self.assertIn("idx_simple_entries_gw_entered", names, "entries reads sort by entered_at")
         self.assertIn("idx_simple_entries_user", names, "blacklist purge needs this")
+        self.assertIn("idx_simple_claims_pending_due", names, "due_claims scans every 30s")
+        # Superseded by idx_simple_entries_gw_entered and dropped on migration;
+        # it only repeated the simple_entries primary-key prefix.
+        self.assertNotIn("idx_simple_entries_giveaway", names)
 
     def test_engine_agnostic_defaults(self) -> None:
         self.assertEqual(self.db.backend, "injected")
@@ -143,6 +147,14 @@ class WriteClassificationTests(unittest.TestCase):
             "",
         ):
             self.assertFalse(_is_write(sql), sql)
+
+    def test_a_pragma_that_assigns_is_a_write(self) -> None:
+        # "PRAGMA user_version = 2" changes the database, so it needs the same
+        # commit as any other write; ignoring it would leave the schema stamp
+        # unapplied and every boot would re-run the whole DDL block.
+        self.assertTrue(_is_write("PRAGMA user_version = 2"))
+        self.assertTrue(_is_write("  pragma journal_mode=wal"))
+        self.assertFalse(_is_write("PRAGMA user_version"), "a bare pragma only reads")
 
 
 class CreateTests(ServiceTestCase):
@@ -449,7 +461,7 @@ class DrawTests(ServiceTestCase):
         self.assertEqual(len(winners), 2)
         self.assertEqual(sorted(ended.winners), sorted(winners))
         self.assertEqual(ended.status, "ended")
-        # The status flip is the claim, so a second ender cannot draw again —
+        # The status flip is the claim, so a second ender cannot draw again â€”
         # and cannot get a different set of winners to announce either.
         with self.assertRaises(ServiceError) as ctx:
             self.svc.end(gw.id)
@@ -1404,6 +1416,167 @@ class ClaimAtomicityTests(ServiceTestCase):
         self.assertEqual(statuses[loser], "replaced")
         again = self.svc.repair_missing_claims(ended.id)
         self.assertEqual(again, 0, "second sweep must be a no-op")
+
+    def test_healthy_claim_sweep_is_three_reads_and_no_writes(self) -> None:
+        ended_ids: list[tuple[str, list[str]]] = []
+        for i in range(25):
+            gw = self.make(winner_count=2, claim_timeout_seconds=3600)
+            for j in range(4):
+                self.join(gw, user_id=str(10 ** 17 + i * 10 + j))
+            ended, winners = self.svc.end(gw.id)
+            self.assertEqual(len(winners), 2)
+            ended_ids.append((ended.id, winners))
+        self.db.reset_stats()
+        written = self.svc.repair_all_missing_claims()
+        stats = self.db.get_stats()
+        self.assertEqual(written, 0)
+        self.assertEqual(int(stats["reads"]), 3)
+        self.assertEqual(int(stats["writes"]), 0)
+        # Positive control: a sweep that bailed after one read would also show
+        # zero writes, so strand a winner of the newest giveaway (last id the
+        # bounded id query returns) and prove the sweep walked the whole set.
+        deepest, deepest_winners = ended_ids[-1]
+        self.db.execute(
+            "UPDATE simple_giveaways SET ended_at = ? WHERE id = ?",
+            (now_ms() + 60_000, deepest),
+        )
+        self.db.execute(
+            "DELETE FROM simple_claims WHERE giveaway_id = ? AND user_id = ?",
+            (deepest, deepest_winners[0]),
+        )
+        self.db.reset_stats()
+        self.assertEqual(self.svc.repair_all_missing_claims(), 1)
+        stats = self.db.get_stats()
+        self.assertEqual(int(stats["reads"]), 3)
+        self.assertEqual(int(stats["writes"]), 1)
+        rows = {str(r["user_id"]) for r in self.svc.claim_status(deepest)}
+        self.assertEqual(rows, set(deepest_winners))
+
+    def test_claim_sweep_recreates_a_stranded_window_in_one_batch(self) -> None:
+        ended, winner, _users = self._three_entrant_ended()
+        row = self.db.query_one(
+            "SELECT ended_at FROM simple_giveaways WHERE id = ?", (ended.id,)
+        )
+        ended_at = int(row["ended_at"])
+        self.db.execute("DELETE FROM simple_claims WHERE giveaway_id = ?", (ended.id,))
+        # Second stranded giveaway with no ended_at: its fallback base is now.
+        gw2 = self.make(winner_count=1, claim_timeout_seconds=3600)
+        self.join(gw2, user_id="555555555555555555")
+        ended2, _winners2 = self.svc.end(gw2.id)
+        self.db.execute(
+            "UPDATE simple_giveaways SET ended_at = NULL WHERE id = ?", (ended2.id,)
+        )
+        self.db.execute("DELETE FROM simple_claims WHERE giveaway_id = ?", (ended2.id,))
+        ts = ended_at + 5000
+        self.db.reset_stats()
+        written = self.svc.repair_all_missing_claims(now=ts)
+        self.assertEqual(written, 2)
+        stats = self.db.get_stats()
+        self.assertEqual(int(stats["reads"]), 3, "the batch must not loop per giveaway")
+        self.assertEqual(int(stats["writes"]), 1, "both rows belong to one INSERT")
+        rows = {str(r["user_id"]): r for r in self.svc.claim_status(ended.id)}
+        self.assertEqual(list(rows), [winner])
+        self.assertEqual(str(rows[winner]["status"]), "pending")
+        self.assertEqual(int(rows[winner]["deadline_ms"]), ended_at + 3600 * 1000)
+        rows2 = self.svc.claim_status(ended2.id)
+        self.assertEqual(len(rows2), 1)
+        self.assertEqual(str(rows2[0]["status"]), "pending")
+        self.assertEqual(int(rows2[0]["deadline_ms"]), ts + 3600 * 1000)
+        self.assertEqual(self.svc.repair_all_missing_claims(now=ts), 0)
+
+    def test_claim_sweep_settles_a_stale_pending_row(self) -> None:
+        ended, winner, users = self._three_entrant_ended()
+        loser = next(u for u in users if u != winner)
+        self.db.execute(
+            "INSERT OR IGNORE INTO simple_claims"
+            " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
+            " VALUES (?, ?, 0, 'pending', ?, ?)",
+            (ended.id, loser, now_ms() + 3600 * 1000, now_ms()),
+        )
+        self.assertEqual(self.svc.repair_all_missing_claims(), 1)
+        statuses = {
+            str(r["user_id"]): str(r["status"]) for r in self.svc.claim_status(ended.id)
+        }
+        self.assertEqual(statuses[winner], "pending")
+        self.assertEqual(statuses[loser], "replaced")
+        self.assertEqual(self.svc.repair_all_missing_claims(), 0)
+
+    def test_claim_sweep_survives_one_bad_row(self) -> None:
+        bad, _bad_winner, _users = self._three_entrant_ended()
+        good = self.make(winner_count=1, claim_timeout_seconds=3600)
+        self.join(good, user_id="444444444444444444")
+        good_ended, good_winners = self.svc.end(good.id)
+        self.db.execute(
+            "UPDATE simple_giveaways SET winners_json = 'not json' WHERE id = ?",
+            (bad.id,),
+        )
+        before = sorted(
+            (str(r["user_id"]), str(r["status"]), int(r["deadline_ms"]))
+            for r in self.svc.claim_status(bad.id)
+        )
+        self.db.execute(
+            "DELETE FROM simple_claims WHERE giveaway_id = ?", (good_ended.id,)
+        )
+        self.assertEqual(self.svc.repair_all_missing_claims(), 1)
+        after = sorted(
+            (str(r["user_id"]), str(r["status"]), int(r["deadline_ms"]))
+            for r in self.svc.claim_status(bad.id)
+        )
+        self.assertEqual(
+            after, before, "the malformed giveaway's own rows must be left intact"
+        )
+        rows = self.svc.claim_status(good_ended.id)
+        self.assertEqual([str(r["user_id"]) for r in rows], good_winners)
+        self.assertEqual({str(r["status"]) for r in rows}, {"pending"})
+
+    def test_claim_sweep_accounting_error_still_settles(self) -> None:
+        """A cursor without rowcount must not skip the settle phase."""
+        ended, winner, users = self._three_entrant_ended()
+        loser = next(u for u in users if u != winner)
+        self.db.execute(
+            "INSERT OR IGNORE INTO simple_claims"
+            " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
+            " VALUES (?, ?, 0, 'pending', ?, ?)",
+            (ended.id, loser, now_ms() + 3600 * 1000, now_ms()),
+        )
+        good = self.make(winner_count=1, claim_timeout_seconds=3600)
+        self.join(good, user_id="444444444444444444")
+        good_ended, good_winners = self.svc.end(good.id)
+        self.db.execute(
+            "DELETE FROM simple_claims WHERE giveaway_id = ?", (good_ended.id,)
+        )
+
+        real_execute = self.db.execute
+
+        class _NoRowcount:
+            def __init__(self, inner):
+                self._inner = inner
+
+            @property
+            def rowcount(self):
+                raise AttributeError("driver cursor has no rowcount")
+
+        def flaky(sql, params=()):
+            cur = real_execute(sql, params)
+            return _NoRowcount(cur) if "INSERT" in sql else cur
+
+        with unittest.mock.patch.object(self.db, "execute", flaky):
+            written = self.svc.repair_all_missing_claims()
+
+        self.assertEqual(written, 2, "one settled row plus the len(chunk) fallback")
+
+        statuses = {
+            str(r["user_id"]): str(r["status"]) for r in self.svc.claim_status(ended.id)
+        }
+        self.assertEqual(
+            statuses[loser],
+            "replaced",
+            "the stale row must settle even when insert accounting fails",
+        )
+        self.assertEqual(
+            [str(r["user_id"]) for r in self.svc.claim_status(good_ended.id)],
+            good_winners,
+        )
 
     def test_reroll_insert_crash_heals_fresh_window(self) -> None:
         ended, winner, users = self._three_entrant_ended()

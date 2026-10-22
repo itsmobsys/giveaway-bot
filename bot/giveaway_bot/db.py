@@ -68,10 +68,15 @@ def _is_write(sql: str) -> bool:
     verb = sql.lstrip().split(None, 1)
     if not verb:
         return False
+    head = verb[0].upper()
+    if head == "PRAGMA":
+        # "PRAGMA user_version = 2" assigns and needs the commit like any other
+        # write; a bare pragma ("PRAGMA table_info(x)") only reads.
+        return "=" in sql
     # WITH counts as a write on purpose: a CTE can head an INSERT/UPDATE/DELETE.
     # Committing a read costs nothing, while forgetting to commit a write
     # silently loses it.
-    return verb[0].upper() not in ("SELECT", "PRAGMA", "EXPLAIN", "VALUES")
+    return head not in ("SELECT", "EXPLAIN", "VALUES")
 
 
 def _brief(exc: Exception, limit: int = 120) -> str:
@@ -82,6 +87,12 @@ def _brief(exc: Exception, limit: int = 120) -> str:
 #: data; fresh names start clean and leave any old rows untouched.
 TABLE_GIVEAWAYS = "simple_giveaways"
 TABLE_ENTRIES = "simple_entries"
+
+#: Schema revision, recorded in the database's own PRAGMA user_version. A boot
+#: that finds this number already set skips the whole DDL block; bump it on any
+#: change to SCHEMA_TABLES, SCHEMA_DROPS, SCHEMA_INDEXES or a column map below,
+#: and the next boot re-runs everything (all of it is idempotent).
+SCHEMA_VERSION = 2
 
 SCHEMA_TABLES = f"""
 CREATE TABLE IF NOT EXISTS {TABLE_GIVEAWAYS} (
@@ -117,15 +128,44 @@ CREATE TABLE IF NOT EXISTS {TABLE_ENTRIES} (
 );
 """
 
+#: Indexes an earlier revision declared that only repeated a primary-key prefix
+#: or were superseded by a wider one below. They are dropped rather than left in
+#: place: a redundant index costs nothing to read through (SQLite prefers the
+#: covering one) but taxes every INSERT and DELETE on that table, and the entry
+#: and message-count tables see the most writes. Dropping is a no-op on a fresh
+#: database.
+SCHEMA_DROPS = """
+DROP INDEX IF EXISTS idx_simple_entries_giveaway;
+DROP INDEX IF EXISTS idx_simple_msgcounts_pk;
+DROP INDEX IF EXISTS idx_simple_bans_cover;
+DROP INDEX IF EXISTS idx_simple_banhits_cover;
+DROP INDEX IF EXISTS idx_simple_bl_cover;
+"""
+
+#: One index per real access shape, each ordered so the statement that uses it
+#: needs no temporary sort. Verified against EXPLAIN QUERY PLAN on a seeded
+#: database (500 giveaways / 27k entries / 5k claims):
+#:   - (status, ends_at)      due() every tick, and it is the only one that can
+#:                            serve the due scan, so it stays as-is.
+#:   - (status, ended_at)     list_all_ended, which otherwise sorts a temp B-tree.
+#:   - (guild_id, status, *)  list_active / list_ended: guild_id led no index at
+#:                            all, so both scanned and sorted.
+#:   - (giveaway_id, ...)     every entries read sorts by entered_at; the same
+#:                            index replaces the old giveaway_id-only one.
+#:   - simple_claims(deadline_ms) WHERE pending — due_claims runs every 30s over
+#:                            a table nothing ever prunes, so it must not scan.
+#:   - entries(user_id) stays: the blacklist purge looks members up by user.
 SCHEMA_INDEXES = f"""
 CREATE INDEX IF NOT EXISTS idx_simple_gw_status_ends ON {TABLE_GIVEAWAYS}(status, ends_at);
-CREATE INDEX IF NOT EXISTS idx_simple_entries_giveaway ON {TABLE_ENTRIES}(giveaway_id);
+CREATE INDEX IF NOT EXISTS idx_simple_gw_status_ended ON {TABLE_GIVEAWAYS}(status, ended_at);
+CREATE INDEX IF NOT EXISTS idx_simple_gw_guild_status_ends
+ON {TABLE_GIVEAWAYS}(guild_id, status, ends_at);
+CREATE INDEX IF NOT EXISTS idx_simple_gw_guild_status_ended
+ON {TABLE_GIVEAWAYS}(guild_id, status, ended_at);
+CREATE INDEX IF NOT EXISTS idx_simple_entries_gw_entered ON {TABLE_ENTRIES}(giveaway_id, entered_at);
 CREATE INDEX IF NOT EXISTS idx_simple_entries_user ON {TABLE_ENTRIES}(user_id);
-CREATE INDEX IF NOT EXISTS idx_simple_bl_cover ON simple_blacklist(guild_id, user_id, expires_at);
-CREATE INDEX IF NOT EXISTS idx_simple_bans_cover ON simple_giveaway_bans(guild_id, user_id);
-CREATE INDEX IF NOT EXISTS idx_simple_banhits_cover
-ON simple_giveaway_ban_hits(guild_id, user_id, giveaway_id);
-CREATE INDEX IF NOT EXISTS idx_simple_msgcounts_pk ON simple_message_counts(guild_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_simple_claims_pending_due
+ON simple_claims(deadline_ms) WHERE status = 'pending';
 """
 
 
@@ -209,6 +249,8 @@ class Database:
         return conn
 
     def init_schema(self) -> None:
+        if self._schema_is_current():
+            return
         for stmt in [s.strip() for s in SCHEMA_TABLES.split(";") if s.strip()]:
             self.execute(stmt)
         # Full column set, so a table created by any earlier v2 revision
@@ -345,8 +387,40 @@ class Database:
   PRIMARY KEY (giveaway_id, user_id, round)
 )"""
         )
+        for stmt in [s.strip() for s in SCHEMA_DROPS.split(";") if s.strip()]:
+            self.execute(stmt)
         for stmt in [s.strip() for s in SCHEMA_INDEXES.split(";") if s.strip()]:
             self.execute(stmt)
+        self._stamp_schema()
+
+    def _schema_is_current(self) -> bool:
+        """True when an earlier boot already applied this exact schema.
+
+        The DDL above is ~19 sequential round trips (8 CREATE TABLE, 3 column
+        probes, 5 drops, 7 indexes). Against a remote database that is seconds
+        of every cold start, paid to re-create objects that are already there,
+        and Render pays it again on every restart and free-tier spin-up. One
+        pragma read answers the same question. Any database from an earlier
+        revision -- or one the pragma cannot be read from -- reports not current
+        and takes the full path, so this can only ever cost the old behaviour.
+        """
+        try:
+            rows = self.query("PRAGMA user_version")
+        except Exception:
+            log.debug("could not read the schema version", exc_info=True)
+            return False
+        try:
+            return int(rows[0].get("user_version") or 0) >= SCHEMA_VERSION
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            return False
+
+    def _stamp_schema(self) -> None:
+        """Record that this revision's schema is fully applied."""
+        try:
+            self.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
+        except Exception:
+            # Worst case the next boot re-runs the DDL, which is idempotent.
+            log.warning("could not record the schema version", exc_info=True)
 
     def _ensure_columns(self, table: str, desired: dict[str, str]) -> None:
         try:
