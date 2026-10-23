@@ -1845,6 +1845,35 @@ class RoundTripBudgetTests(ServiceTestCase):
         self.assertEqual(self.svc.message_count(self.guild, "c" * 18), 4)
         self.assertEqual(self.svc.message_count(self.guild, "d" * 18), 5)
 
+    def test_ban_purges_and_resyncs_in_three_statements(self) -> None:
+        first = self.make()
+        second = self.make()
+        banned = "8" * 18
+        self.join(first, user_id=banned)
+        self.join(first, user_id="9" * 18)
+        self.join(second, user_id=banned)
+        self.db.reset_stats()
+        self.svc.blacklist_add(self.guild, banned)
+        stats = self.db.get_stats()
+        self.assertEqual(stats["reads"], 1, "one read finds the affected giveaways")
+        self.assertEqual(
+            stats["writes"], 3, "blacklist upsert + one DELETE + one counter UPDATE"
+        )
+        self.assertEqual(self.svc.entry_count(first.id), 1, "the other entrant stays")
+        self.assertEqual(self.svc.entry_count(second.id), 0)
+        rows = self.db.query(
+            "SELECT entrant_count FROM simple_giveaways WHERE id = ?", (first.id,)
+        )
+        self.assertEqual(int(rows[0]["entrant_count"]), 1)
+
+    def test_ban_without_live_entries_skips_both_writes(self) -> None:
+        self.make()
+        self.db.reset_stats()
+        self.svc.blacklist_add(self.guild, "7" * 18)
+        stats = self.db.get_stats()
+        self.assertEqual(stats["reads"], 1, "the ban still proves there is nothing to drop")
+        self.assertEqual(stats["writes"], 1, "only the blacklist upsert")
+
     def test_start_claims_is_one_write(self) -> None:
         gw = self.make(winner_count=10, claim_timeout_seconds=3600)
         winners = [str(500000 + i) for i in range(10)]

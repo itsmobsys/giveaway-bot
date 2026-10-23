@@ -758,31 +758,45 @@ class GiveawayService:
             await self._cache_put(key, value, COUNT_CACHE_TTL)
         return value
 
-    def _sync_counter(self, giveaway_id: str) -> None:
-        """Reset counter to COUNT(*) after a bulk drop (ban/timeout).
+    def _purge_entries_and_resync(self, guild_id: str, user_id: str) -> int:
+        """Drop a member's entries in every live giveaway, resyncing counters once.
 
-        Bulk drops remove entries without going through leave(), so the live
-        counter would otherwise stay high. Rare path (bans only), so a full
-        COUNT(*) here is fine; failures only log (the read path heals it).
+        Ban and timeout paths used to DELETE, then call list_active() and run
+        `_sync_counter` (one COUNT read + one UPDATE) per running giveaway:
+        1 + 2N statements for a ban that usually touches zero rows. The ids are
+        cheap to read first, so the whole guild's counters collapse into one
+        correlated UPDATE, and a member with no live entries costs one read and
+        no writes at all. Races with join/leave keep their old outcome: a join
+        that lands after the read is not deleted and its bump is already exact;
+        the read path still recomputes any count a lost race left behind.
         """
-        try:
-            row = self.db.query_one(
-                "SELECT COUNT(*) AS n FROM simple_entries WHERE giveaway_id = ?",
-                (giveaway_id,),
-            )
-            try:
-                n = int((row or {}).get("n") or 0)
-            except (TypeError, ValueError):
-                return
-            self.db.execute(
-                "UPDATE simple_giveaways SET entrant_count = ? WHERE id = ?",
-                (n, giveaway_id),
-            )
-            # The cached display count for this giveaway is now wrong: the rows
-            # were dropped here, not through leave(), so nothing else marks it.
+        rows = self.db.query(
+            "SELECT DISTINCT giveaway_id FROM simple_entries WHERE user_id = ?"
+            " AND giveaway_id IN (SELECT id FROM simple_giveaways"
+            " WHERE guild_id = ? AND status = 'active')",
+            (user_id, guild_id),
+        )
+        ids = [str(row["giveaway_id"]) for row in rows]
+        if not ids:
+            return 0
+        marks = ",".join("?" for _ in ids)
+        self.db.execute(
+            "DELETE FROM simple_entries WHERE user_id = ?"  # noqa: S608
+            " AND giveaway_id IN (SELECT id FROM simple_giveaways"
+            " WHERE guild_id = ? AND status = 'active')"
+            f" AND giveaway_id IN ({marks})",
+            (user_id, guild_id, *ids),
+        )
+        self.db.execute(
+            "UPDATE simple_giveaways SET entrant_count ="  # noqa: S608
+            " (SELECT COUNT(*) FROM simple_entries AS e"
+            " WHERE e.giveaway_id = simple_giveaways.id)"
+            f" WHERE id IN ({marks})",
+            tuple(ids),
+        )
+        for giveaway_id in ids:
             self._mark_stale(f"count:{giveaway_id}")
-        except Exception:
-            pass
+        return len(ids)
 
     def entries_snapshot(
         self, giveaway_id: str, limit: int | None, user_id: str
@@ -2781,15 +2795,17 @@ class GiveawayService:
             " banned_by = excluded.banned_by, created_at = excluded.created_at",
             (guild_id, user_id, expires_at, clean_reason, clean_by, ts),
         )
-        self.db.execute(
-            "DELETE FROM simple_entries WHERE user_id = ? AND giveaway_id IN"
-            " (SELECT id FROM simple_giveaways WHERE guild_id = ? AND status = 'active')",
-            (user_id, guild_id),
-        )
-        for row in self.list_active(guild_id):
-            self._sync_counter(row.id)
-        info = self.ban_info(guild_id, user_id, ts)
-        return info or {"permanent": hours_int == 0, "reason": clean_reason}
+        self._purge_entries_and_resync(guild_id, user_id)
+        # The row just written holds exactly these values, so reading it back
+        # only to rebuild the same dict costs every ban a Turso round trip.
+        remaining = 0 if expires_at is None else max(0, expires_at - ts)
+        return {
+            "expires_at": expires_at,
+            "reason": clean_reason,
+            "banned_by": clean_by,
+            "permanent": expires_at is None,
+            "remaining_ms": remaining,
+        }
 
     def blacklist_remove(self, guild_id: str, user_id: str) -> bool:
         cur = self.db.execute(
@@ -3089,13 +3105,7 @@ class GiveawayService:
         # every running giveaway in the server, exactly as blacklist_add does.
         # Dropping only the one they clicked would let them win the giveaway
         # they joined yesterday while sitting out this one.
-        self.db.execute(
-            "DELETE FROM simple_entries WHERE user_id = ? AND giveaway_id IN"
-            " (SELECT id FROM simple_giveaways WHERE guild_id = ? AND status = 'active')",
-            (user_id, gw.guild_id),
-        )
-        for row in self.list_active(gw.guild_id):
-            self._sync_counter(row.id)
+        self._purge_entries_and_resync(gw.guild_id, user_id)
         if left > 0:
             left = self.consume_timeout_ban(gw.guild_id, user_id, gw.id)
             if left > 0:
