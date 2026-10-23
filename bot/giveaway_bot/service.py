@@ -65,6 +65,26 @@ def _changed(cur: Any) -> bool:
         return False
 
 
+def _returned(cur: Any) -> dict | None:
+    """Map a ``RETURNING *`` row to a dict, or None when unavailable.
+
+    Saves the read-back the claim paths used to run after every successful
+    status flip. Drivers that omit ``description`` simply return None and the
+    caller falls back to its old SELECT.
+    """
+    try:
+        values = cur.fetchone()
+        names = [str(col[0]) for col in (cur.description or ())]
+    except Exception:
+        return None
+    if values is None or not names:
+        return None
+    try:
+        return dict(zip(names, values, strict=True))
+    except Exception:
+        return None
+
+
 #: Tag carried by the refusals a caller has to treat differently from a plain
 #: "no": the member was stopped by the timed-out rule and their entry was
 #: dropped, so anything granted on joining has to go with it.
@@ -2411,10 +2431,12 @@ class GiveawayService:
         """
         cur = self.db.execute(
             "UPDATE simple_claims SET status = 'claimed', claimed_at = ?"
-            " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
+            " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'"
+            " RETURNING *",
             (now_ms(), giveaway_id, str(user_id)),
         )
-        if not _changed(cur):
+        row = _returned(cur)
+        if row is None and not _changed(cur):
             # A crash between a draw and its inserts strands winners with no
             # row: heal once, then retry so the rightful winner still claims.
             try:
@@ -2425,14 +2447,19 @@ class GiveawayService:
                 try:
                     retry = self.db.execute(
                         "UPDATE simple_claims SET status = 'claimed', claimed_at = ?"
-                        " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
+                        " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'"
+                        " RETURNING *",
                         (now_ms(), giveaway_id, str(user_id)),
                     )
                 except Exception:
                     retry = None
-                if retry is not None and _changed(retry):
+                retry_row = _returned(retry)
+                if retry_row is not None:
+                    row = retry_row
                     cur = retry
-        if not _changed(cur):
+                elif retry is not None and _changed(retry):
+                    cur = retry
+        if row is None and not _changed(cur):
             row = self.db.query_one(
                 "SELECT status FROM simple_claims WHERE giveaway_id = ? AND user_id = ?"
                 " ORDER BY round DESC LIMIT 1",
@@ -2448,11 +2475,12 @@ class GiveawayService:
             if status == self.CLAIM_REPLACED:
                 raise ServiceError("This winner was replaced by a reroll.")
             raise ServiceError("This claim window has closed.")
-        row = self.db.query_one(
-            "SELECT * FROM simple_claims WHERE giveaway_id = ? AND user_id = ?"
-            " AND status = 'claimed' ORDER BY round DESC LIMIT 1",
-            (giveaway_id, str(user_id)),
-        )
+        if row is None:
+            row = self.db.query_one(
+                "SELECT * FROM simple_claims WHERE giveaway_id = ? AND user_id = ?"
+                " AND status = 'claimed' ORDER BY round DESC LIMIT 1",
+                (giveaway_id, str(user_id)),
+            )
         return dict(row or {})
 
     def skip_claim(self, giveaway_id: str, user_id: str, staff_id: str) -> dict:
@@ -2465,10 +2493,12 @@ class GiveawayService:
             raise ServiceError("A staff member must verify the claim.")
         cur = self.db.execute(
             "UPDATE simple_claims SET status = 'skipped', skipped_by = ?, skipped_at = ?"
-            " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
+            " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'"
+            " RETURNING *",
             (str(staff_id), now_ms(), giveaway_id, str(user_id)),
         )
-        if not _changed(cur):
+        row = _returned(cur)
+        if row is None and not _changed(cur):
             # Same stranded-window heal as claim(): a missing row may just be
             # a draw whose inserts never landed.
             try:
@@ -2480,14 +2510,19 @@ class GiveawayService:
                     retry = self.db.execute(
                         "UPDATE simple_claims SET status = 'skipped',"
                         " skipped_by = ?, skipped_at = ?"
-                        " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
+                        " WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'"
+                        " RETURNING *",
                         (str(staff_id), now_ms(), giveaway_id, str(user_id)),
                     )
                 except Exception:
                     retry = None
-                if retry is not None and _changed(retry):
+                retry_row = _returned(retry)
+                if retry_row is not None:
+                    row = retry_row
                     cur = retry
-        if not _changed(cur):
+                elif retry is not None and _changed(retry):
+                    cur = retry
+        if row is None and not _changed(cur):
             row = self.db.query_one(
                 "SELECT status FROM simple_claims WHERE giveaway_id = ? AND user_id = ?"
                 " ORDER BY round DESC LIMIT 1",
@@ -2503,11 +2538,12 @@ class GiveawayService:
             if status == self.CLAIM_REPLACED:
                 raise ServiceError("That winner was replaced by a reroll.")
             raise ServiceError("That claim window has already closed.")
-        row = self.db.query_one(
-            "SELECT * FROM simple_claims WHERE giveaway_id = ? AND user_id = ?"
-            " AND status = 'skipped' ORDER BY round DESC LIMIT 1",
-            (giveaway_id, str(user_id)),
-        )
+        if row is None:
+            row = self.db.query_one(
+                "SELECT * FROM simple_claims WHERE giveaway_id = ? AND user_id = ?"
+                " AND status = 'skipped' ORDER BY round DESC LIMIT 1",
+                (giveaway_id, str(user_id)),
+            )
         return dict(row or {})
 
     def expire_claim(

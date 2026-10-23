@@ -1981,6 +1981,32 @@ class RoundTripBudgetTests(ServiceTestCase):
         )
         self.assertTrue(all(str(r["status"]) == "pending" for r in again))
 
+    def test_claim_success_is_one_write_without_a_read_back(self) -> None:
+        gw = self.make(winner_count=1, claim_timeout_seconds=3600)
+        self.join(gw, user_id="777777777777777777")
+        ended, winners = self.svc.end(gw.id)
+        self.svc.start_claims(ended, winners, now=now_ms())
+        self.db.reset_stats()
+        row = self.svc.claim(ended.id, winners[0])
+        stats = self.db.get_stats()
+        self.assertEqual(stats["writes"], 1, "one guarded status flip")
+        self.assertEqual(stats["reads"], 0, "RETURNING carries the row back")
+        self.assertEqual(str(row["user_id"]), winners[0])
+        self.assertEqual(str(row["status"]), "claimed")
+
+    def test_skip_success_is_one_write_without_a_read_back(self) -> None:
+        gw = self.make(winner_count=1, claim_timeout_seconds=3600)
+        self.join(gw, user_id="888888888888888888")
+        ended, winners = self.svc.end(gw.id)
+        self.svc.start_claims(ended, winners, now=now_ms())
+        self.db.reset_stats()
+        row = self.svc.skip_claim(ended.id, winners[0], "999999999999999999")
+        stats = self.db.get_stats()
+        self.assertEqual(stats["writes"], 1, "one guarded status flip")
+        self.assertEqual(stats["reads"], 0, "RETURNING carries the row back")
+        self.assertEqual(str(row["user_id"]), winners[0])
+        self.assertEqual(str(row["status"]), "skipped")
+
     def test_empty_giveaway_count_is_known_zero(self) -> None:
         gw = self.make()
         self.db.reset_stats()
