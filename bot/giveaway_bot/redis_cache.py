@@ -254,14 +254,15 @@ class RedisCache:
         if not self.available:
             self._counters["skipped"] += 1
             return _FAILED
+        if self._client_or_none() is None:
+            # No driver, malformed URL, or a client already closed: every
+            # caller treats this exactly like a miss. Check before the budget
+            # so an unconnectable cache cannot drain the token bucket.
+            self._counters["skipped"] += 1
+            return _FAILED
         if not self._budget.take():
             # Over the plan's ops/sec: skip without touching the network. The
             # caller sees a miss and reads Turso, which is always correct.
-            self._counters["skipped"] += 1
-            return _FAILED
-        if self._client_or_none() is None:
-            # No driver, malformed URL, or a client already closed: every
-            # caller treats this exactly like a miss.
             self._counters["skipped"] += 1
             return _FAILED
         self._counters["attempted"] += 1

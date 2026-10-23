@@ -172,6 +172,23 @@ class DegradedModeTests(unittest.IsolatedAsyncioTestCase):
 
 
 class BudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_an_unconnectable_cache_never_spends_the_budget(self) -> None:
+        def broken() -> FakeRedis:
+            raise ModuleNotFoundError("No module named 'redis'")
+
+        cache = RedisCache(
+            "redis://example.invalid:6379/0",
+            connect=broken,
+            op_budget_per_sec=1.0,
+            clock=FakeClock(),
+        )
+        before = cache._budget._tokens
+        for _ in range(5):
+            self.assertIsNone(await cache.get("k"))
+        self.assertEqual(cache._budget._tokens, before,
+                         "a cache with no client must not drain the token bucket")
+        self.assertEqual(cache.stats()["counters"]["skipped"], 5)
+
     async def test_over_budget_ops_are_skipped_without_touching_redis(self) -> None:
         fake = FakeRedis()
         clock = FakeClock()

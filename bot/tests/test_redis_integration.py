@@ -233,7 +233,8 @@ class CachedCountTests(ServiceTestCase):
         gw = self.make()
         self.svc.discard(gw.id)
         spilled = self.svc.drain_invalidations()
-        self.assertIn("all:active", spilled)
+        self.assertIn(f"guild:{self.guild}:active", spilled)
+        self.assertNotIn("all:active", spilled, "nothing ever writes that key")
         self.assertIn(f"count:{gw.id}", spilled)
         self.assertEqual(asyncio.run(self.svc.flush_invalidations()), 0, "nothing cached yet")
 

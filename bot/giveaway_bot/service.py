@@ -346,7 +346,7 @@ class GiveawayService:
         cache = self._redis
         if cache is None or not guild_id:
             return
-        keys = [f"guild:{guild_id}:active", "all:active"]
+        keys = [f"guild:{guild_id}:active"]
         if giveaway_id:
             keys.append(f"gw:{giveaway_id}")
             keys.append(f"count:{giveaway_id}")
@@ -489,7 +489,7 @@ class GiveawayService:
         # A brand-new running giveaway changes both the guild list and the
         # global list; without this an autocomplete would not offer it until
         # the 8s TTL lapsed.
-        self._mark_stale(f"guild:{guild_id}:active", "all:active")
+        self._mark_stale(f"guild:{guild_id}:active")
         # Read-after-write removed: every value in this row is one we just
         # supplied, so selecting it back was a full round trip (~170ms here) to
         # learn what we already know.
@@ -1808,7 +1808,7 @@ class GiveawayService:
         # left to the key's own TTL (4-10s), because each cached value is
         # derivable from Turso and never decides anything.
         self._mark_stale(
-            f"gw:{gw.id}", f"guild:{gw.guild_id}:active", "all:active", f"count:{gw.id}"
+            f"gw:{gw.id}", f"guild:{gw.guild_id}:active", f"count:{gw.id}"
         )
         return ended, winners
 
@@ -2632,7 +2632,7 @@ class GiveawayService:
         # giveaway that no longer exists. The guild-scoped list key is not
         # marked because this path has no guild id to build it from; it ages
         # out on its own short TTL.
-        self._mark_stale("all:active", f"count:{giveaway_id}")
+        self._mark_stale(f"count:{giveaway_id}")
 
     def cancel(self, giveaway_id: str) -> Giveaway:
         gw = self.get(giveaway_id)
@@ -2649,7 +2649,7 @@ class GiveawayService:
         if not _changed(cur):
             raise ServiceError("Only an active giveaway can be cancelled.")
         self._mark_stale(
-            f"gw:{gw.id}", f"guild:{gw.guild_id}:active", "all:active", f"count:{gw.id}"
+            f"gw:{gw.id}", f"guild:{gw.guild_id}:active", f"count:{gw.id}"
         )
         return self.get(gw.id)
 
@@ -2673,7 +2673,7 @@ class GiveawayService:
         )
         if not _changed(cur):
             raise ServiceError("Only a running giveaway can be extended.")
-        self._mark_stale(f"gw:{gw.id}", f"guild:{gw.guild_id}:active", "all:active")
+        self._mark_stale(f"gw:{gw.id}", f"guild:{gw.guild_id}:active")
         return self.get(gw.id)
 
     def set_entrants_role(self, giveaway_id: str, role_id: str | None) -> None:
