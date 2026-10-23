@@ -246,8 +246,16 @@ class CommandWiringTests(BotTestCase):
 
     def test_buffer_overflow_flushes_early(self) -> None:
         self.bot.MESSAGE_BUFFER_MAX = 2
-        asyncio.run(self.bot.on_message(fake_message(self.guild, "1" * 18)))
-        asyncio.run(self.bot.on_message(fake_message(self.guild, "2" * 18)))
+
+        async def scenario() -> None:
+            await self.bot.on_message(fake_message(self.guild, "1" * 18))
+            await self.bot.on_message(fake_message(self.guild, "2" * 18))
+            # The flush is deliberately off the message path, so the test has to
+            # wait for the task instead of relying on loop shutdown to run it.
+            assert self.bot._flush_task is not None
+            await self.bot._flush_task
+
+        asyncio.run(scenario())
         self.assertEqual(self.bot._message_buffer, {}, "flushed at the cap")
         self.assertEqual(self.svc.message_count(self.guild, "2" * 18), 1)
 
@@ -1243,6 +1251,22 @@ class GiveawayLifecycleTests(BotTestCase):
         self.assertIn("fresh", self.bot._refresh_stamp)
         self.assertNotIn("stale", self.bot._entered)
         self.assertIn("fresh", self.bot._entered)
+
+    def test_expired_bans_are_purged_on_the_ten_minute_sweep_only(self) -> None:
+        self.bot.service.due = lambda: []
+        self.bot.service.due_claims = lambda **kwargs: []
+        self.bot.service.wipe_stale_entries = lambda: 0
+        calls: list[int] = []
+        self.bot.service.purge_expired_bans = lambda: calls.append(1) or 0
+        self.bot._lists_loaded = True
+        self.bot._last_list_refresh = time.monotonic()
+        self.bot._tick_count = 19
+
+        asyncio.run(self.bot.tick.coro(self.bot))  # tick 20: the sweep runs
+        asyncio.run(self.bot.tick.coro(self.bot))  # tick 21: it does not
+
+        self.assertEqual(len(calls), 1,
+                         "the housekeeping write must not run on every tick")
 
     def test_tick_error_handler_logs_and_restarts_loop(self) -> None:
         with (patch.object(self.bot.tick, "restart") as restart,

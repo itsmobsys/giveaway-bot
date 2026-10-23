@@ -1755,6 +1755,16 @@ class GiveawayBot(commands.Bot):
             else:
                 if wiped:
                     log.info("wiped %d stale entry row(s)", wiped)
+            # Housekeeping only: every blacklist read already filters expired
+            # rows, so this never has to gate a command. Doing it here turns a
+            # write on every /giveaway_ban_list into one per 10 minutes.
+            try:
+                purged = await self._db_call(self.service.purge_expired_bans)
+            except Exception:
+                log.exception("ban purge failed")
+            else:
+                if purged:
+                    log.info("purged %d expired ban(s)", purged)
 
     @tick.error
     async def _tick_error(self, error: Exception) -> None:
@@ -2766,10 +2776,6 @@ def wire_commands(bot: GiveawayBot) -> None:
             return
         try:
             gid = str(interaction.guild.id)
-            try:
-                await bot._db_call(svc.purge_expired_bans)
-            except Exception:
-                log.exception("ban purge failed")
             rows = await bot._db_call(svc.blacklist_list_detailed, gid)
             total = await bot._db_call(svc.count_blacklisted, gid)
         except Exception:
