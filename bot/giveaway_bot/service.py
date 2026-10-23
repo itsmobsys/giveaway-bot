@@ -1892,7 +1892,7 @@ class GiveawayService:
                 # reroll is additive, and each deadline still expires/skips
                 # independently.
                 try:
-                    self.start_claims(self.get(gw.id), use)
+                    self.start_claims(gw, use)
                 except Exception:
                     log.warning("reroll claim insert failed for %s; repairing", gw.id)
                     try:
@@ -2608,7 +2608,7 @@ class GiveawayService:
             # replacement. Idempotent inserts plus the repair sweep heal it,
             # and the stored draw is still returned for the announce.
             try:
-                self.start_claims(self.get(gw.id), use, now=ts)
+                self.start_claims(gw, use, now=ts)
             except Exception:
                 log.warning("expire claim insert failed for %s; repairing", gw.id)
                 try:

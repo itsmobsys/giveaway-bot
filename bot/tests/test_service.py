@@ -1336,6 +1336,35 @@ class RerollCasTests(ServiceTestCase):
         self.assertIn(winner, redrawn.winners, "expired winner stays named")
         self.assertEqual(len(fresh), 1)
 
+    def test_reroll_reads_the_header_twice(self) -> None:
+        ended, _winner, _users = self._three_entrant_ended()
+        original = self.svc.get
+        calls: list[str] = []
+
+        def counted(giveaway_id: str):
+            calls.append(giveaway_id)
+            return original(giveaway_id)
+
+        self.svc.get = counted
+        self.svc.reroll(ended.id, 1)
+        self.assertEqual(len(calls), 2,
+                         "one resolve plus one fresh row for the announce")
+
+    def test_expire_reads_the_header_twice(self) -> None:
+        ended, winner, _users = self._three_entrant_ended(claim_timeout_seconds=3600)
+        deadline = int(self.svc.pending_claims(ended.id)[0]["deadline_ms"])
+        original = self.svc.get
+        calls: list[str] = []
+
+        def counted(giveaway_id: str):
+            calls.append(giveaway_id)
+            return original(giveaway_id)
+
+        self.svc.get = counted
+        self.svc.expire_claim(ended.id, winner, now=deadline + 1)
+        self.assertEqual(len(calls), 2,
+                         "claim config comes from the row already loaded")
+
     def test_read_winners_raw_round_trip(self) -> None:
         ended, winner, _users = self._three_entrant_ended()
         winners, raw = self.svc._read_winners_raw(ended.id)
