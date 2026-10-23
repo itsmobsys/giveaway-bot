@@ -2651,15 +2651,41 @@ class GiveawayService:
 
         Also zeroes the live counter on wiped giveaways: otherwise
         entry_count() would keep returning the stale pre-wipe bump.
+
+        The 10-minute sweep used to commit both statements even when the
+        previous pass had already done the work. One existence read is cheaper
+        than two no-op write round trips on Turso, so nothing to do means no
+        writes at all. If that read fails we fall through to the old cleanup:
+        an unreadable DB must not postpone the privacy wipe.
         """
         cutoff = (now if now is not None else now_ms()) - self.ENTRY_RETENTION_MS
+        try:
+            todo = self.db.query_one(
+                "SELECT 1 AS hit FROM simple_giveaways WHERE status != 'active'"
+                " AND COALESCE(ended_at, created_at) <= ?"
+                " AND NOT EXISTS (SELECT 1 FROM simple_claims"
+                " WHERE simple_claims.giveaway_id = simple_giveaways.id"
+                " AND simple_claims.status = 'pending')"
+                " AND (entrant_count IS NULL OR entrant_count != 0"
+                " OR EXISTS (SELECT 1 FROM simple_entries"
+                " WHERE simple_entries.giveaway_id = simple_giveaways.id))"
+                " LIMIT 1",
+                (cutoff,),
+            )
+        except Exception:
+            todo = {"hit": 1}
+        if todo is None:
+            return 0
         try:
             self.db.execute(
                 "UPDATE simple_giveaways SET entrant_count = 0 WHERE status != 'active'"
                 " AND COALESCE(ended_at, created_at) <= ?"
                 " AND NOT EXISTS (SELECT 1 FROM simple_claims"
                 " WHERE simple_claims.giveaway_id = simple_giveaways.id"
-                " AND simple_claims.status = 'pending')",
+                " AND simple_claims.status = 'pending')"
+                # A stored zero already says "no entries"; rewriting every
+                # old row every ten minutes was the no-op write to remove.
+                " AND (entrant_count IS NULL OR entrant_count != 0)",
                 (cutoff,),
             )
         except Exception:

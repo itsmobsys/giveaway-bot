@@ -1874,6 +1874,33 @@ class RoundTripBudgetTests(ServiceTestCase):
         self.assertEqual(stats["reads"], 1, "the ban still proves there is nothing to drop")
         self.assertEqual(stats["writes"], 1, "only the blacklist upsert")
 
+    def test_retention_sweep_with_nothing_to_do_is_one_read(self) -> None:
+        gw = self.make()
+        self.join(gw)
+        self.svc.end(gw.id)
+        # A previous sweep already removed the rows and zeroed the counter.
+        self.db.execute("DELETE FROM simple_entries WHERE giveaway_id = ?", (gw.id,))
+        self.db.execute(
+            "UPDATE simple_giveaways SET entrant_count = 0 WHERE id = ?", (gw.id,)
+        )
+        self.db.reset_stats()
+        self.assertEqual(self.svc.wipe_stale_entries(now=now_ms() + 10 * DAY_MS), 0)
+        stats = self.db.get_stats()
+        self.assertEqual(stats["reads"], 1, "one existence probe, no writes")
+        self.assertEqual(stats["writes"], 0)
+
+    def test_retention_sweep_that_has_work_still_writes(self) -> None:
+        gw = self.make()
+        self.join(gw, user_id="1" * 18)
+        self.svc.end(gw.id)
+        self.db.reset_stats()
+        self.assertEqual(self.svc.wipe_stale_entries(now=now_ms() + 10 * DAY_MS), 1)
+        stats = self.db.get_stats()
+        self.assertEqual(stats["reads"], 1, "the probe plus the two writes")
+        self.assertEqual(stats["writes"], 2, "counter zero + entry delete")
+        self.assertEqual(self.svc.entry_count(gw.id, exact=True), 0)
+        self.assertEqual(self.svc.get(gw.id).entrant_count, 0)
+
     def test_start_claims_is_one_write(self) -> None:
         gw = self.make(winner_count=10, claim_timeout_seconds=3600)
         winners = [str(500000 + i) for i in range(10)]
