@@ -2091,21 +2091,40 @@ class GiveawayService:
                 base = ts
             deadline = base + gw.claim_timeout_seconds * 1000
         winners = [str(w) for w in dict.fromkeys(str(w) for w in gw.winners)]
+        pending = [(gw.id, uid, deadline, ts) for uid in winners if uid not in have]
         written = 0
-        for uid in winners:
-            if uid in have:
-                continue
+        # One multi-row INSERT per chunk instead of one write per winner: the
+        # repair runs after a failed draw and on every sweep tick, so a large
+        # winner set used to cost a Turso round trip per row. A failed batch
+        # falls back to single rows so one bad value cannot strand the rest.
+        for start in range(0, len(pending), self.CLAIM_SWEEP_INSERT_CHUNK):
+            chunk = pending[start : start + self.CLAIM_SWEEP_INSERT_CHUNK]
+            values = ", ".join("(?, ?, 0, 'pending', ?, ?)" for _ in chunk)
+            params = [value for row in chunk for value in row]
             try:
-                self.db.execute(
-                    "INSERT OR IGNORE INTO simple_claims"
+                cur = self.db.execute(
+                    "INSERT OR IGNORE INTO simple_claims"  # noqa: S608
                     " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
-                    " VALUES (?, ?, 0, 'pending', ?, ?)",
-                    (gw.id, uid, deadline, ts),
+                    f" VALUES {values}",  # noqa: S608
+                    params,
                 )
+                written += max(int(cur.rowcount or 0), 0)
             except Exception:
-                log.warning("claim repair insert failed for %s/%s", gw.id, uid)
-                continue
-            written += 1
+                log.warning("claim repair insert batch failed for %s", gw.id)
+                for row in chunk:
+                    try:
+                        self.db.execute(
+                            "INSERT OR IGNORE INTO simple_claims"
+                            " (giveaway_id, user_id, round, status, deadline_ms, created_at)"
+                            " VALUES (?, ?, 0, 'pending', ?, ?)",
+                            row,
+                        )
+                    except Exception:
+                        log.warning(
+                            "claim repair insert failed for %s/%s", gw.id, row[1]
+                        )
+                        continue
+                    written += 1
         if winners:
             # Settle pending rows for users no longer named. Healthy draws have
             # none: every claim row belongs to a current winner, so this UPDATE

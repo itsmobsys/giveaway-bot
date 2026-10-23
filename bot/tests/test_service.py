@@ -1418,6 +1418,53 @@ class ClaimAtomicityTests(ServiceTestCase):
         again = self.svc.repair_missing_claims(ended.id)
         self.assertEqual(again, 0, "second sweep must be a no-op")
 
+    def test_repair_inserts_missing_winners_in_one_batch(self) -> None:
+        gw = self.make(winner_count=3, claim_timeout_seconds=3600)
+        for j in range(3):
+            self.join(gw, user_id=str(10 ** 17 + j))
+        ended, winners = self.svc.end(gw.id)
+        missing = winners[1]
+        self.db.execute(
+            "DELETE FROM simple_claims WHERE giveaway_id = ? AND user_id = ?",
+            (ended.id, missing),
+        )
+        self.db.reset_stats()
+        written = self.svc.repair_missing_claims(ended.id)
+        stats = self.db.get_stats()
+        self.assertEqual(written, 1)
+        self.assertEqual(
+            int(stats["writes"]), 1,
+            "three winners, one missing row: heal with one INSERT, not one per winner",
+        )
+        self.assertIn(
+            missing,
+            [str(r["user_id"]) for r in self.svc.pending_claims(ended.id)],
+        )
+
+    def test_repair_falls_back_to_single_rows_if_batch_fails(self) -> None:
+        gw = self.make(winner_count=6, claim_timeout_seconds=3600)
+        for j in range(6):
+            self.join(gw, user_id=str(10 ** 17 + j))
+        ended, _winners = self.svc.end(gw.id)
+        self.db.execute("DELETE FROM simple_claims WHERE giveaway_id = ?", (ended.id,))
+        original = self.db.execute
+        failed = []
+
+        def flaky(sql, params=()):
+            if "VALUES (?, ?, 0, 'pending', ?, ?), (" in sql and not failed:
+                failed.append(1)
+                raise OSError("batch down")
+            return original(sql, params)
+
+        self.db.execute = flaky
+        try:
+            written = self.svc.repair_missing_claims(ended.id)
+        finally:
+            self.db.execute = original
+        self.assertEqual(failed, [1], "the batch must be attempted first")
+        self.assertEqual(written, 6, "one failed batch must not strand the winners")
+        self.assertEqual(len(self.svc.pending_claims(ended.id)), 6)
+
     def test_healthy_claim_sweep_is_three_reads_and_no_writes(self) -> None:
         ended_ids: list[tuple[str, list[str]]] = []
         for i in range(25):
