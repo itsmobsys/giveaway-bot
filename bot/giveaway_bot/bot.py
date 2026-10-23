@@ -113,7 +113,15 @@ class GiveawayBot(commands.Bot):
         self._role_tasks: set[asyncio.Task] = set()
         #: (guild_id, user_id) -> messages seen since the last flush. Counting in
         #: memory turns one Turso write per message into one per flush interval.
-        self._message_buffer: dict[tuple[str, str], int] = {}
+        #: Raw int snowflakes: str()ing both ids on every chat line is pure
+        #: allocator churn on a busy server, and the flush stringifies once per
+        #: row anyway (the service and SQLite are happy with either).
+        self._message_buffer: dict[tuple[int, int], int] = {}
+        #: The single in-flight threshold flush (see on_message). Kept so a
+        #: 5000-row burst spawns one task, not one per message, and so close()
+        #: can let it finish instead of cancelling a batch that was already
+        #: swapped out of the buffer.
+        self._flush_task: asyncio.Task | None = None
         #: Tick counter; the entry-wipe sweep runs every ~20 ticks so a
         #: usually-empty DELETE doesn't cost a Turso write on every pass.
         self._tick_count = 0
@@ -161,6 +169,12 @@ class GiveawayBot(commands.Bot):
         #: normal path where the atomic INSERT guard still decides.
         self._entered: dict[str, dict[str, float]] = {}
         self._last_list_refresh: float = 0.0
+        #: True once the autocomplete snapshot has been filled at least once.
+        #: An empty cache is not a cold cache: a bot in zero giveaways re-ran
+        #: the whole sweep (two list reads + the embed window) on every single
+        #: tick, forever, because the thing it checked for emptiness was
+        #: legitimately empty. Time alone now decides after that first pass.
+        self._lists_loaded = False
         #: One-shot guild-command cleanup flag (see on_ready). Discord fires
         #: on_ready on every reconnect, not just startup, so the sweep below
         #: must run once per process, never per reconnect.
@@ -319,6 +333,24 @@ class GiveawayBot(commands.Bot):
                     stale = True
                 if stale:
                     self._refresh_stamp.pop(giveaway_id, None)
+        except Exception:
+            pass
+        # Entry markers expire on read, but a giveaway nobody clicks again
+        # would keep its members' timestamps resident forever. Same TTL as the
+        # latch itself: an older marker can never answer a click, so dropping
+        # it is not observable. Empty giveaway buckets go too.
+        try:
+            ttl = self.ENTERED_TTL
+            for giveaway_id, members in list(self._entered.items()):
+                for user_id, ts in list(members.items()):
+                    try:
+                        stale = now - float(ts) > ttl
+                    except Exception:
+                        stale = True
+                    if stale:
+                        members.pop(user_id, None)
+                if not members:
+                    self._entered.pop(giveaway_id, None)
         except Exception:
             pass
 
@@ -494,19 +526,21 @@ class GiveawayBot(commands.Bot):
                     delay=60.0,
                 )
 
-    def _spawn_bg(self, coro) -> None:
+    def _spawn_bg(self, coro) -> asyncio.Task | None:
         """Fire-and-forget post-ack work that must never block the next click.
 
         Role grants + embed PATCHes run here so the ack returns while Discord
         API calls finish in the background. Each step is isolated upstream;
         failures only log. Tracked in _bg_tasks (cancelled in close()) so a
-        shutdown never strands a bare task the loop then warns about."""
+        shutdown never strands a bare task the loop then warns about. Returns
+        the task so callers that need single-flight can hold it."""
         try:
             task = asyncio.get_running_loop().create_task(coro)
         except RuntimeError:
-            return
+            return None
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     async def close(self) -> None:
         for loop in (self.tick, self.heartbeat, self.flush_messages):
@@ -514,6 +548,15 @@ class GiveawayBot(commands.Bot):
                 loop.cancel()
             except Exception:
                 pass
+        try:
+            # A threshold flush may already have swapped its batch OUT of the
+            # buffer. Cancelling it below would drop exactly those counts, so
+            # let it land before the task sweep.
+            task = self._flush_task
+            if task is not None and not task.done():
+                await task
+        except Exception:
+            log.exception("background message-count flush failed")
         try:
             # Last chance to persist counts: the gateway is about to go away and
             # whatever is still buffered would be lost with it.
@@ -573,9 +616,20 @@ class GiveawayBot(commands.Bot):
             cache.setdefault(gw.guild_id, []).append((gw.id, gw.prize))
         self._ended_autocomplete_cache = cache
 
+    @staticmethod
+    def _message_key(guild_id: object, user_id: object) -> tuple[object, object]:
+        """Buffer key for a (guild, user) pair.
+
+        The buffer stores raw ints; callers hand over ints from gateway objects
+        and str ids from database rows, so normalise both to the same thing."""
+        try:
+            return (int(str(guild_id)), int(str(user_id)))
+        except (TypeError, ValueError):
+            return (guild_id, user_id)
+
     def _pending_messages(self, guild_id: str, user_id: str) -> int:
         """Counts seen but not yet flushed to the database."""
-        return self._message_buffer.get((guild_id, user_id), 0)
+        return self._message_buffer.get(self._message_key(guild_id, user_id), 0)
 
     # -- helpers --------------------------------------------------------
     def _target_channel(self, interaction: discord.Interaction) -> discord.TextChannel | None:
@@ -736,23 +790,45 @@ class GiveawayBot(commands.Bot):
     async def on_message(self, message: discord.Message) -> None:
         """Count a message towards its author's min-messages requirement.
 
-        The count lives in memory until flush_messages() writes it. The old
-        version queued one database write per message, so every line typed in
-        the server cost a Turso round-trip (and a write) of its own.
+        The count lives in memory until flush_messages() writes it. Counting is
+        now an int-keyed dict increment and nothing else: the old version
+        awaited a full Turso write the moment the buffer filled, so message
+        #5000 in a burst parked the gateway handler behind a network round-trip
+        (and every message behind it). The threshold only *starts* a flush;
+        the swap-and-write still happens in one batch, in a task.
+
+        No guild is ever skipped: min_messages is checked against the lifetime
+        simple_message_counts table, so a "quiet guild" shortcut here would
+        undercount exactly the members it was meant to save work for.
         """
         if message.guild is None or message.author.bot:
             return
-        key = (str(message.guild.id), str(message.author.id))
+        key = self._message_key(message.guild.id, message.author.id)
         self._message_buffer[key] = self._message_buffer.get(key, 0) + 1
         if len(self._message_buffer) >= self.MESSAGE_BUFFER_MAX:
-            await self._flush_message_buffer()
+            self._spawn_flush()
 
-    @tasks.loop(seconds=MESSAGE_FLUSH_SECONDS)
-    async def flush_messages(self) -> None:
+    def _spawn_flush(self) -> None:
+        """Persist the buffer off the message path, one flush at a time.
+
+        _flush_message_buffer swaps the dict out before it awaits, so a second
+        flush never loses a row — it just finds the fresh dict. The guard only
+        stops a refilling buffer from queueing one task per message.
+        """
+        task = self._flush_task
+        if task is not None and not task.done():
+            return
+        self._flush_task = self._spawn_bg(self._flush_quietly())
+
+    async def _flush_quietly(self) -> None:
         try:
             await self._flush_message_buffer()
         except Exception:
             log.exception("message-count flush failed")
+
+    @tasks.loop(seconds=MESSAGE_FLUSH_SECONDS)
+    async def flush_messages(self) -> None:
+        await self._flush_quietly()
 
     @flush_messages.before_loop
     async def _before_flush_messages(self) -> None:
@@ -765,7 +841,7 @@ class GiveawayBot(commands.Bot):
         # Swap first: anything counted while the write is in flight lands in the
         # fresh dict instead of being overwritten by the batch we are sending.
         batch, self._message_buffer = self._message_buffer, {}
-        rows = [(guild_id, user_id, n) for (guild_id, user_id), n in batch.items()]
+        rows = [(str(guild_id), str(user_id), n) for (guild_id, user_id), n in batch.items()]
         # The service reports progress in here. _db_call runs it on a worker
         # under an 8s wait_for, and a timeout cancels the await, not the
         # thread: without the receipt a timed-out flush used to requeue the
@@ -840,7 +916,7 @@ class GiveawayBot(commands.Bot):
     def _requeue(self, rows: list[tuple[str, str, int]]) -> None:
         """Put counts that did not reach the database back in the buffer."""
         for guild_id, user_id, count in rows:
-            key = (guild_id, user_id)
+            key = self._message_key(guild_id, user_id)
             self._message_buffer[key] = self._message_buffer.get(key, 0) + count
 
     # -- entrants role (ping everyone in the giveaway) --------------------
@@ -991,6 +1067,45 @@ class GiveawayBot(commands.Bot):
             "stripped entrants role for %s; deleting it in %.0fs",
             gw.id, self.ROLE_DELETE_DELAY,
         )
+
+    async def _revoke_entrants_roles(self, giveaways: list[Giveaway], user_id: str) -> None:
+        """Take one member's entrants role in every giveaway, a few at a time.
+
+        This used to be one awaited Discord call per giveaway in a serial loop,
+        so a ban in a server with 40 live giveaways made the moderator wait for
+        40 guild round-trips. Still paced by ROLE_STRIP_CONCURRENCY so the
+        per-route rate limit and the call order stay the same; the entry-marker
+        cleanup stays synchronous, before any of the network work.
+        """
+        if not giveaways:
+            return
+        gate = asyncio.Semaphore(self.ROLE_STRIP_CONCURRENCY)
+
+        async def one(gw: Giveaway) -> None:
+            self._clear_entered(gw.id, user_id)
+            async with gate:
+                try:
+                    await self._take_entrants_role(gw, user_id)
+                except Exception:
+                    log.exception("entrants role take failed for %s/%s", gw.id, user_id)
+
+        await asyncio.gather(*(one(gw) for gw in giveaways))
+
+    def _strip_role_bg(self, gw: Giveaway) -> None:
+        """Strip one giveaway's entrants role without blocking the caller.
+
+        Called after the announcement: the member loop is one guild round-trip
+        per entrant (minutes on a large giveaway), so /end must reply to the
+        moderator and the tick must move on while it drains.
+        """
+
+        async def strip_later(giveaway: Giveaway = gw) -> None:
+            try:
+                await self._strip_entrants_role(giveaway)
+            except Exception:
+                log.exception("role strip failed for %s", giveaway.id)
+
+        self._spawn_bg(strip_later())
 
     def _schedule_role_delete(
         self, guild_id: str, role_id: str, giveaway_id: str, delay: float
@@ -1512,16 +1627,11 @@ class GiveawayBot(commands.Bot):
                 await self._announce(ended, winners)
             except Exception:
                 log.exception("announcement failed for %s", gw.id)
-            async def _strip_later(giveaway: Giveaway = ended) -> None:
-                try:
-                    await self._strip_entrants_role(giveaway)
-                except Exception:
-                    log.exception("role strip failed for %s", giveaway.id)
 
             # Announce first (members need the winners while the role still
             # exists), then strip off-loop: one guild round-trip per member
             # must not hold up the next due giveaway or the claim sweep.
-            self._spawn_bg(_strip_later())
+            self._strip_role_bg(ended)
         # Claim expiry: sweep due pending claims, expire + auto-reroll.
         # Restart recovery lives here too: deadlines are durable rows, so a
         # restart just picks up whatever is due on the next tick.
@@ -1565,7 +1675,7 @@ class GiveawayBot(commands.Bot):
         # stays usable between refreshes; embeds just tick slower.
         now_mono = time.monotonic()
         last_list = getattr(self, "_last_list_refresh", 0.0)
-        due = now_mono - last_list >= self.LIST_REFRESH_SECONDS or not self._autocomplete_cache
+        due = now_mono - last_list >= self.LIST_REFRESH_SECONDS or not self._lists_loaded
         # One poll body per window across processes. The free plan restarts
         # (deploys, OOM, idle spin-down) and an old instance overlaps a new
         # one for a few seconds; both would otherwise run the identical two
@@ -1601,6 +1711,9 @@ class GiveawayBot(commands.Bot):
                     ended_list = []
                 self._cache_ended_autocomplete(ended_list)
                 self._last_list_refresh = now_mono
+                # The snapshot exists now (possibly empty because the bot is
+                # in no giveaways); from here the time gate alone decides.
+                self._lists_loaded = True
                 window = self._refresh_window(live)
                 window_ids = [gw.id for gw in window]
                 if window_ids:
@@ -2003,8 +2116,11 @@ def wire_commands(bot: GiveawayBot) -> None:
             return
         bot._gw_drop(gw.id)
         await bot._announce(ended, winners)
-        await bot._strip_entrants_role(ended)
         await bot._safe_followup(interaction, f"Ended with {len(winners)} winner(s).")
+        # Reply first: stripping is one guild call per entrant and used to run
+        # between the announcement and this confirmation, so a 10k-entrant
+        # giveaway left the moderator waiting on the whole member loop.
+        bot._strip_role_bg(ended)
 
     @bot.tree.command(name="giveaway_reroll", description="Draw new winner(s)")
     @app_commands.autocomplete(giveaway_id=_gw_ended_autocomplete)
@@ -2163,12 +2279,24 @@ def wire_commands(bot: GiveawayBot) -> None:
             f"⏳ **{fresh.prize}** extended — now ends <t:{int(fresh.ends_at/1000)}:R>.",
         )
         # Tell the people waiting: ping every entrant in the giveaway channel.
+        # Role first, ids second: with a role the mention reaches everyone, so
+        # loading the entrant ids (a 10k-row read on a big giveaway) is pure
+        # payload. The total still comes from the stored counter.
+        role = bot._role_for(fresh)
+        entrants: list = []
+        total = 0
         try:
-            entrants = await bot._db_call(svc.entries, fresh.id)
+            if role is None:
+                entrants = await bot._db_call(svc.entries, fresh.id)
+                total = len(entrants)
+            else:
+                total = fresh.entrant_count
+                if total is None:
+                    total = await bot._db_call(svc.entry_count, fresh.id)
         except Exception:
             log.exception("entrant lookup failed for extend notice (%s)", fresh.id)
-            entrants = []
-        if not entrants:
+            entrants, total = [], 0
+        if not total:
             return
         try:
             channel = bot.get_channel(int(fresh.channel_id))
@@ -2181,7 +2309,6 @@ def wire_commands(bot: GiveawayBot) -> None:
             f" <t:{int(fresh.ends_at/1000)}:R>!"
         )
         try:
-            role = bot._role_for(fresh)
             if role is not None:
                 await channel.send(
                     f"{notice}\n{role.mention}",
@@ -2229,9 +2356,14 @@ def wire_commands(bot: GiveawayBot) -> None:
             except ServiceError as exc:
                 await bot._safe_followup(interaction, f"⚠️ {exc.message}")
                 return
-            # Count and page separately: the total is what the header needs, and
-            # only 50 of them are ever printed.
-            total = await bot._db_call(svc.entry_count, gw.id)
+            # Count and page separately: the header needs the total and only 50
+            # rows are ever printed. entrant_count is maintained by the join /
+            # leave / end writes, so the header is free; descending into
+            # entry_count() (a COUNT(*) over every entry) is the legacy
+            # fallback for rows the counter has never been written for.
+            total = gw.entrant_count
+            if total is None:
+                total = await bot._db_call(svc.entry_count, gw.id)
             entrants = await bot._db_call(svc.entries, gw.id, 50)
             host = f" by <@{gw.host_id}>" if gw.host_id else ""
             chance = min(100.0, gw.winner_count / total * 100) if total else 0.0
@@ -2261,7 +2393,11 @@ def wire_commands(bot: GiveawayBot) -> None:
             return
         lines = []
         for gw in active[:10]:
-            n = await bot._db_call(svc.entry_count, gw.id)
+            # Same stored counter as the header above: ten COUNT(*) scans to
+            # render ten lines, when the join/leave writes already keep it.
+            n = gw.entrant_count
+            if n is None:
+                n = await bot._db_call(svc.entry_count, gw.id)
             each = f" — **{min(100.0, gw.winner_count / n * 100):.1f}%** each" if n else ""
             # Ten lines carrying full 256-character prizes pass Discord's 2000
             # character cap, and the resulting 400 would be swallowed by
@@ -2357,11 +2493,31 @@ def wire_commands(bot: GiveawayBot) -> None:
             gw = await bot._db_call(
                 svc.resolve, str(interaction.guild.id), giveaway_id
             )
-            entrants = await bot._db_call(svc.entries, gw.id)
         except ServiceError as exc:
             await bot._safe_followup(interaction, f"⚠️ {exc.message}")
             return
-        if not entrants:
+        # Role first: one role mention reaches everyone, so the entrant ids are
+        # only needed on the roleless fallback. Reading them first meant a 10k
+        # row fetch (and a 10k-list allocation) to discard it.
+        role = bot._role_for(gw)
+        entrants: list = []
+        total = 0
+        if role is None:
+            try:
+                entrants = await bot._db_call(svc.entries, gw.id)
+            except ServiceError as exc:
+                await bot._safe_followup(interaction, f"⚠️ {exc.message}")
+                return
+            total = len(entrants)
+        else:
+            try:
+                total = gw.entrant_count
+                if total is None:
+                    total = await bot._db_call(svc.entry_count, gw.id)
+            except ServiceError as exc:
+                await bot._safe_followup(interaction, f"⚠️ {exc.message}")
+                return
+        if not total:
             await bot._safe_followup(interaction, "Nobody has joined this giveaway yet.")
             return
         # Discord accepts up to 6000 characters on an option but only allows
@@ -2371,12 +2527,12 @@ def wire_commands(bot: GiveawayBot) -> None:
         if len(text) > 1400:
             text = text[:1397] + "…"
         body = f"📢 **{gw.prize}**" + (f" — {text}" if text else "")
-        role = bot._role_for(gw)
         channel = interaction.channel
         if not isinstance(channel, discord.TextChannel):
             await bot._safe_followup(interaction, "Run this in a text channel.")
             return
         pairs: list[tuple[str, int]] = []
+        sent = 0
         try:
             if role is not None:
                 await channel.send(
@@ -2402,13 +2558,13 @@ def wire_commands(bot: GiveawayBot) -> None:
         if role is None and len(pairs) > MAX_MENTION_MESSAGES:
             await bot._safe_followup(
                 interaction,
-                f"📢 Pinged {sent} of {len(entrants)} entrant(s) — capped at"
+                f"📢 Pinged {sent} of {total} entrant(s) — capped at"
                 f" {MAX_MENTION_MESSAGES} messages without an entrants role."
                 " Re-run once the role exists to reach the rest.",
             )
         else:
             await bot._safe_followup(
-                interaction, f"📢 Pinged {len(entrants)} entrant(s)."
+                interaction, f"📢 Pinged {total} entrant(s)."
             )
 
     @bot.tree.command(name="giveaway_blacklist_add", description="Block a user from all giveaways")
@@ -2432,9 +2588,7 @@ def wire_commands(bot: GiveawayBot) -> None:
             log.exception("blacklist add failed for %s", uid)
             await bot._safe_followup(interaction, "⚠️ Could not update the blacklist. Try again.")
             return
-        for gw in active:
-            bot._clear_entered(gw.id, uid)
-            await bot._take_entrants_role(gw, uid)
+        await bot._revoke_entrants_roles(active, uid)
         log.info("blacklisted %s in guild %s", uid, gid)
         await bot._safe_followup(
             interaction,
@@ -2546,14 +2700,9 @@ def wire_commands(bot: GiveawayBot) -> None:
             log.exception("ban failed for %s", uid)
             await bot._safe_followup(interaction, "⚠️ Could not update the ban. Try again.")
             return
-        for gw in active:
-            # Their entries are gone, so this process's entry markers must go
-            # too, or the next honest click is refused as "already entered".
-            bot._clear_entered(gw.id, uid)
-            try:
-                await bot._take_entrants_role(gw, uid)
-            except Exception:
-                log.exception("ban role take failed for %s/%s", gw.id, uid)
+        # Their entries are gone, so this process's entry markers must go too,
+        # or the next honest click is refused as "already entered".
+        await bot._revoke_entrants_roles(active, uid)
         log.info("banned %s in guild %s for %sh reason=%r", uid, gid, hours_int, (reason or "")[:64])
         clean_reason = (reason or "").strip()
         reason_bit = f" Reason: {clean_reason[:256]}" if clean_reason else ""

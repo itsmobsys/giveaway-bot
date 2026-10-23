@@ -166,6 +166,23 @@ class CommandWiringTests(BotTestCase):
         asyncio.run(self.bot._flush_message_buffer())
         self.assertEqual(self.svc.message_count(self.guild, "3" * 18), 3, "no double counting")
 
+    def test_message_flush_is_single_flight(self) -> None:
+        async def scenario() -> None:
+            blocker = asyncio.Event()
+
+            async def slow() -> None:
+                await blocker.wait()
+
+            first = self.bot._spawn_bg(slow())
+            self.bot._flush_task = first
+            self.bot._spawn_flush()
+            self.assertIs(self.bot._flush_task, first,
+                          "a refilling buffer must not queue a task per message")
+            blocker.set()
+            await first
+
+        asyncio.run(scenario())
+
     def test_a_failed_flush_keeps_the_counts(self) -> None:
         asyncio.run(self.bot.on_message(fake_message(self.guild, "3" * 18)))
         original = self.bot.service.add_message_counts
@@ -196,7 +213,7 @@ class CommandWiringTests(BotTestCase):
         self.bot.service.add_message_counts = original
         self.assertEqual(
             self.bot._message_buffer,
-            {(self.guild, "4" * 18): 1},
+            {(int(self.guild), int("4" * 18)): 1},
             "only the tail goes back: the committed head must not be counted twice",
         )
         asyncio.run(self.bot._flush_message_buffer())
@@ -1157,6 +1174,21 @@ class GiveawayLifecycleTests(BotTestCase):
         # The batched sweep is cheap enough to heal on every pass.
         self.assertEqual(flags, [True] * 10)
 
+    def test_an_empty_list_snapshot_is_not_refetched_every_tick(self) -> None:
+        self.bot.service.due = lambda: []
+        self.bot.service.due_claims = lambda **kwargs: []
+        calls: list[str] = []
+        self.bot.service.list_all_active = lambda limit: calls.append("active") or []
+        self.bot.service.list_all_ended = lambda limit: calls.append("ended") or []
+        self.bot._lists_loaded = False
+        self.bot._last_list_refresh = 0.0
+
+        for _ in range(3):
+            asyncio.run(self.bot.tick.coro(self.bot))
+
+        self.assertEqual(calls, ["active", "ended"],
+                         "an empty snapshot must still mark the lists loaded")
+
     def test_tick_reads_live_statuses_in_one_batch(self) -> None:
         gw = self.make(prize="batched")
         self.bot.service.due = lambda: []
@@ -1195,6 +1227,8 @@ class GiveawayLifecycleTests(BotTestCase):
         self.bot._gw_cache["fresh"] = (object(), now)
         self.bot._refresh_stamp["stale"] = stale
         self.bot._refresh_stamp["fresh"] = now
+        self.bot._entered["stale"] = {"u": now - (self.bot.ENTERED_TTL * 2)}
+        self.bot._entered["fresh"] = {"u": now}
         self.bot.service.due = lambda: []
         self.bot.service.due_claims = lambda **kwargs: []
         # Keep the cosmetic sweep out of this test's snapshot bookkeeping.
@@ -1207,6 +1241,8 @@ class GiveawayLifecycleTests(BotTestCase):
         self.assertIn("fresh", self.bot._gw_cache)
         self.assertNotIn("stale", self.bot._refresh_stamp)
         self.assertIn("fresh", self.bot._refresh_stamp)
+        self.assertNotIn("stale", self.bot._entered)
+        self.assertIn("fresh", self.bot._entered)
 
     def test_tick_error_handler_logs_and_restarts_loop(self) -> None:
         with (patch.object(self.bot.tick, "restart") as restart,
