@@ -9,51 +9,26 @@
 //! None of these loops owns a gateway event, and serenity 0.12.5 only builds a
 //! `Context` inside its dispatch (`Context::new` is crate-private and
 //! `Context::easy` is compiled out with the `cache` + `gateway` features), so
-//! the loop-side sends carry the same `Arc<Cache>` / `Arc<Http>` pair the client
-//! publishes and build their payloads with the very same shared builders.
+//! the loop-side sends go through [`Gateway`], the same `Arc<Cache>` /
+//! `Arc<Http>` pair the client publishes. `mod.rs` owns the bodies; this module
+//! only decides when they run.
 
-use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
-use gwbot_core::components;
-use gwbot_core::embeds;
 use gwbot_core::models::{Giveaway, ServiceError};
 use serde_json::Value;
-use serenity::all::{
-    Cache, ChannelId, Context, CreateActionRow, CreateAllowedMentions, CreateMessage, EditMessage,
-    GuildId, Http, Member, MessageId, RoleId, UserId,
-};
+use serenity::all::{GuildId, RoleId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use super::{
-    cached_kind, guild_id_of, is_not_found, is_text_kind, json_id, snowflake, Bot,
-    LIST_REFRESH_SECS, MESSAGE_FLUSH_SECONDS, REFRESH_CONCURRENCY, ROLE_DELETE_DELAY_SECS,
-    ROLE_STRIP_CONCURRENCY, STRIP_BATCH, SWEEP_LEASE_SECS,
+    snowflake, Bot, Gateway, LIST_REFRESH_SECS, MESSAGE_FLUSH_SECONDS, REFRESH_CONCURRENCY,
+    SWEEP_LEASE_SECS,
 };
-use crate::convert;
-
-/// The two gateway handles a loop-side Discord call needs.
-///
-/// `mod.rs::announce` / `refresh_embeds` take a `Context`; the loops have none,
-/// so they pass this pair (which is `CacheHttp` on its own) instead.
-#[derive(Clone)]
-struct Gateway {
-    cache: Arc<Cache>,
-    http: Arc<Http>,
-}
-
-impl Gateway {
-    /// `(&Arc<Cache>, &Http)` is the `CacheHttp` impl serenity documents for
-    /// callers that have no `Context`.
-    fn cache_http(&self) -> (&Arc<Cache>, &Http) {
-        (&self.cache, self.http.as_ref())
-    }
-}
 
 impl Bot {
     // -- the draw timer --------------------------------------------------
@@ -109,8 +84,7 @@ impl Bot {
             if let Some(handles) = &handles {
                 // Announce before the role strip: the winner mention has to
                 // still resolve for everyone who entered.
-                self.announce_gateway(&ended, &winners, false, handles)
-                    .await;
+                self.announce_with(handles, &ended, &winners, false).await;
                 self.strip_entrants_role_with(handles, &ended).await;
             }
         }
@@ -152,7 +126,7 @@ impl Bot {
             self.spawn_invalidation_flush();
             if !fresh.is_empty() {
                 if let Some(handles) = &handles {
-                    self.announce_gateway(&ended, &fresh, true, handles).await;
+                    self.announce_with(handles, &ended, &fresh, true).await;
                 }
             }
         }
@@ -203,7 +177,7 @@ impl Bot {
                     }
                     if let Some(handles) = &handles {
                         let window = self.refresh_window(live);
-                        self.refresh_embeds_gateway(&window, handles).await;
+                        self.refresh_embeds(&window, handles).await;
                     }
                 }
                 Err(err) => error!("live list failed: {err}"),
@@ -421,91 +395,9 @@ impl Bot {
         }
     }
 
-    /// Take the role from every entrant now, delete it in five minutes.
-    ///
-    /// `Context`-shaped for callers that own one; the tick reaches the same
-    /// body through [`Self::strip_entrants_role_with`], because a loop has no
-    /// event context to borrow.
-    #[allow(dead_code)]
-    pub(crate) async fn strip_entrants_role(&self, ctx: &Context, gw: &Giveaway) {
-        let handles = Gateway {
-            cache: ctx.cache.clone(),
-            http: ctx.http.clone(),
-        };
-        self.strip_entrants_role_with(&handles, gw).await;
-    }
+    // -- gateway handles --------------------------------------------------
 
-    async fn strip_entrants_role_with(&self, handles: &Gateway, gw: &Giveaway) {
-        let Some(role_id) = self.entrants_role(&handles.cache, gw) else {
-            return;
-        };
-        let entrants = match self.db_call(self.service().entries(&gw.id, None)).await {
-            Ok(rows) => rows,
-            Err(err) => {
-                error!("could not list entrants for role strip ({}): {err}", gw.id);
-                Vec::new()
-            }
-        };
-        let ids: Vec<String> = entrants.iter().filter_map(json_id).collect();
-        if !ids.is_empty() {
-            // Concurrently, but a few at a time. One member at a time made a
-            // 1000-entrant giveaway take minutes to clean up; all of them at
-            // once would trip the per-route rate limit.
-            let gate = Arc::new(Semaphore::new(ROLE_STRIP_CONCURRENCY));
-            for window in ids.chunks(STRIP_BATCH) {
-                let mut set = tokio::task::JoinSet::new();
-                for user_id in window {
-                    let bot = self.clone();
-                    let handles = handles.clone();
-                    let gw = gw.clone();
-                    let gate = gate.clone();
-                    let user_id = user_id.clone();
-                    set.spawn(async move {
-                        let Ok(_permit) = gate.acquire().await else {
-                            return;
-                        };
-                        bot.take_entrants_role_with(&handles, &gw, &user_id).await;
-                    });
-                }
-                while set.join_next().await.is_some() {}
-            }
-        }
-        self.schedule_role_delete(
-            &gw.guild_id,
-            &role_id.to_string(),
-            &gw.id,
-            ROLE_DELETE_DELAY_SECS,
-        );
-        info!(
-            "stripped entrants role for {}; deleting it in {:.0}s",
-            gw.id, ROLE_DELETE_DELAY_SECS
-        );
-    }
-
-    async fn take_entrants_role_with(&self, handles: &Gateway, gw: &Giveaway, user_id: &str) {
-        let Some(guild_id) = snowflake(&gw.guild_id).map(GuildId::new) else {
-            return;
-        };
-        let Some(role_id) = self.entrants_role(&handles.cache, gw) else {
-            return;
-        };
-        let Some(member) = self.member_in(handles, guild_id, user_id).await else {
-            return;
-        };
-        let _ = handles
-            .http
-            .remove_member_role(
-                guild_id,
-                member.user.id,
-                role_id,
-                Some(&format!("Left giveaway {}", gw.id)),
-            )
-            .await;
-    }
-
-    // -- gateway-free copies of the shared helpers ------------------------
-    // Same bodies as `mod.rs`, minus the `Context` the loops cannot build.
-
+    /// The cache/http pair, when the client has published both.
     fn gateway(&self) -> Option<Gateway> {
         Some(Gateway {
             cache: self.cache()?,
@@ -513,197 +405,8 @@ impl Bot {
         })
     }
 
-    /// The entrants role of a giveaway, as an id (a cache ref is not `Send`).
-    fn entrants_role(&self, cache: &Cache, gw: &Giveaway) -> Option<RoleId> {
-        let guild_id = GuildId::new(snowflake(&gw.guild_id)?);
-        let role_id = RoleId::new(snowflake(gw.entrants_role_id.as_deref()?)?);
-        let exists = cache
-            .guild(guild_id)
-            .map(|guild| guild.roles.contains_key(&role_id))
-            .unwrap_or(false);
-        exists.then_some(role_id)
-    }
-
-    async fn member_in(
-        &self,
-        handles: &Gateway,
-        guild_id: GuildId,
-        user_id: &str,
-    ) -> Option<Member> {
-        let uid = UserId::new(snowflake(user_id)?);
-        if let Some(member) = handles
-            .cache
-            .guild(guild_id)
-            .and_then(|guild| guild.members.get(&uid).cloned())
-        {
-            return Some(member);
-        }
-        handles.http.get_member(guild_id, uid).await.ok()
-    }
-
-    /// `<@&...>` for this server's notify role, or empty when unset/gone.
-    async fn notify_mention_for(&self, cache: &Cache, guild_id: &str) -> String {
-        let Some(role_id) = self.service().get_notify_role_cached(guild_id).await else {
-            return String::new();
-        };
-        let (Some(guild), Some(role)) = (snowflake(guild_id), snowflake(&role_id)) else {
-            return String::new();
-        };
-        let role_id = RoleId::new(role);
-        let exists = cache
-            .guild(GuildId::new(guild))
-            .map(|cached| cached.roles.contains_key(&role_id))
-            .unwrap_or(false);
-        if exists {
-            format!("<@&{role_id}>")
-        } else {
-            String::new()
-        }
-    }
-
-    /// Winner celebration, `mod.rs::announce` with the cache/http pair.
-    async fn announce_gateway(
-        &self,
-        gw: &Giveaway,
-        winners: &[String],
-        reroll: bool,
-        handles: &Gateway,
-    ) {
-        let cache = handles.cache.as_ref();
-        let cache_http = handles.cache_http();
-        let Some(channel_id) = snowflake(&gw.channel_id).map(ChannelId::new) else {
-            return;
-        };
-        let is_text = cached_kind(cache, guild_id_of(gw), channel_id)
-            .map(is_text_kind)
-            .unwrap_or(false);
-        if !is_text {
-            return;
-        }
-        let entries = match gw.entrant_count {
-            Some(count) => count,
-            None => self
-                .db_call(self.service().entry_count(&gw.id, false))
-                .await
-                .unwrap_or(0),
-        };
-
-        let mut claim_deadlines: HashMap<String, i64> = HashMap::new();
-        if gw.claim_enabled() && !winners.is_empty() {
-            match self.db_call(self.service().pending_claims(&gw.id)).await {
-                Ok(pending) => {
-                    for row in pending {
-                        let Some(uid) = json_id(&row) else { continue };
-                        if !winners.iter().any(|w| w == &uid) {
-                            continue;
-                        }
-                        if let Some(deadline) = row
-                            .get("deadline_ms")
-                            .and_then(Value::as_i64)
-                            .filter(|d| *d != 0)
-                        {
-                            claim_deadlines.insert(uid, deadline);
-                        }
-                    }
-                }
-                Err(err) => error!("claim lookup failed for {}: {err}", gw.id),
-            }
-        }
-        let claim_deadline_ms = claim_deadlines.values().copied().min();
-
-        let mut embed = embeds::winner_embed(
-            gw,
-            winners,
-            entries,
-            self.state.settings.embed_color,
-            claim_deadline_ms,
-            (!claim_deadlines.is_empty()).then_some(&claim_deadlines),
-        );
-        if reroll {
-            embed.title = "Giveaway Rerolled".to_string();
-        }
-
-        let mut parts: Vec<String> = Vec::new();
-        if !winners.is_empty() {
-            let mentions = winners
-                .iter()
-                .map(|w| format!("<@{w}>"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            parts.push(format!("🎉 {mentions}"));
-        }
-        let notify = self.notify_mention_for(cache, &gw.guild_id).await;
-        if !notify.is_empty() {
-            parts.push(format!("{notify} — results are in!"));
-        }
-        if let Some(role_id) = self.entrants_role(cache, gw) {
-            parts.push(format!("<@&{role_id}> — thanks to everyone who entered!"));
-        } else if winners.is_empty() {
-            parts.push("No valid entries — no winners this time.".to_string());
-        }
-        let content = if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join("\n"))
-        };
-
-        let components: Vec<CreateActionRow> = if claim_deadlines.is_empty() {
-            Vec::new()
-        } else {
-            convert::to_action_rows(&components::claim_buttons(&gw.id))
-        };
-        let allowed = CreateAllowedMentions::new()
-            .everyone(false)
-            .all_users(true)
-            .all_roles(true);
-        let create_embed = convert::to_create_embed(&embed);
-
-        if let (Some(message_id), false) = (
-            gw.message_id
-                .as_deref()
-                .and_then(snowflake)
-                .map(MessageId::new),
-            reroll,
-        ) {
-            let edited = channel_id
-                .edit_message(
-                    cache_http,
-                    message_id,
-                    EditMessage::new()
-                        .embed(create_embed.clone())
-                        .components(components.clone()),
-                )
-                .await;
-            if edited.is_ok() {
-                if let Some(text) = content {
-                    let _ = channel_id
-                        .send_message(
-                            cache_http,
-                            CreateMessage::new()
-                                .content(text)
-                                .reference_message((channel_id, message_id))
-                                .allowed_mentions(allowed),
-                        )
-                        .await;
-                }
-                return;
-            }
-        }
-
-        let mut message = CreateMessage::new()
-            .embed(create_embed)
-            .components(components)
-            .allowed_mentions(allowed);
-        if let Some(text) = content {
-            message = message.content(text);
-        }
-        if let Err(err) = channel_id.send_message(cache_http, message).await {
-            warn!("announce failed for {}: {err}", gw.id);
-        }
-    }
-
-    /// `mod.rs::refresh_embeds`, one `Context` short.
-    async fn refresh_embeds_gateway(&self, giveaways: &[Giveaway], handles: &Gateway) {
+    /// Re-render the live panel for each giveaway, a few at a time.
+    async fn refresh_embeds(&self, giveaways: &[Giveaway], handles: &Gateway) {
         let gate = Arc::new(Semaphore::new(REFRESH_CONCURRENCY));
         let mut set = tokio::task::JoinSet::new();
         for gw in giveaways {
@@ -715,68 +418,10 @@ impl Bot {
                 let Ok(_permit) = gate.acquire().await else {
                     return;
                 };
-                let _ = bot.refresh_embed_gateway(&gw, &handles).await;
+                let _ = bot.refresh_embed_with(&handles, &gw, None, None).await;
             });
         }
         while set.join_next().await.is_some() {}
-    }
-
-    /// Re-render one live giveaway message, re-checking status right before it.
-    async fn refresh_embed_gateway(&self, gw: &Giveaway, handles: &Gateway) -> Option<String> {
-        if !gw.active() || gw.message_id.is_none() {
-            return None;
-        }
-        let status = match self.db_call(self.service().get_status(&gw.id)).await {
-            Ok(value) => value,
-            Err(err) => {
-                error!("refresh status recheck failed for {}: {err}", gw.id);
-                return None;
-            }
-        };
-        if status.as_deref() != Some("active") {
-            return status;
-        }
-        let (Some(channel_id), Some(message_id)) = (
-            snowflake(&gw.channel_id).map(ChannelId::new),
-            gw.message_id
-                .as_deref()
-                .and_then(snowflake)
-                .map(MessageId::new),
-        ) else {
-            return None;
-        };
-        let is_text = cached_kind(&handles.cache, guild_id_of(gw), channel_id)
-            .map(is_text_kind)
-            .unwrap_or(false);
-        if !is_text {
-            return None;
-        }
-        let count = self.service().entry_count_cached(&gw.id).await.unwrap_or(0);
-        let embed = embeds::giveaway_embed(gw, count, self.state.settings.embed_color);
-        let rows = convert::to_action_rows(&components::giveaway_buttons(
-            &gw.id,
-            &self.state.settings.dashboard_url,
-        ));
-        match channel_id
-            .edit_message(
-                handles.cache_http(),
-                message_id,
-                EditMessage::new()
-                    .embed(convert::to_create_embed(&embed))
-                    .components(rows),
-            )
-            .await
-        {
-            Ok(_) => Some("active".to_string()),
-            Err(err) if is_not_found(&err) => {
-                debug!("giveaway message for {} no longer exists", gw.id);
-                None
-            }
-            Err(err) => {
-                warn!("embed refresh failed for {} ({err})", gw.id);
-                None
-            }
-        }
     }
 }
 

@@ -31,10 +31,10 @@ use gwbot_core::service::{FlushReceipt, GiveawayService};
 use gwbot_core::Database;
 use serde_json::Value;
 use serenity::all::{
-    Cache, ChannelId, ChannelType, Client, CommandInteraction, ComponentInteraction, Context,
-    CreateActionRow, CreateAllowedMentions, CreateCommand, CreateInteractionResponse,
+    Cache, CacheHttp, ChannelId, ChannelType, Client, CommandInteraction, ComponentInteraction,
+    Context, CreateActionRow, CreateAllowedMentions, CreateCommand, CreateInteractionResponse,
     CreateInteractionResponseMessage, CreateMessage, EditMessage, EventHandler, GatewayError,
-    GatewayIntents, GuildId, Interaction, Member, Message, MessageId, PartialChannel, Ready,
+    GatewayIntents, GuildId, Http, Interaction, Member, Message, MessageId, PartialChannel, Ready,
     RoleId, UserId,
 };
 use serenity::async_trait;
@@ -224,6 +224,38 @@ impl BotState {
 #[derive(Clone)]
 pub struct Bot {
     state: Arc<BotState>,
+}
+
+/// The two gateway handles a Discord call needs, without a `Context`.
+///
+/// serenity 0.12.5 only builds a `Context` inside its own dispatch, so the tick
+/// loop has none. It does have the `Arc<Cache>` / `Arc<Http>` pair the client
+/// publishes, and those are all a send or an edit actually reads. Carrying them
+/// here means the loops and the event handlers share one implementation of each
+/// side effect instead of two copies that can drift apart.
+#[derive(Clone)]
+pub(crate) struct Gateway {
+    pub(crate) cache: Arc<Cache>,
+    pub(crate) http: Arc<Http>,
+}
+
+impl From<&Context> for Gateway {
+    fn from(ctx: &Context) -> Self {
+        Self {
+            cache: ctx.cache.clone(),
+            http: ctx.http.clone(),
+        }
+    }
+}
+
+impl CacheHttp for Gateway {
+    fn http(&self) -> &Http {
+        self.http.as_ref()
+    }
+
+    fn cache(&self) -> Option<&Arc<Cache>> {
+        Some(&self.cache)
+    }
 }
 
 impl Bot {
@@ -551,6 +583,20 @@ impl Bot {
         entry_count: Option<i64>,
         live_status: Option<&str>,
     ) -> Option<String> {
+        let handles = Gateway::from(ctx);
+        self.refresh_embed_with(&handles, gw, entry_count, live_status)
+            .await
+    }
+
+    /// The body of [`Self::refresh_embed`], taking the gateway handles directly
+    /// so the tick loop can call it too.
+    async fn refresh_embed_with(
+        &self,
+        handles: &Gateway,
+        gw: &Giveaway,
+        entry_count: Option<i64>,
+        live_status: Option<&str>,
+    ) -> Option<String> {
         if !gw.active() || gw.message_id.is_none() {
             return None;
         }
@@ -576,7 +622,7 @@ impl Bot {
         ) else {
             return None;
         };
-        let is_text = cached_kind(&ctx.cache, guild_id_of(gw), channel_id)
+        let is_text = cached_kind(&handles.cache, guild_id_of(gw), channel_id)
             .map(is_text_kind)
             .unwrap_or(false);
         if !is_text {
@@ -593,7 +639,7 @@ impl Bot {
         ));
         match channel_id
             .edit_message(
-                ctx,
+                handles,
                 message_id,
                 EditMessage::new()
                     .embed(convert::to_create_embed(&embed))
@@ -731,33 +777,47 @@ impl Bot {
 
     // -- entrants role ---------------------------------------------------
 
-    async fn member_for(&self, ctx: &Context, guild_id: GuildId, user_id: &str) -> Option<Member> {
+    /// A member, from the cache when it is warm, else one REST lookup.
+    ///
+    /// Takes the handles directly rather than a `Context`, so the tick loop can
+    /// reach the same body.
+    async fn member_in(
+        &self,
+        cache: &Cache,
+        http: &Http,
+        guild_id: GuildId,
+        user_id: &str,
+    ) -> Option<Member> {
         let uid = snowflake(user_id)?;
         let user_id = UserId::new(uid);
-        if let Some(member) = ctx
-            .cache
+        if let Some(member) = cache
             .guild(guild_id)
             .and_then(|guild| guild.members.get(&user_id).cloned())
         {
             return Some(member);
         }
-        ctx.http.get_member(guild_id, user_id).await.ok()
+        http.get_member(guild_id, user_id).await.ok()
+    }
+
+    /// The entrants role of a giveaway, as an id (a cache ref is not `Send`).
+    fn entrants_role(&self, cache: &Cache, gw: &Giveaway) -> Option<RoleId> {
+        let guild_id = GuildId::new(snowflake(&gw.guild_id)?);
+        let role_id = RoleId::new(snowflake(gw.entrants_role_id.as_deref()?)?);
+        let exists = cache
+            .guild(guild_id)
+            .map(|guild| guild.roles.contains_key(&role_id))
+            .unwrap_or(false);
+        exists.then_some(role_id)
     }
 
     /// The entrants role of a giveaway, as ids only (a cache ref is not `Send`).
     fn role_for(&self, ctx: &Context, gw: &Giveaway) -> Option<(GuildId, RoleId)> {
         let guild_id = GuildId::new(snowflake(&gw.guild_id)?);
-        let role_id = RoleId::new(snowflake(gw.entrants_role_id.as_deref()?)?);
-        let exists = ctx
-            .cache
-            .guild(guild_id)
-            .map(|guild| guild.roles.contains_key(&role_id))
-            .unwrap_or(false);
-        exists.then_some((guild_id, role_id))
+        Some((guild_id, self.entrants_role(&ctx.cache, gw)?))
     }
 
     /// `<@&...>` for this server's notify role, or empty when unset/gone.
-    async fn notify_mention(&self, ctx: &Context, guild_id: &str) -> String {
+    async fn notify_mention_for(&self, cache: &Cache, guild_id: &str) -> String {
         let Some(role_id) = self.service().get_notify_role_cached(guild_id).await else {
             return String::new();
         };
@@ -766,8 +826,7 @@ impl Bot {
         };
         let guild_id = GuildId::new(guild);
         let role_id = RoleId::new(role);
-        let exists = ctx
-            .cache
+        let exists = cache
             .guild(guild_id)
             .map(|cached| cached.roles.contains_key(&role_id))
             .unwrap_or(false);
@@ -776,6 +835,10 @@ impl Bot {
         } else {
             String::new()
         }
+    }
+
+    async fn notify_mention(&self, ctx: &Context, guild_id: &str) -> String {
+        self.notify_mention_for(&ctx.cache, guild_id).await
     }
 
     /// Grant the entrants role, then take it straight back if the giveaway
@@ -834,13 +897,26 @@ impl Bot {
     }
 
     async fn take_entrants_role(&self, ctx: &Context, gw: &Giveaway, user_id: &str) {
-        let Some((guild_id, role_id)) = self.role_for(ctx, gw) else {
+        let handles = Gateway::from(ctx);
+        self.take_entrants_role_with(&handles, gw, user_id).await;
+    }
+
+    /// The body of [`Self::take_entrants_role`], taking the gateway handles
+    /// directly so the tick loop can call it too.
+    async fn take_entrants_role_with(&self, handles: &Gateway, gw: &Giveaway, user_id: &str) {
+        let Some(guild_id) = snowflake(&gw.guild_id).map(GuildId::new) else {
             return;
         };
-        let Some(member) = self.member_for(ctx, guild_id, user_id).await else {
+        let Some(role_id) = self.entrants_role(&handles.cache, gw) else {
             return;
         };
-        let _ = ctx
+        let Some(member) = self
+            .member_in(&handles.cache, &handles.http, guild_id, user_id)
+            .await
+        else {
+            return;
+        };
+        let _ = handles
             .http
             .remove_member_role(
                 guild_id,
@@ -851,15 +927,89 @@ impl Bot {
             .await;
     }
 
+    /// Take the role from every entrant now, delete it in five minutes.
+    ///
+    /// `Context`-shaped for the command handlers; the tick reaches the same
+    /// body through [`Self::strip_entrants_role_with`], because a loop has no
+    /// event context to borrow.
+    pub(crate) async fn strip_entrants_role(&self, ctx: &Context, gw: &Giveaway) {
+        let handles = Gateway::from(ctx);
+        self.strip_entrants_role_with(&handles, gw).await;
+    }
+
+    async fn strip_entrants_role_with(&self, handles: &Gateway, gw: &Giveaway) {
+        let Some(role_id) = self.entrants_role(&handles.cache, gw) else {
+            return;
+        };
+        let entrants = match self.db_call(self.service().entries(&gw.id, None)).await {
+            Ok(rows) => rows,
+            Err(err) => {
+                error!("could not list entrants for role strip ({}): {err}", gw.id);
+                Vec::new()
+            }
+        };
+        let ids: Vec<String> = entrants.iter().filter_map(json_id).collect();
+        if !ids.is_empty() {
+            // Concurrently, but a few at a time. One member at a time made a
+            // 1000-entrant giveaway take minutes to clean up; all of them at
+            // once would trip the per-route rate limit.
+            let gate = Arc::new(Semaphore::new(ROLE_STRIP_CONCURRENCY));
+            for window in ids.chunks(STRIP_BATCH) {
+                let mut set = tokio::task::JoinSet::new();
+                for user_id in window {
+                    let bot = self.clone();
+                    let handles = handles.clone();
+                    let gw = gw.clone();
+                    let gate = gate.clone();
+                    let user_id = user_id.clone();
+                    set.spawn(async move {
+                        let Ok(_permit) = gate.acquire().await else {
+                            return;
+                        };
+                        bot.take_entrants_role_with(&handles, &gw, &user_id).await;
+                    });
+                }
+                while set.join_next().await.is_some() {}
+            }
+        }
+        self.schedule_role_delete(
+            &gw.guild_id,
+            &role_id.to_string(),
+            &gw.id,
+            ROLE_DELETE_DELAY_SECS,
+        );
+        info!(
+            "stripped entrants role for {}; deleting it in {:.0}s",
+            gw.id, ROLE_DELETE_DELAY_SECS
+        );
+    }
+
     // -- announcement ----------------------------------------------------
 
     /// Winner celebration. Runs BEFORE the entrants role is stripped so the role
     /// mention below still reaches everyone who joined.
     async fn announce(&self, ctx: &Context, gw: &Giveaway, winners: &[String], reroll: bool) {
+        let handles = Gateway::from(ctx);
+        self.announce_with(&handles, gw, winners, reroll).await;
+    }
+
+    /// The body of [`Self::announce`], taking the gateway handles directly.
+    ///
+    /// The tick loop owns no `Context` (serenity 0.12 only builds one inside its
+    /// dispatch), so it calls this with the `Arc<Cache>` / `Arc<Http>` pair the
+    /// client publishes.
+    async fn announce_with(
+        &self,
+        handles: &Gateway,
+        gw: &Giveaway,
+        winners: &[String],
+        reroll: bool,
+    ) {
+        let cache = handles.cache.as_ref();
         let Some(channel_id) = snowflake(&gw.channel_id).map(ChannelId::new) else {
             return;
         };
-        let is_text = cached_kind(&ctx.cache, guild_id_of(gw), channel_id)
+        let is_text = cached_kind(cache, guild_id_of(gw), channel_id)
             .map(is_text_kind)
             .unwrap_or(false);
         if !is_text {
@@ -917,11 +1067,11 @@ impl Bot {
                 .join(" ");
             parts.push(format!("🎉 {mentions}"));
         }
-        let notify = self.notify_mention(ctx, &gw.guild_id).await;
+        let notify = self.notify_mention_for(cache, &gw.guild_id).await;
         if !notify.is_empty() {
             parts.push(format!("{notify} — results are in!"));
         }
-        if let Some((_, role_id)) = self.role_for(ctx, gw) {
+        if let Some(role_id) = self.entrants_role(cache, gw) {
             parts.push(format!("<@&{role_id}> — thanks to everyone who entered!"));
         } else if winners.is_empty() {
             parts.push("No valid entries — no winners this time.".to_string());
@@ -952,7 +1102,7 @@ impl Bot {
         ) {
             let edited = channel_id
                 .edit_message(
-                    ctx,
+                    handles,
                     message_id,
                     EditMessage::new()
                         .embed(create_embed.clone())
@@ -963,7 +1113,7 @@ impl Bot {
                 if let Some(text) = content {
                     let _ = channel_id
                         .send_message(
-                            ctx,
+                            handles,
                             CreateMessage::new()
                                 .content(text)
                                 .reference_message((channel_id, message_id))
@@ -982,7 +1132,7 @@ impl Bot {
         if let Some(text) = content {
             message = message.content(text);
         }
-        if let Err(err) = channel_id.send_message(ctx, message).await {
+        if let Err(err) = channel_id.send_message(handles, message).await {
             warn!("announce failed for {}: {err}", gw.id);
         }
     }

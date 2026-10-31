@@ -10,19 +10,16 @@
 //! then the command is deferred, then the database work happens, and only then
 //! is the member answered. The database is never touched before the defer.
 
-use std::sync::Arc;
-
 use anyhow::Result;
 use gwbot_core::components;
 use gwbot_core::embeds::{self, Embed};
 use gwbot_core::mentions::{split_mentions, MAX_MENTION_MESSAGES};
-use gwbot_core::models::{Giveaway, ServiceError};
+use gwbot_core::models::ServiceError;
 use serenity::all::{
     AutocompleteChoice, ChannelId, CommandDataOptionValue, CommandInteraction, CommandOptionType,
     Context, CreateAllowedMentions, CreateAutocompleteResponse, CreateCommand, CreateCommandOption,
     CreateInteractionResponse, CreateMessage, EditMessage, EditRole, MessageId, RoleId, UserId,
 };
-use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 use super::{cached_kind, guild_id_of, is_text_kind, is_thread_kind, json_id, snowflake, Bot};
@@ -597,7 +594,7 @@ async fn giveaway_end(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
 
     bot.gw_drop(&gw.id);
     bot.announce(ctx, &ended, &winners, false).await;
-    strip_entrants_role(bot, ctx, &ended).await;
+    bot.strip_entrants_role(ctx, &ended).await;
     bot.safe_followup_command(ctx, ci, &format!("Ended with {} winner(s).", winners.len()))
         .await;
     Ok(())
@@ -829,7 +826,7 @@ async fn giveaway_cancel(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> R
         }
     }
 
-    strip_entrants_role(bot, ctx, &ended).await;
+    bot.strip_entrants_role(ctx, &ended).await;
 
     if is_text {
         if let Some(channel_id) = channel_id {
@@ -1367,55 +1364,6 @@ async fn giveaway_ping(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Res
 }
 
 // -- shared cleanup ------------------------------------------------------
-
-/// Take the entrants role from every entrant now, delete it in five minutes.
-///
-/// `bot.py` kept this on the bot class; it lives here because ending, cancelling
-/// and expiring a claim are the only callers and none of them are in `mod.rs`.
-async fn strip_entrants_role(bot: &Bot, ctx: &Context, gw: &Giveaway) {
-    let Some((_, role_id)) = bot.role_for(ctx, gw) else {
-        return;
-    };
-    let entrants = match bot.db_call(bot.service().entries(&gw.id, None)).await {
-        Ok(rows) => rows,
-        Err(err) => {
-            error!("could not list entrants for role strip ({}): {err}", gw.id);
-            Vec::new()
-        }
-    };
-    let ids: Vec<String> = entrants.iter().filter_map(json_id).collect();
-    if !ids.is_empty() {
-        // Concurrently, but a few at a time. One member at a time made a
-        // 1000-entrant giveaway take minutes to clean up; all of them at once
-        // would trip the per-route rate limit.
-        let gate = Arc::new(Semaphore::new(super::ROLE_STRIP_CONCURRENCY));
-        for window in ids.chunks(super::STRIP_BATCH) {
-            let mut set = tokio::task::JoinSet::new();
-            for user_id in window {
-                let bot = bot.clone();
-                let ctx = ctx.clone();
-                let gw = gw.clone();
-                let gate = gate.clone();
-                let user_id = user_id.clone();
-                set.spawn(async move {
-                    let Ok(_permit) = gate.acquire().await else {
-                        return;
-                    };
-                    bot.take_entrants_role(&ctx, &gw, &user_id).await;
-                });
-            }
-            while set.join_next().await.is_some() {}
-        }
-    }
-    bot.schedule_role_delete(
-        &gw.guild_id,
-        &role_id.to_string(),
-        &gw.id,
-        super::ROLE_DELETE_DELAY_SECS,
-    );
-    info!(
-        "stripped entrants role for {}; deleting it in {:.0}s",
-        gw.id,
-        super::ROLE_DELETE_DELAY_SECS
-    );
-}
+//
+// The entrants-role strip lives on `Bot` (`bot::tick`), because the tick loop
+// needs the same body without an event context to borrow.
