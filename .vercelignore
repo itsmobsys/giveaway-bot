@@ -1,6 +1,7 @@
-# Keep the Python bot and local-only files out of Vercel deployments.
+# Keep the bot and local-only files out of Vercel deployments.
 # Vercel only needs: api/, public/, package.json, vercel.json.
-bot/
+rust/
+tests/
 .venv/
 __pycache__/
 .pytest_cache/

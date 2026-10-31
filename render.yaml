@@ -1,8 +1,11 @@
 # Render blueprint: giveaway bot as a Web Service.
 #
-# The bot binds $PORT itself (/health), so the free-tier Web Service type works
-# — no background worker needed. Keep it awake with a free UptimeRobot monitor
-# on https://<name>.onrender.com/health every 5 minutes.
+# The bot binds $PORT itself (/health and /ready), so the free-tier Web Service
+# type works - no background worker needed. Keep it awake with a free UptimeRobot
+# monitor on https://<name>.onrender.com/health every 5 minutes.
+#
+# The image is built by the repository Dockerfile (Rust, multi-stage), so a
+# deploy needs no Python and no build cache from a previous release.
 
 services:
   - type: web
@@ -34,3 +37,8 @@ services:
       # Turso. Never a source of truth -- it only cuts repeat reads.
       - key: REDIS_URL
         sync: false
+      # Per-process ops/sec the Redis governor will spend. The governor always
+      # keeps a sliding second under the managed plan's 100 ops/s ceiling, so
+      # lowering this only trades cache hits for headroom.
+      - key: REDIS_OP_BUDGET_PER_SEC
+        value: "80"

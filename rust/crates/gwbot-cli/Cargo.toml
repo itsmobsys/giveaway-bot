@@ -1,0 +1,20 @@
+[package]
+name = "gwbot-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "The giveaway-bot binary: run, doctor, healthcheck"
+
+[[bin]]
+name = "giveaway-bot"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+futures = "0.3"
+gwbot-core = { path = "../gwbot-core" }
+gwbot-discord = { path = "../gwbot-discord" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

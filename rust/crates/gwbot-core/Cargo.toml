@@ -1,0 +1,30 @@
+[package]
+name = "gwbot-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Giveaway domain: config, Turso storage, rules, embeds, cache"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+dotenvy.workspace = true
+rand.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+# Remote-only Turso client: pure Rust HTTP over rustls, no C toolchain needed.
+# `tls` is required for libsql:// (https) endpoints; `remote` alone is plaintext.
+libsql = { version = "0.9", default-features = false, features = ["remote", "tls"] }
+# Bundled SQLite is used by the test oracle and the JSON harness only. Production
+# is Turso-only by design (see db.rs), so this never becomes a storage fallback.
+rusqlite = { version = "0.32", features = ["bundled"] }
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

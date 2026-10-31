@@ -1,9 +1,9 @@
-# Python runtime dependencies for the Discord bot.
-# Installs the same set SillyDev / Render / local dev all use.
-discord.py>=2.4,<3
-python-dotenv>=1.0,<2
-libsql>=0.1.11,<2
-# Short-TTL read cache + concurrency damper only. Turso stays the single
-# source of truth: every entry is confirmed by a Turso commit before the
-# member is acked, and losing Redis only costs latency, never data.
-redis>=5.0,<6
+# Python is test-only: the bot itself is Rust (see rust/).
+#
+# The suite in tests/ drives the compiled `gwbot-harness` binary over a JSON
+# line protocol, so it needs nothing from PyPI -- only the standard library and
+# a Python 3.11+ interpreter. This file is kept (empty of packages) because some
+# panels and CI images install it unconditionally and fail on a missing file.
+#
+# Runtime dependencies live in rust/Cargo.toml and are vendored into the binary
+# by `cargo build --release -p gwbot-cli`. Nothing here is needed to run the bot.

@@ -1,14 +1,20 @@
 # Giveaway Bot
 
-Simple standalone Discord giveaway bot. MIT licensed.
+Simple standalone Discord giveaway bot, written in Rust. MIT licensed.
 
 ```
 .
-├── bot/            Python Discord bot (discord.py), Turso-backed
-├── dashboard/      Website + Vercel Node.js API (live + previous giveaways)
-├── app.py          Root entry point for panels that start a file
-├── requirements.txt  Bot dependencies
-├── render.yaml     Render blueprint: bot web service
+├── rust/               Rust workspace: the bot
+│   └── crates/
+│       ├── gwbot-core/     config, Turso storage, rules, embeds, cache
+│       ├── gwbot-discord/  gateway wiring: commands, buttons, tick loop
+│       ├── gwbot-cli/      the `giveaway-bot` binary (run / doctor / healthcheck)
+│       └── gwbot-harness/  JSON-line driver used by the Python test suite
+├── tests/              Python test suite (drives the harness, no gateway needed)
+├── dashboard/          Website + Vercel Node.js API (live + previous giveaways)
+├── app.py              Root launcher for panels that start a file
+├── Dockerfile          Multi-stage Rust image (deployed to Render)
+├── render.yaml         Render blueprint: bot web service
 └── docker-compose.yml  Bot, locally
 ```
 
@@ -29,9 +35,10 @@ Simple standalone Discord giveaway bot. MIT licensed.
   They are kept in memory and written in one batched statement every 10s, so a
   busy server does not pay a database round-trip per message
 - Turso-only storage, so restarts never lose data
-- Built-in `/health` server, so it runs on Render's free Web Service tier
+- Built-in `/health` and `/ready` endpoints, so it runs on Render's free Web
+  Service tier
 
-Details: [bot/README.md](bot/README.md).
+Details: [rust/README.md](rust/README.md).
 
 ## Dashboard (website + API, Vercel)
 
@@ -90,23 +97,33 @@ and a strong, unique `ADMIN_PASSWORD` (required for admin access), then deploy.
 
 ## Quick start
 
+Requires a Rust toolchain (1.80+). A C linker is needed for the bundled SQLite
+that the test oracle and the harness link: `gcc`/`cc` on Linux, MSVC Build Tools
+or a mingw-w64 toolchain on Windows.
+
 ```bash
-python -m pip install -r requirements.txt
-python -m giveaway_bot doctor   # from bot/
-python -m giveaway_bot run      # or: python app.py (from root)
+cargo build --release -p gwbot-cli          # from rust/
+./rust/target/release/giveaway-bot doctor   # check the environment
+./rust/target/release/giveaway-bot run      # or: python app.py (from the root)
 ```
+
+`app.py` is only a launcher: it finds the built binary and `exec`s it, so hosts
+that can only start a Python file still work. Nothing about the bot runs in
+Python.
 
 ## Tests
 
-No extra dependencies: both suites are plain stdlib and Node.
-
 ```bash
-cd bot       && python -m unittest discover -s tests -t .   # rules, embeds, bot
-cd dashboard && node smoke.js                              # page + card shape
+cargo test --workspace                                   # from rust/
+python -m unittest discover -s tests -t .                # from the root
+cd dashboard && node smoke.js                            # page + card shape
 ```
 
-The Python suite hands `Database` an in-memory SQLite connection, so the real
-schema, constraints and upserts are exercised without a Turso account.
+The Python suite is the black-box suite: it starts the compiled harness binary
+and drives the real Rust service over a JSON-line protocol, against an
+in-memory SQLite database. It covers the rules, the storage invariants,
+fairness, concurrency, failure recovery and a load smoke test. No Discord
+token, network or Turso account is needed.
 
 ## Env
 
@@ -120,6 +137,9 @@ schema, constraints and upserts are exercised without a Turso account.
 | `TICK_SECONDS` | no | Embed refresh + due checks (default 30) |
 | `EMBED_COLOR` | no | e.g. `0x7C5CFF`, `#7C5CFF` or `7C5CFF`; masked to 24 bits |
 | `DASHBOARD_URL` | no | Blue "Dashboard" link button on every giveaway message (empty = no button) |
+| `REDIS_URL` | no | Optional short-TTL read cache; unset disables it |
+| `REDIS_ENABLED` | no | Switch the cache off without clearing the URL (default true) |
+| `REDIS_OP_BUDGET_PER_SEC` | no | Per-process Redis ops/sec ceiling (default 80) |
 | `PORT` | no | Health server port (Render sets it; default 10000) |
 
 The bot needs **Server Members Intent** (Developer Portal → Bot) for role checks
