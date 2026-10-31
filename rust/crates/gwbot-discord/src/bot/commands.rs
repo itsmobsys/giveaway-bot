@@ -296,11 +296,16 @@ fn can_manage(ci: &CommandInteraction) -> bool {
         .unwrap_or(false)
 }
 
-/// `discord.Member.display_name` as this port defines it: nickname, else name.
+/// `discord.Member.display_name`: nickname, else global name, else username.
+///
+/// The interaction payload carries a partial member, so this is the same
+/// fallback chain serenity's `Member::display_name` uses rather than a second
+/// spelling of it.
 fn display_name(ci: &CommandInteraction) -> String {
     ci.member
         .as_deref()
         .and_then(|member| member.nick.clone())
+        .or_else(|| ci.user.global_name.clone())
         .unwrap_or_else(|| ci.user.name.clone())
 }
 
@@ -397,12 +402,10 @@ async fn giveaway_create(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> R
                 .members
                 .get(&user_id)
                 .and_then(|member| member.nick.clone());
-            let name = ci
-                .data
-                .resolved
-                .users
-                .get(&user_id)
-                .map(|user| user.name.clone());
+            let resolved_user = ci.data.resolved.users.get(&user_id);
+            let name = resolved_user
+                .and_then(|user| user.global_name.clone())
+                .or_else(|| resolved_user.map(|user| user.name.clone()));
             (
                 user_id.to_string(),
                 nick.or(name).unwrap_or_else(|| user_id.to_string()),

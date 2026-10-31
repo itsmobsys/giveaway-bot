@@ -630,7 +630,16 @@ impl Bot {
         }
         let count = match entry_count {
             Some(count) => count,
-            None => self.service().entry_count_cached(&gw.id).await.unwrap_or(0),
+            None => match self.service().entry_count_cached(&gw.id).await {
+                Ok(count) => count,
+                // A failed count must not be rendered as "0 entrants": Python
+                // skipped the edit entirely, so a transient database error froze
+                // the old countdown rather than flashing an empty giveaway.
+                Err(err) => {
+                    error!("embed refresh failed for {}: {err}", gw.id);
+                    return None;
+                }
+            },
         };
         let embed = embeds::giveaway_embed(gw, count, self.state.settings.embed_color);
         let rows = convert::to_action_rows(&components::giveaway_buttons(
