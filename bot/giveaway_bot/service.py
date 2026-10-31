@@ -20,8 +20,6 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 log = logging.getLogger("giveaway_bot.service")
 
-DAY = 86_400_000
-
 #: TTL of the short-lived read caches. Everything here is derivable from
 #: Turso, so a stale hit only ever costs a few seconds of cosmetic staleness
 #: (a list one giveaway behind, a count one entry behind) -- never a wrong
@@ -310,25 +308,6 @@ class GiveawayService:
             await cache.delete(suffix)
         except Exception:
             log.debug("redis delete failed for %s", suffix, exc_info=True)
-
-    async def _invalidate_guild(self, guild_id: str, giveaway_id: str | None = None) -> None:
-        """Drop everything a finished/cancelled giveaway could have changed.
-
-        Called synchronously inside the write path (after the statement has
-        landed), so the very next read is served from the database rather
-        than from a row that says the giveaway is still running.
-        """
-        cache = self._redis
-        if cache is None or not guild_id:
-            return
-        keys = [f"guild:{guild_id}:active", "all:active"]
-        if giveaway_id:
-            keys.append(f"gw:{giveaway_id}")
-            keys.append(f"count:{giveaway_id}")
-        try:
-            await cache.delete(*keys)
-        except Exception:
-            log.debug("redis invalidation failed for guild %s", guild_id, exc_info=True)
 
     @staticmethod
     def _dump(gw: Giveaway) -> dict[str, Any]:

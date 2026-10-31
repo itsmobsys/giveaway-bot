@@ -79,11 +79,6 @@ class FakeRedis:
         self._maybe_fail()
         return True
 
-    async def aclose(self) -> None:
-        # The cache closes its client on shutdown; the fake only has to survive
-        # the call (the bot's close() path reaches it in the end tests).
-        self.calls.append(("aclose", (), {}))
-
     async def eval(self, script: str, numkeys: int, *args):
         self.calls.append(("eval", (script, numkeys, *args), {}))
         self._maybe_fail()

@@ -204,25 +204,6 @@ class ClaimView(discord.ui.View):
         except Exception:
             pass
 
-    @classmethod
-    def unregister(cls) -> None:
-        _HANDLERS.pop(ClaimButton.PREFIX, None)
-
-    @classmethod
-    def register_all(
-        cls,
-        client: discord.Client,
-        *,
-        join: Handler,
-        leave: Handler,
-        participants: Handler,
-        claim: Handler,
-    ) -> None:
-        """Wire all four handlers at once (convenience over GiveawayView)."""
-        GiveawayView.register(
-            client, join=join, leave=leave, participants=participants, claim=claim
-        )
-
 
 class ParticipantsPages(discord.ui.View):
     """Ephemeral paged entrant list: Prev | page x/y | Next."""

@@ -94,10 +94,6 @@ class Settings:
     redis_enabled: bool = field(default_factory=lambda: _bool("REDIS_ENABLED", True))
 
     @property
-    def uses_turso(self) -> bool:
-        return bool(self.turso_url)
-
-    @property
     def uses_redis(self) -> bool:
         return bool(self.redis_url) and self.redis_enabled
 

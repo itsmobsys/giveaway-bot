@@ -1202,23 +1202,6 @@ class GiveawayBot(commands.Bot):
                 "This giveaway just ended — your entry arrived too late for the draw.",
             )
 
-    async def _reply(self, interaction: discord.Interaction, text: str) -> None:
-        """Win 1 (direct reply): one Discord RTT instead of defer + followup.
-
-        When nothing answered yet, response.send_message completes the click
-        in a single call (~120ms saved). After a defer (slow path) it falls
-        through to the followup. Ephemeral in both cases."""
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(text, ephemeral=True)
-                return
-            await interaction.followup.send(text, ephemeral=True)
-        except (discord.NotFound, discord.HTTPException) as exc:
-            # The ack never reached the member: log so a silent join (entry
-            # stored, user told nothing) leaves a trace instead of looking
-            # like the button did nothing.
-            log.warning("reply failed (%s): %s", type(exc).__name__, exc)
-
     async def _safe_followup(self, interaction: discord.Interaction, text: str) -> None:
         """Followup send that never raises; a silent ack leaves a warning."""
         try:
@@ -2923,11 +2906,6 @@ def wire_commands(bot: GiveawayBot) -> None:
             # database. A leg that never ran says so instead of showing 0.
             return "not measured" if value is None else f"{value:.1f}ms"
 
-        def _agg(value: float | None) -> str:
-            # An aggregate that was never measured must read as "n/a", never as
-            # a fast zero.
-            return f"{value:.1f}ms" if value is not None else "n/a"
-
         def _ops() -> str:
             if cache_gets is None:
                 return "n/a"
@@ -3231,8 +3209,6 @@ async def amain(settings: Settings) -> None:
                 if shutdown_task is not None:
                     await shutdown_task
                     break
-            else:
-                break
     finally:
         try:
             await redis.aclose()

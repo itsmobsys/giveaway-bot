@@ -36,11 +36,6 @@ class FakeRedis:
         if self.fail is not None:
             raise self.fail
 
-    async def ping(self) -> bool:
-        self.calls.append(("ping", (), {}))
-        self._maybe_fail("ping")
-        return True
-
     async def get(self, key: str):
         self.calls.append(("get", (key,), {}))
         self._maybe_fail("get")
