@@ -1,4 +1,4 @@
-//! Discord embed text, ported from `bot/giveaway_bot/embeds.py`.
+//! Discord embed text, ported 1:1 from the Python bot.
 //!
 //! The output is a framework-neutral [`Embed`] rather than a `serenity` type so
 //! the exact wording, countdown and winner formatting can be unit-tested

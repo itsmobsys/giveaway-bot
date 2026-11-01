@@ -1,19 +1,20 @@
 # Giveaway Bot — Rust workspace
 
-The bot, ported from the Python implementation with behaviour, storage schema,
-dashboard contract and fairness rules unchanged.
+The bot, ported from a Python implementation with behaviour, storage schema,
+dashboard contract and fairness rules unchanged. That Python tree has been removed;
+the Rust suite is now the only specification of the behaviour.
 
 ```
 crates/
 ├── gwbot-core/      domain: config, Turso storage, rules, embeds, cache, health
 ├── gwbot-discord/   gateway adapter: commands, buttons, tick loop
 ├── gwbot-cli/       the `giveaway-bot` binary (run / doctor / healthcheck)
-└── gwbot-harness/   JSON-line driver used by the Python test suite
+└── gwbot-testkit/   in-process harness and shared fixtures for the test suite
 ```
 
-Only `gwbot-cli` produces a deployed binary. `gwbot-harness` exists so the
-Python suite can drive the real service without a Discord token, and is never
-shipped.
+Only `gwbot-cli` produces a deployed binary. `gwbot-testkit` exists so the
+integration tests can drive the real service without a Discord token, and is
+never shipped.
 
 ## Build and run
 
@@ -23,9 +24,10 @@ cargo build --release -p gwbot-cli
 ./target/release/giveaway-bot run
 ```
 
-A C linker is required: `rusqlite`'s bundled SQLite (used by the test oracle
-and the harness) compiles a small amount of C. On Windows that means MSVC Build
-Tools or a mingw-w64 toolchain; on Linux, `build-essential` and `pkg-config`.
+A C linker is required: `rusqlite`'s bundled SQLite (used by the test suite)
+compiles a small amount of C. On Windows that means MSVC Build Tools or a
+mingw-w64 toolchain; on Linux, `build-essential` and `pkg-config`. The deployed
+binary never opens a local database, so a production image does not need it.
 
 ## Layers
 
@@ -34,7 +36,7 @@ Tools or a mingw-w64 toolchain; on Linux, `build-essential` and `pkg-config`.
 | `gwbot-core` | rules, SQL, retries, caching, embed text, button ids | touch a gateway |
 | `gwbot-discord` | slash commands, component dispatch, tick loop, login retry | write SQL directly |
 | `gwbot-cli` | process lifecycle, `doctor`, health probing | decide a giveaway rule |
-| `gwbot-harness` | the test protocol | run in production |
+| `gwbot-testkit` | the test fixtures and fake clock | run in production |
 
 `gwbot-core` is framework-neutral on purpose: embeds and buttons are plain
 structs (`Embed`, `ButtonSpec`), so their exact wording and ids are unit-tested
@@ -45,10 +47,9 @@ how serenity spells the same thing.
 
 Turso (libSQL) is the only production store. `libsql` is built with
 `default-features = false, features = ["remote", "tls"]`; the local
-`rusqlite` backend exists **only** for the test oracle and the harness, and
-there is no code path that falls back to a local file in production — Render
-wipes its disk on every redeploy, so a local database would silently lose
-every giveaway.
+`rusqlite` backend exists **only** for the test suite, and there is no code path
+that falls back to a local file in production — Render wipes its disk on every
+redeploy, so a local database would silently lose every giveaway.
 
 Schema version 2, identical to the Python bot:
 
@@ -83,46 +84,53 @@ the managed plan's 100 ops/s ceiling (a skip looks exactly like a miss), and a
 circuit breaker stops hammering a dead server. Turso stays the source of truth —
 every write goes straight there, and losing Redis costs latency, never data.
 
-## Harness protocol
+## The test harness
 
-`gwbot-harness` reads one JSON object per line on stdin and writes one per line
-on stdout:
+`gwbot-testkit` is the harness, and it is a library, not a binary. One `Harness`
+is one bot process: a fresh database, a `GiveawayService` over it, and a
+`ManualClock` it owns.
 
-```json
-{"id": 1, "op": "create", "args": {"guild_id": "...", "prize": "Nitro", ...}}
-{"id": 1, "ok": true, "result": {"id": "gw_ab12", ...}}
+```rust
+let h = Harness::new().await;                       // fresh temp database
+let gw = create(&h, json!({"prize": "Nitro", "minutes": 10})).await;
+let joined = join(&h, &gw, "user_1", json!({})).await?;
 ```
 
-A refusal keeps its kind so the Python suite can assert on it:
+Operations are still called by name — `h.call("join", args)` — so every test
+ported from the old suite reads the same way, while the wire format and the
+subprocess are gone. A refusal keeps its kind (`service_error`, `timeout_ban`, …)
+so a test can assert on the exact reason.
 
-```json
-{"id": 2, "ok": false, "kind": "service_error", "detail": "timeout_ban", "error": "..."}
-```
+Three rules keep the suite honest:
 
-`sql` runs a statement straight against the test database so a test can assert
-storage state without trusting the service to report on itself. `clock.now`,
-`clock.advance` and `clock.set` drive a fake clock, so "expires in five
-minutes" never races a slow CI box.
+- every fixture starts a fresh database, so no test can be made green by another
+  test's leftovers;
+- the clock only moves when a test moves it (`advance`, `set`), so "expires in
+  five minutes" never races a slow CI box;
+- the clock belongs to the harness, not to the process, so tests run in parallel
+  threads without moving each other's deadlines.
 
-Environment:
+Storage assertions go straight at the test database, so a test can check what was
+stored without trusting the service to report on itself. `run_concurrently` and
+the `*_job` helpers stage the racing calls that the concurrency tests need.
 
-| Var | What |
-| --- | --- |
-| `GWBOT_HARNESS_DB` | database file (default `:memory:`) |
-| `GWBOT_HARNESS_FAKE_CLOCK` | `1` to start the clock at a fixed point |
-| `GWBOT_HARNESS_START_MS` | the fixed point, in epoch milliseconds |
+Nothing here needs a Discord token, a network connection or a Turso account.
 
 ## Tests
 
 ```bash
-cargo test --workspace                          # Rust unit tests
+cargo test --workspace                          # unit + integration tests
 cargo clippy --workspace --all-targets          # lints
 cargo fmt --all -- --check                      # formatting
-
-python -m unittest discover -s tests -t .       # from the repository root
 ```
 
-The Python suite is the integration layer: it builds nothing, starts the
-compiled harness, and exercises rules, storage invariants, fairness,
+`cargo test --workspace` is the only test entry point: there is no separate client
+to build and no interpreter to install. The integration layer lives in
+`crates/gwbot-testkit/tests/` and exercises rules, storage invariants, fairness,
 concurrency, failure recovery and a load smoke test against a real SQLite
 database using the real schema.
+
+The gateway half lives in `crates/gwbot-discord/src/bot/tests.rs` plus
+`src/bot/tests/`, in-crate because serenity only builds a `Context` inside its own
+dispatch: those tests drive the same functions the handlers call and record the
+answer instead of editing a message.

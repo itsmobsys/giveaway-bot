@@ -1,9 +1,0 @@
-# Python is test-only: the bot itself is Rust (see rust/).
-#
-# The suite in tests/ drives the compiled `gwbot-harness` binary over a JSON
-# line protocol, so it needs nothing from PyPI -- only the standard library and
-# a Python 3.11+ interpreter. This file is kept (empty of packages) because some
-# panels and CI images install it unconditionally and fail on a missing file.
-#
-# Runtime dependencies live in rust/Cargo.toml and are vendored into the binary
-# by `cargo build --release -p gwbot-cli`. Nothing here is needed to run the bot.

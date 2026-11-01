@@ -1,6 +1,6 @@
 //! Periodic loops: the draw timer, the message-count flush and the heartbeat.
 //!
-//! `bot.py` hung these off `discord.ext.tasks`, whose decorators waited for
+//! The Python bot hung these off `discord.ext.tasks`, whose decorators waited for
 //! `ready`, restarted a crashed loop and logged the exception. Each loop here is
 //! a plain `async fn`: wait for the first `ready`, then repeat forever, logging
 //! every failure instead of dying. A dead tick would silently stop drawing
@@ -46,7 +46,7 @@ impl Bot {
     }
 
     /// One pass: correctness phases first, then the gated cosmetic half.
-    async fn tick_once(&self) {
+    pub(crate) async fn tick_once(&self) {
         let handles = self.gateway();
 
         // -- due draws ---------------------------------------------------
@@ -253,7 +253,7 @@ impl Bot {
     /// a raw TCP connect, a write, and a read of the status line is the whole
     /// protocol needed. `Connection: close` makes our own server hang up after
     /// the body, so the read always terminates.
-    async fn probe_health(&self) -> Result<(u16, f64)> {
+    pub(super) async fn probe_health(&self) -> Result<(u16, f64)> {
         let port = self.state.settings.port.max(1);
         let started = Instant::now();
         let mut stream = tokio::time::timeout(

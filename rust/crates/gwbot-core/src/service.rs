@@ -1,4 +1,4 @@
-//! Giveaway domain rules. Ported 1:1 from `bot/giveaway_bot/service.py`.
+//! Giveaway domain rules, ported 1:1 from the Python bot.
 //!
 //! Every method is `async` because the only backend is Turso over HTTP; the
 //! Python original was sync only because its driver was thread-local. The
@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex as StdMutex;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anyhow::Result;
 use rand::seq::SliceRandom;
@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 use crate::cache::RedisCache;
 use crate::db::{is_ambiguous_loss, Database, Row, SqlValue};
 use crate::models::{
-    changed, now_ms, Giveaway, PartialFlush, ServiceError, ENTRY_RETENTION_MS, MAX_WINNERS,
-    MESSAGE_FLUSH_CHUNK, TIMEOUT_BAN_KIND, TIMEOUT_PENALTY,
+    changed, Clock, Giveaway, PartialFlush, ServiceError, SystemClock, ENTRY_RETENTION_MS,
+    MAX_WINNERS, MESSAGE_FLUSH_CHUNK, TIMEOUT_BAN_KIND, TIMEOUT_PENALTY,
 };
 
 //: TTL of the short-lived read caches. Everything here is derivable from
@@ -95,6 +95,9 @@ impl FlushReceipt {
 pub struct GiveawayService {
     db: Database,
     redis: Option<RedisCache>,
+    /// Where every deadline, claim and retention check reads the time. Owned
+    /// rather than global so parallel tests cannot move each other's clock.
+    clock: Arc<dyn Clock>,
     /// Key suffixes whose cached value a just-committed write invalidated.
     /// The write path cannot await a Redis delete, so it records them here and
     /// the caller drains the list right after the same DB call, so the next
@@ -104,9 +107,17 @@ pub struct GiveawayService {
 
 impl GiveawayService {
     pub fn new(db: Database, redis: Option<RedisCache>) -> Self {
+        Self::with_clock(db, redis, Arc::new(SystemClock))
+    }
+
+    /// The production constructor, with the clock injected.
+    ///
+    /// Only tests pass anything but [`SystemClock`]; the bot never pins time.
+    pub fn with_clock(db: Database, redis: Option<RedisCache>, clock: Arc<dyn Clock>) -> Self {
         Self {
             db,
             redis,
+            clock,
             pending_invalidations: StdMutex::new(Vec::new()),
         }
     }
@@ -117,6 +128,15 @@ impl GiveawayService {
 
     pub fn redis(&self) -> Option<&RedisCache> {
         self.redis.as_ref()
+    }
+
+    /// The instant every rule in this service sees.
+    pub fn now_ms(&self) -> i64 {
+        self.clock.now_ms()
+    }
+
+    pub fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
     }
 
     // -- optional redis read cache --------------------------------------
@@ -488,7 +508,7 @@ impl GiveawayService {
         }
         role_ids.truncate(5);
         let gid = random_id();
-        let created = now_ms();
+        let created = self.now_ms();
         let ends_at = created + duration_seconds * 1000;
         let blocked = blocked_role_id.filter(|role| !role.is_empty());
         let min_age = min_account_age_days.max(0);
@@ -1007,7 +1027,7 @@ impl GiveawayService {
                 ServiceError::new(self.ban_message(&gw.guild_id, user_id, None).await?).into(),
             );
         }
-        if gw.ends_at <= now_ms() {
+        if gw.ends_at <= self.now_ms() {
             return Err(ServiceError::new("This giveaway has ended.").into());
         }
         // Discord's native timeout (/mute), and anyone still sitting out the
@@ -1150,7 +1170,7 @@ impl GiveawayService {
         guild_id: &str,
         user_id: &str,
     ) -> Result<(Giveaway, Option<(bool, i64, i64, bool)>)> {
-        let snap_now = now_ms();
+        let snap_now = self.now_ms();
         let row = self
             .db
             .query_one(
@@ -1211,7 +1231,7 @@ impl GiveawayService {
         if guild_id.is_empty() || user_id.is_empty() {
             return Some((false, 0, 0, false));
         }
-        let snap_now = now_ms();
+        let snap_now = self.now_ms();
         let row = self
             .db
             .query_one(
@@ -1506,7 +1526,7 @@ impl GiveawayService {
         // A currently-timed-out member (timed_out=true) never reaches this
         // statement: check_eligible above always refuses them first. The bans
         // guard below therefore covers the penalty-row race only.
-        let now = now_ms();
+        let now = self.now_ms();
         let username: String = username.chars().take(64).collect();
         let inserted = match self
             .db
@@ -1557,7 +1577,7 @@ impl GiveawayService {
                         .await
                     {
                         if let Some(entered_at) = row.int("entered_at") {
-                            let age = now_ms() - entered_at;
+                            let age = self.now_ms() - entered_at;
                             if age < 15000 {
                                 return if fetch_count {
                                     self.entry_count(&gw.id, false).await
@@ -1594,7 +1614,7 @@ impl GiveawayService {
                     return Err(err);
                 }
             };
-            if !fresh.active() || fresh.ends_at <= now_ms() {
+            if !fresh.active() || fresh.ends_at <= self.now_ms() {
                 return Err(ServiceError::new("This giveaway has ended.").into());
             }
             if self.is_blacklisted(&gw.guild_id, user_id, None).await? {
@@ -1835,7 +1855,7 @@ impl GiveawayService {
         // One timestamp for the due check, the flip and the claim windows: the
         // repair sweep rebuilds deadlines as ended_at + timeout, so both must
         // share a base, and the tick test needs a deterministic clock.
-        let ts = now.unwrap_or_else(now_ms);
+        let ts = now.unwrap_or_else(|| self.now_ms());
         if require_due && gw.ends_at > ts {
             return Err(ServiceError::new("This giveaway is not due to end yet.").into());
         }
@@ -2243,7 +2263,7 @@ impl GiveawayService {
                                 gw.id.as_str().into(),
                                 replace_user_id.into(),
                                 CLAIM_REPLACED.into(),
-                                now_ms().into(),
+                                self.now_ms().into(),
                             ],
                         )
                         .await?;
@@ -2281,7 +2301,7 @@ impl GiveawayService {
         if !gw.claim_enabled() || winners.is_empty() {
             return Ok(());
         }
-        let ts = now.unwrap_or_else(now_ms);
+        let ts = now.unwrap_or_else(|| self.now_ms());
         let deadline = ts + gw.claim_timeout_seconds * 1000;
         for user_id in winners {
             self.db
@@ -2343,7 +2363,7 @@ impl GiveawayService {
             // Python row-level warning: the user still counts as "has a row".
             latest = latest.max(row.int_or("deadline_ms", 0));
         }
-        let ts = now.unwrap_or_else(now_ms);
+        let ts = now.unwrap_or_else(|| self.now_ms());
         let deadline = if latest > 0 {
             // Never hand a repaired winner an already-past deadline: a later
             // draw (reroll/expire) must start its own window at repair time,
@@ -2424,7 +2444,7 @@ impl GiveawayService {
     /// them up like any restart recovery. Idempotent; failures heal on a later
     /// tick. Returns rows written.
     pub async fn repair_all_missing_claims(&self, now: Option<i64>, limit: i64) -> Result<i64> {
-        let ts = now.unwrap_or_else(now_ms);
+        let ts = now.unwrap_or_else(|| self.now_ms());
         let rows = match self
             .db
             .query(
@@ -2487,7 +2507,7 @@ impl GiveawayService {
     /// Heals stranded windows first (bounded sweep, oldest ended first), so a
     /// crash between a draw and its inserts never hides as "no due claims".
     pub async fn due_claims(&self, now: Option<i64>, limit: i64) -> Result<Vec<Value>> {
-        let ts = now.unwrap_or_else(now_ms);
+        let ts = now.unwrap_or_else(|| self.now_ms());
         let _ = self.repair_all_missing_claims(Some(ts), 25).await;
         let rows = self
             .db
@@ -2509,7 +2529,7 @@ impl GiveawayService {
             .db
             .execute(
                 "UPDATE simple_claims SET status = 'claimed', claimed_at = ? WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
-                &[now_ms().into(), giveaway_id.into(), user_id.into()],
+                &[self.now_ms().into(), giveaway_id.into(), user_id.into()],
             )
             .await?;
         if !changed(flipped) {
@@ -2520,7 +2540,7 @@ impl GiveawayService {
                     .db
                     .execute(
                         "UPDATE simple_claims SET status = 'claimed', claimed_at = ? WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
-                        &[now_ms().into(), giveaway_id.into(), user_id.into()],
+                        &[self.now_ms().into(), giveaway_id.into(), user_id.into()],
                     )
                     .await;
                 if let Ok(retry) = retry {
@@ -2584,7 +2604,7 @@ impl GiveawayService {
                 "UPDATE simple_claims SET status = 'skipped', skipped_by = ?, skipped_at = ? WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
                 &[
                     staff_id.into(),
-                    now_ms().into(),
+                    self.now_ms().into(),
                     giveaway_id.into(),
                     user_id.into(),
                 ],
@@ -2600,7 +2620,7 @@ impl GiveawayService {
                         "UPDATE simple_claims SET status = 'skipped', skipped_by = ?, skipped_at = ? WHERE giveaway_id = ? AND user_id = ? AND status = 'pending'",
                         &[
                             staff_id.into(),
-                            now_ms().into(),
+                            self.now_ms().into(),
                             giveaway_id.into(),
                             user_id.into(),
                         ],
@@ -2666,7 +2686,7 @@ impl GiveawayService {
         if gw.active() {
             return Err(ServiceError::new("This giveaway is still running.").into());
         }
-        let ts = now.unwrap_or_else(now_ms);
+        let ts = now.unwrap_or_else(|| self.now_ms());
         let flipped = self
             .db
             .execute(
@@ -2804,7 +2824,7 @@ impl GiveawayService {
             .execute(
                 "UPDATE simple_giveaways SET status = 'cancelled', ended_at = ?, entrant_count = (SELECT COUNT(*) FROM simple_entries WHERE giveaway_id = ?) WHERE id = ? AND status = 'active'",
                 &[
-                    now_ms().into(),
+                    self.now_ms().into(),
                     gw.id.as_str().into(),
                     gw.id.as_str().into(),
                 ],
@@ -2889,7 +2909,7 @@ impl GiveawayService {
     /// Also zeroes the live counter on wiped giveaways: otherwise entry_count()
     /// would keep returning the stale pre-wipe bump.
     pub async fn wipe_stale_entries(&self, now: Option<i64>) -> Result<i64> {
-        let cutoff = now.unwrap_or_else(now_ms) - ENTRY_RETENTION_MS;
+        let cutoff = now.unwrap_or_else(|| self.now_ms()) - ENTRY_RETENTION_MS;
         let _ = self
             .db
             .execute(
@@ -2930,7 +2950,7 @@ impl GiveawayService {
         if guild_id.is_empty() || user_id.is_empty() {
             return Ok(None);
         }
-        let ts = now.unwrap_or_else(now_ms);
+        let ts = now.unwrap_or_else(|| self.now_ms());
         let row = self
             .db
             .query_one(
@@ -3031,7 +3051,7 @@ impl GiveawayService {
         }
         let clean_reason: String = reason.trim().chars().take(256).collect();
         let clean_by: String = banned_by.trim().chars().take(64).collect();
-        let ts = now.unwrap_or_else(now_ms);
+        let ts = now.unwrap_or_else(|| self.now_ms());
         let expires_at: Option<i64> = if hours == 0 {
             None
         } else {
@@ -3078,7 +3098,7 @@ impl GiveawayService {
 
     /// Delete timed bans already past expiry. Returns rows removed.
     pub async fn purge_expired_bans(&self, now: Option<i64>) -> Result<i64> {
-        let ts = now.unwrap_or_else(now_ms);
+        let ts = now.unwrap_or_else(|| self.now_ms());
         let removed = self
             .db
             .execute(
@@ -3095,7 +3115,7 @@ impl GiveawayService {
     /// capped, so this is what keeps a caller from reporting the size of the
     /// page set as if it were the whole blacklist.
     pub async fn count_blacklisted(&self, guild_id: &str, now: Option<i64>) -> Result<i64> {
-        let ts = now.unwrap_or_else(now_ms);
+        let ts = now.unwrap_or_else(|| self.now_ms());
         let row = self
             .db
             .query_one(
@@ -3112,7 +3132,7 @@ impl GiveawayService {
         limit: i64,
         now: Option<i64>,
     ) -> Result<Vec<String>> {
-        let ts = now.unwrap_or_else(now_ms);
+        let ts = now.unwrap_or_else(|| self.now_ms());
         let rows = self
             .db
             .query(
@@ -3133,7 +3153,7 @@ impl GiveawayService {
         limit: i64,
         now: Option<i64>,
     ) -> Result<Vec<Value>> {
-        let ts = now.unwrap_or_else(now_ms);
+        let ts = now.unwrap_or_else(|| self.now_ms());
         let rows = self
             .db
             .query(
@@ -3192,7 +3212,7 @@ impl GiveawayService {
         giveaway_id: Option<&str>,
     ) -> Result<i64> {
         let count = giveaways.max(1);
-        let ts = now_ms();
+        let ts = self.now_ms();
         // Hits from giveaways that are over can never refuse anyone again, so
         // each new penalty starts by dropping this member's stale ones.
         self.db
@@ -3241,7 +3261,7 @@ impl GiveawayService {
                     guild_id.into(),
                     user_id.into(),
                     giveaway_id.into(),
-                    now_ms().into(),
+                    self.now_ms().into(),
                 ],
             )
             .await?;
@@ -3286,7 +3306,7 @@ impl GiveawayService {
                     "UPDATE simple_giveaway_bans SET giveaways_remaining = giveaways_remaining - 1, last_blocked_giveaway_id = ?, updated_at = ? WHERE guild_id = ? AND user_id = ? AND giveaways_remaining > 0 AND (last_blocked_giveaway_id IS NULL OR last_blocked_giveaway_id != ?)",
                     &[
                         giveaway_id.into(),
-                        now_ms().into(),
+                        self.now_ms().into(),
                         guild_id.into(),
                         user_id.into(),
                         giveaway_id.into(),
@@ -3408,7 +3428,7 @@ impl GiveawayService {
                 return Err(err);
             }
         };
-        if !live.active() || live.ends_at <= now_ms() {
+        if !live.active() || live.ends_at <= self.now_ms() {
             return Err(ServiceError::new("This giveaway has ended.").into());
         }
         let mut left = match snap_ban {
@@ -3478,7 +3498,7 @@ impl GiveawayService {
     }
 
     pub async fn due(&self, now: Option<i64>) -> Result<Vec<Giveaway>> {
-        let ts = now.unwrap_or_else(now_ms);
+        let ts = now.unwrap_or_else(|| self.now_ms());
         let rows = self
             .db
             .query(

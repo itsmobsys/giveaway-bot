@@ -1,6 +1,6 @@
 //! Domain types shared by the service, the Discord adapter and the harness.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -181,24 +181,32 @@ impl std::fmt::Display for PartialFlush {
 
 impl std::error::Error for PartialFlush {}
 
-/// Set once the harness takes control of the clock. Off in production, where
-/// `now_ms` is just `SystemTime::now`.
-static FAKE_CLOCK: AtomicBool = AtomicBool::new(false);
-
-/// The frozen time while [`FAKE_CLOCK`] is on.
-static FAKE_NOW_MS: AtomicI64 = AtomicI64::new(0);
-
-/// Milliseconds since the Unix epoch, the bot's only time unit.
+/// Where the service reads the time.
 ///
-/// Tests need time to move only when they say so: an "expires in five minutes"
-/// assertion that reads the wall clock is a flake waiting to happen, and a
-/// timeout-penalty test cannot wait out a real five hours. The harness flips
-/// this to a fake clock, so every rule that consults the time - expiry, claim
-/// deadlines, retention sweeps - sees exactly the instant the test chose.
-pub fn now_ms() -> i64 {
-    if FAKE_CLOCK.load(Ordering::Relaxed) {
-        return FAKE_NOW_MS.load(Ordering::Relaxed);
+/// Milliseconds since the Unix epoch is the bot's only time unit. Production
+/// uses [`SystemClock`]; a test injects a [`ManualClock`] so an "expires in five
+/// minutes" assertion never races a slow CI box, and a timeout-penalty test does
+/// not have to wait out five real hours.
+///
+/// This is a value the service owns rather than a process-global, because Rust
+/// tests run in parallel threads inside one process: a global clock would let
+/// one test's `advance` move another test's deadline.
+pub trait Clock: Send + Sync {
+    fn now_ms(&self) -> i64;
+}
+
+/// The real clock. What production runs on.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now_ms(&self) -> i64 {
+        system_now_ms()
     }
+}
+
+/// Milliseconds since the Unix epoch, straight from the OS.
+pub fn system_now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -206,31 +214,45 @@ pub fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// True once a test has pinned the clock.
-pub fn fake_clock_enabled() -> bool {
-    FAKE_CLOCK.load(Ordering::Relaxed)
-}
-
-/// Pin the clock to `ms` and return it. Test-only; production never calls this.
-pub fn set_fake_clock(ms: i64) -> i64 {
-    FAKE_NOW_MS.store(ms, Ordering::Relaxed);
-    FAKE_CLOCK.store(true, Ordering::Relaxed);
-    ms
-}
-
-/// Move the pinned clock forward and return the new instant.
+/// A clock that only moves when a test moves it.
 ///
-/// Pins to the real clock first if nothing has been pinned yet, so a test can
-/// advance without having to know the epoch.
-pub fn advance_fake_clock(delta_ms: i64) -> i64 {
-    if !FAKE_CLOCK.load(Ordering::Relaxed) {
-        let real = now_ms();
-        FAKE_NOW_MS.store(real, Ordering::Relaxed);
-        FAKE_CLOCK.store(true, Ordering::Relaxed);
+/// Starts at whatever instant the test picks, so assertions can name absolute
+/// deadlines instead of measuring elapsed time.
+#[derive(Debug)]
+pub struct ManualClock {
+    now: AtomicI64,
+}
+
+impl ManualClock {
+    pub fn new(ms: i64) -> Self {
+        Self {
+            now: AtomicI64::new(ms),
+        }
     }
-    let next = FAKE_NOW_MS.load(Ordering::Relaxed).saturating_add(delta_ms);
-    FAKE_NOW_MS.store(next, Ordering::Relaxed);
-    next
+
+    pub fn now(&self) -> i64 {
+        self.now.load(Ordering::Relaxed)
+    }
+
+    /// Jump to `ms` and return it.
+    pub fn set(&self, ms: i64) -> i64 {
+        self.now.store(ms, Ordering::Relaxed);
+        ms
+    }
+
+    /// Move forward by `delta_ms` and return the new instant. Negative deltas
+    /// are allowed so a test can pin a deadline in the past.
+    pub fn advance(&self, delta_ms: i64) -> i64 {
+        let next = self.now().saturating_add(delta_ms);
+        self.now.store(next, Ordering::Relaxed);
+        next
+    }
+}
+
+impl Clock for ManualClock {
+    fn now_ms(&self) -> i64 {
+        self.now()
+    }
 }
 
 /// True when a statement that must match a row actually matched one.
@@ -297,13 +319,32 @@ mod tests {
         // Pinning freezes time: two reads with real work between them must
         // return the same instant, which is what makes an expiry assertion
         // deterministic.
-        let pinned = set_fake_clock(1_700_000_000_000);
-        assert_eq!(now_ms(), pinned);
-        assert_eq!(now_ms(), pinned);
-        assert!(fake_clock_enabled());
+        let clock = ManualClock::new(1_700_000_000_000);
+        let pinned = clock.now_ms();
+        assert_eq!(clock.now_ms(), pinned);
+        assert_eq!(clock.now_ms(), pinned);
 
         // Advancing is the only thing that moves it, by exactly the delta.
-        assert_eq!(advance_fake_clock(1_500), pinned + 1_500);
-        assert_eq!(now_ms(), pinned + 1_500);
+        assert_eq!(clock.advance(1_500), pinned + 1_500);
+        assert_eq!(clock.now_ms(), pinned + 1_500);
+    }
+
+    #[test]
+    fn two_clocks_do_not_share_time() {
+        // The reason the clock is owned by the service: parallel tests each get
+        // their own, so one test's advance cannot move another's deadline.
+        let a = ManualClock::new(1_000);
+        let b = ManualClock::new(2_000);
+        a.advance(500);
+        assert_eq!(a.now_ms(), 1_500);
+        assert_eq!(b.now_ms(), 2_000);
+    }
+
+    #[test]
+    fn the_system_clock_moves_on_its_own() {
+        // Only asserts the epoch is sane: the point is that production reads a
+        // real clock rather than a frozen one.
+        let now = SystemClock.now_ms();
+        assert!(now > 1_600_000_000_000, "system clock looks unset: {now}");
     }
 }

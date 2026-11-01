@@ -55,10 +55,10 @@ fn main() -> std::process::ExitCode {
         return std::process::ExitCode::from(2);
     }
 
-    // Loaded before dispatch, not inside `run`: Python read `.env` when its
-    // config module was imported, so `doctor` and `healthcheck` saw the same
-    // settings the bot would. A host that already set a real environment
-    // variable still wins -- dotenvy never overrides.
+    // Loaded before dispatch, not inside `run`: the retired Python bot read
+    // `.env` when its config module was imported, so `doctor` and `healthcheck`
+    // saw the same settings the bot would. A host that already set a real
+    // environment variable still wins -- dotenvy never overrides.
     gwbot_core::load_dotenv();
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()

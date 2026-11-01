@@ -10,20 +10,27 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: bot
+        working-directory: rust
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: "3.14"
-          cache: pip
-          cache-dependency-path: bot/pyproject.toml
-      - name: Install bot dependencies
-        run: pip install -e ".[turso,dev]"
-      - name: Run bot test suite
-        run: python -m unittest discover -s tests -t .
-      - name: Run ruff
-        run: python -m ruff check .
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # rusqlite's bundled SQLite (the testkit's local database) compiles a
+      # small amount of C, so the runner needs a linker and pkg-config.
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends build-essential pkg-config
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run test suite
+        run: cargo test --workspace
+      - name: Build release binary
+        run: cargo build --release -p gwbot-cli --locked
 
   dashboard:
     name: dashboard smoke

@@ -6,7 +6,7 @@
 //! of data loss. The only local backend is [`Database::in_memory`], used by
 //! tests and the JSON harness.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -354,9 +354,36 @@ struct Stats {
     writes: AtomicU64,
     read_us: AtomicU64,
     write_us: AtomicU64,
+    /// Statements are captured only while a caller asked for them: one relaxed
+    /// load per statement otherwise, so the counters stay free in production.
+    logging: AtomicBool,
+    log: StdMutex<Vec<String>>,
+    /// Injected failures, same gate trick as `logging`: one relaxed load per
+    /// statement when no test asked for them, so production pays nothing.
+    failing: AtomicBool,
+    fail_marker: StdMutex<Option<String>>,
+    /// How many matching statements to let through before the failure starts.
+    /// A partial-flush test needs the second chunk to fail, not the first.
+    fail_skip: AtomicU64,
 }
 
 impl Stats {
+    fn record_sql(&self, sql: &str) {
+        if !self.logging.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Ok(mut log) = self.log.lock() {
+            log.push(sql.to_string());
+        }
+    }
+
+    fn take_sql(&self) -> Vec<String> {
+        match self.log.lock() {
+            Ok(mut log) => std::mem::take(&mut *log),
+            Err(_) => Vec::new(),
+        }
+    }
+
     fn record(&self, write: bool, elapsed: Duration) {
         let us = elapsed.as_micros().min(u64::MAX as u128) as u64;
         if write {
@@ -382,6 +409,43 @@ impl Stats {
         self.writes.store(0, Ordering::Relaxed);
         self.read_us.store(0, Ordering::Relaxed);
         self.write_us.store(0, Ordering::Relaxed);
+    }
+
+    fn start_logging(&self) {
+        self.take_sql();
+        self.logging.store(true, Ordering::Relaxed);
+    }
+
+    /// The marker whose statement must fail, if one was injected.
+    fn injected_failure(&self, sql: &str) -> Option<String> {
+        if !self.failing.load(Ordering::Relaxed) {
+            return None;
+        }
+        let marker = self.fail_marker.lock().ok()?;
+        let marker = marker.as_deref()?;
+        if !sql.contains(marker) {
+            return None;
+        }
+        // `fail_skip` lets the first N matching statements through, so a batch
+        // write can be made to fail half way instead of at its head.
+        let skip = self.fail_skip.load(Ordering::Relaxed);
+        if skip > 0 {
+            self.fail_skip.store(skip - 1, Ordering::Relaxed);
+            return None;
+        }
+        Some(marker.to_string())
+    }
+
+    fn start_failing(&self, marker: &str, skip: u64) {
+        if let Ok(mut slot) = self.fail_marker.lock() {
+            *slot = Some(marker.to_string());
+            self.fail_skip.store(skip, Ordering::Relaxed);
+            self.failing.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn stop_failing(&self) {
+        self.failing.store(false, Ordering::Relaxed);
     }
 }
 
@@ -653,6 +717,10 @@ impl Database {
     ///   short backoff. Anything else is returned untouched.
     pub async fn execute(&self, sql: &str, params: &[SqlValue]) -> Result<u64> {
         let write = is_write(sql);
+        self.stats.record_sql(sql);
+        if let Some(marker) = self.stats.injected_failure(sql) {
+            bail!("injected database failure: {marker}");
+        }
         let mut last_error: Option<anyhow::Error> = None;
         for attempt in 0..6u32 {
             let start = Instant::now();
@@ -700,6 +768,10 @@ impl Database {
     /// Every statement `query` runs is a read, so replaying is safe whether the
     /// server never saw it or the rows were lost in transit.
     pub async fn query(&self, sql: &str, params: &[SqlValue]) -> Result<Vec<Row>> {
+        self.stats.record_sql(sql);
+        if let Some(marker) = self.stats.injected_failure(sql) {
+            bail!("injected database failure: {marker}");
+        }
         let mut last_error: Option<anyhow::Error> = None;
         for _ in 0..3 {
             let start = Instant::now();
@@ -879,6 +951,45 @@ impl Database {
 
     pub fn reset_stats(&self) {
         self.stats.reset();
+    }
+
+    /// Capture every statement from here on (tests only).
+    ///
+    /// The Python suite proved read budgets by wrapping `db.query`; there is no
+    /// monkeypatching here, so the same evidence comes from the database's own
+    /// statement log. Off unless a caller asks for it.
+    pub fn log_queries(&self) {
+        self.stats.start_logging();
+    }
+
+    /// Statements captured since the last take, clearing the buffer.
+    pub fn take_query_log(&self) -> Vec<String> {
+        self.stats.take_sql()
+    }
+
+    /// Make every statement containing `marker` fail until [`Self::clear_failures`].
+    ///
+    /// The Python suite reached into the connection object and monkeypatched
+    /// `execute`/`query` to raise on one particular statement. Rust has no
+    /// monkeypatching, so the same failure is injected at the one place every
+    /// caller funnels through. Off by default, and only matching statements
+    /// fail, so a test can break exactly one read and leave the rest working.
+    pub fn fail_matching(&self, marker: &str) {
+        self.stats.start_failing(marker, 0);
+    }
+
+    /// Like [`Self::fail_matching`], but lets the first `skip` matching
+    /// statements through.
+    ///
+    /// A chunked batch write sends the same statement once per chunk, so
+    /// "fail the second chunk" needs a countdown rather than a different
+    /// marker.
+    pub fn fail_matching_after(&self, marker: &str, skip: u64) {
+        self.stats.start_failing(marker, skip);
+    }
+
+    pub fn clear_failures(&self) {
+        self.stats.stop_failing();
     }
 
     /// Close every pooled connection. For shutdown.

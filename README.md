@@ -3,10 +3,11 @@
 A standalone Discord giveaway bot written in Rust, with a read-only web dashboard
 over the same database. MIT licensed.
 
-Python is no longer part of the product. It survives only as the automated
-black-box test client: `tests/` starts the compiled harness binary and drives the
-real Rust service over a JSON-line protocol. The original Python bot under `bot/`
-is kept as a behavioural reference and is never deployed.
+The whole product is Rust: one binary, one typed service layer, and an in-process
+Rust test suite that exercises the real service against a real SQLite database.
+There is no Python runtime, no interpreter dependency and no separate test client
+to build. The original Python implementation the port was checked against has been
+removed; the behaviour it specified now lives in Rust and is pinned by the tests.
 
 **Why Rust:** one binary, no interpreter or virtualenv on the host, a footprint
 that fits Render's free web-service tier, and a single typed service layer where
@@ -25,7 +26,6 @@ the giveaway rules cannot drift between handlers.
 - [Testing](#testing)
 - [Dashboard](#dashboard)
 - [Deployment](#deployment)
-- [Python's role](#pythons-role)
 - [License](#license)
 
 ---
@@ -40,12 +40,9 @@ the giveaway rules cannot drift between handlers.
 │   │   │                       components, Redis cache, health server
 │   │   ├── gwbot-discord/      serenity gateway: commands, buttons, tick loops
 │   │   ├── gwbot-cli/          the `giveaway-bot` binary (run/doctor/healthcheck)
-│   │   └── gwbot-harness/      JSON-line driver used by the Python suite
+│   │   └── gwbot-testkit/      in-process test harness and shared fixtures
 │   └── README.md               workspace-internal notes
-├── tests/                      Python black-box suite (test-only, no credentials)
-├── bot/                        original Python bot — reference only, not deployed
 ├── dashboard/                  read-only site + Vercel Node 20 API
-├── app.py                      root launcher that execs the built binary
 ├── Dockerfile                  multi-stage Rust image (deployed to Render)
 ├── render.yaml                 Render blueprint: bot web service
 ├── docker-compose.yml          local container run
@@ -208,12 +205,14 @@ own permission bits, with no cache round-trip.
 | `gwbot-core` | Everything framework-neutral: settings, storage, rules, embeds, buttons, cache, health |
 | `gwbot-discord` | serenity gateway wiring only — it translates events into service calls |
 | `gwbot-cli` | The `giveaway-bot` binary: `run`, `doctor`, `healthcheck` |
-| `gwbot-harness` | A JSON-line driver over the same service, used by the Python tests |
+| `gwbot-testkit` | The in-process harness and shared fixtures every integration test drives |
 
 The dependency direction is one-way: `gwbot-discord` and `gwbot-cli` depend on
-`gwbot-core`, never the reverse. Embeds and buttons are plain structs in
-`gwbot-core` (`Embed`, `ButtonSpec`); `gwbot-discord::convert` is the only place
-that knows about serenity's types.
+`gwbot-core`, never the reverse, and `gwbot-testkit` depends on `gwbot-core`
+alone — it is a dev-only crate and nothing it contains reaches a deployed
+binary. Embeds and buttons are plain structs in `gwbot-core` (`Embed`,
+`ButtonSpec`); `gwbot-discord::convert` is the only place that knows about
+serenity's types.
 
 ### The service layer
 
@@ -250,8 +249,8 @@ Indexes cover the queries that actually run: `(status, ends_at)`,
 giveaway ends; the final entrant count is stored on the giveaway row, so the
 dashboard keeps its numbers after the entries are gone.
 
-`rusqlite` (bundled SQLite) exists **only** for the test oracle and the harness.
-It is never reachable from the production path.
+`rusqlite` (bundled SQLite) exists **only** for the test suite. It is never
+reachable from the production path.
 
 ### Cache
 
@@ -285,9 +284,9 @@ Per-tick work is bounded and rate-limited:
 
 ## Quick start
 
-Requires Rust 1.80+. A C linker is needed for the bundled SQLite that the test
-oracle and the harness link: `gcc`/`cc` on Linux, MSVC Build Tools or a mingw-w64
-toolchain on Windows.
+Requires Rust 1.80+. A C linker is needed for the bundled SQLite the test suite
+links: `gcc`/`cc` on Linux, MSVC Build Tools or a mingw-w64 toolchain on Windows.
+The deployed binary does not use it — Turso is remote.
 
 ```bash
 # from rust/
@@ -298,11 +297,6 @@ cp .env.example .env          # then fill in the token and Turso credentials
 ./rust/target/release/giveaway-bot doctor    # validate configuration
 ./rust/target/release/giveaway-bot run       # start the bot
 ```
-
-`app.py` is only a launcher: it locates the built binary and `exec`s it (on
-POSIX) or hands over to it (on Windows, where `execv` would lose the exit code),
-so a host that can only start a Python file still works. Nothing about the bot
-runs in Python.
 
 ### The `giveaway-bot` binary
 
@@ -357,45 +351,47 @@ manages.
 
 ## Testing
 
-Three independent suites, none of which needs a Discord token, network access or
-a Turso account.
+Two suites, neither of which needs a Discord token, network access or a Turso
+account: the Rust tests run against a temporary local SQLite database, and the
+dashboard preview mocks its API.
 
 ```bash
-# Rust unit and integration tests — from rust/
+# Rust: unit tests plus the in-process integration suite — from rust/
 cargo test --workspace
 cargo clippy --workspace --all-targets     # must be warning-free
 cargo fmt --all -- --check
-
-# Python black-box suite — from the repo root, after building the harness
-cargo build -p gwbot-harness --manifest-path rust/Cargo.toml
-python -m unittest discover -s tests -t .
 
 # Dashboard helpers and card shape — from dashboard/
 node smoke.js
 ```
 
-### What the Python suite covers
+`cargo test --workspace` is the only test entry point. There is no separate
+black-box client to build first.
 
-`tests/` starts the compiled `gwbot-harness` binary and drives the real Rust
-service against an in-memory SQLite database, over a JSON-line protocol. It is a
-black box: it cannot reach inside the service, only send operations and inspect
-the resulting database state.
+### What `cargo test --workspace` covers
 
-| Module | Focus |
+`gwbot-testkit` is the harness. It builds the real service over a temporary
+SQLite database and hands a test the fixtures it needs — guilds, members, a fake
+clock — so a test can assert on stored state rather than trusting the service to
+report on itself. Nothing is spawned and no protocol is serialised: the tests
+call the same code the bot calls.
+
+| Test file | Focus |
 | --- | --- |
-| `test_schema.py` | Table/column/index shape, `SCHEMA_VERSION`, migration behaviour |
-| `test_service.py` | Create/join/leave/end/reroll/cancel/extend, validation order, error text |
-| `test_fairness.py` | Uniform winner selection, no duplicates, entrant-set invariants |
-| `test_concurrency.py` | Racing joins, double draws, duplicate clicks, claim races |
-| `test_recovery.py` | Restart mid-draw, partial flush, due giveaways after downtime |
-| `test_load.py` | Bulk entry and draw smoke test |
+| `schema.rs` | Table/column/index shape, `SCHEMA_VERSION`, migration behaviour |
+| `service.rs` | Create/join/leave/end/reroll/cancel/extend, validation order, error text |
+| `fairness.rs` | Uniform winner selection, no duplicates, entrant-set invariants |
+| `concurrency.rs` | Racing joins, double draws, duplicate clicks, claim races |
+| `recovery.rs` | Restart mid-draw, partial flush, due giveaways after downtime |
+| `load.rs` | Bulk entry and draw smoke test |
+| `legacy_*.rs` | Per-module coverage carried over from the retired Python suite (config, storage, embeds, cache, service) |
+| `gwbot-discord/src/bot/tests*.rs` | Gateway behaviour: command wiring, click paths, panel paging, announcements, login retry, shutdown. In-crate because a `Context` only exists inside serenity's dispatch |
 
-Winner selection cannot match Python bit-for-bit, so parity is asserted on
-database state and fairness invariants — never on a specific winner.
+Winner selection cannot match the retired Python bot bit-for-bit, so parity is
+asserted on database state and fairness invariants — never on a specific winner.
 
-The harness protocol is documented by its own op list in
-`rust/crates/gwbot-harness/src/main.rs`, which is the authority for argument
-names; `tests/harness.py` is the Python client for it.
+The fixtures live in `rust/crates/gwbot-testkit/src/`, which is the authority for
+how a test sets a scenario up.
 
 ---
 
@@ -491,22 +487,13 @@ migration run automatically on first connect, and are idempotent.
 
 ---
 
-## Python's role
+## Port history
 
-Python is **test-only**. `tests/` is the only Python that ships as part of the
-workflow; it is a black-box client for the Rust binary and is not imported by the
-bot.
-
-The `bot/` tree is the original Python implementation, kept because it is the
-behavioural specification the Rust port was checked against. It is not built, not
-deployed and not part of the runtime path, but it is kept runnable for reference:
-
-```bash
-cd bot
-python -m unittest discover -s tests -t .
-```
-
-Do not add features there. Changes belong in `rust/`.
+This bot was ported from a Python implementation that has since been removed. Its
+behaviour, storage schema, dashboard contract and fairness rules were carried over
+unchanged, and the Rust suite pins them: parity is asserted on database state and
+fairness invariants, never on a specific winner, because winner selection cannot
+match the old generator bit-for-bit.
 
 ---
 

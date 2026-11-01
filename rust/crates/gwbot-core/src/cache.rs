@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use redis::aio::ConnectionManager;
 use regex::Regex;
 use serde_json::{json, Value as Json};
@@ -76,6 +77,62 @@ pub fn scrub(text: &str) -> String {
     clean.chars().take(160).collect()
 }
 
+/// Time source for the budget and the breaker.
+///
+/// Production reads `Instant::now`; a test advances a [`ManualCacheClock`]
+/// instead of sleeping, so budget refill and breaker cooldown are deterministic.
+pub trait CacheClock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SystemCacheClock;
+
+impl CacheClock for SystemCacheClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+/// A clock that only moves when a test moves it.
+pub struct ManualCacheClock {
+    base: Instant,
+    offset: std::sync::Mutex<Duration>,
+}
+
+impl ManualCacheClock {
+    pub fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            offset: std::sync::Mutex::new(Duration::ZERO),
+        }
+    }
+
+    pub fn advance(&self, seconds: f64) {
+        let mut offset = self
+            .offset
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *offset += Duration::from_secs_f64(seconds.max(0.0));
+    }
+}
+
+impl Default for ManualCacheClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CacheClock for ManualCacheClock {
+    fn now(&self) -> Instant {
+        self.base
+            + *self
+                .offset
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// Token bucket: refills at a fixed rate, refuses (never queues) over cap.
 ///
 /// Refusing is the point. Queueing would just move the burst into the future
@@ -107,8 +164,8 @@ impl Budget {
         }
     }
 
-    fn take(&mut self) -> bool {
-        let now = Instant::now();
+    /// The same rule with the instant supplied, so a test can move time.
+    fn take_at(&mut self, now: Instant) -> bool {
         let elapsed = now.duration_since(self.stamp).as_secs_f64();
         if elapsed > 0.0 {
             self.tokens = self.capacity.min(self.tokens + elapsed * self.rate);
@@ -175,10 +232,124 @@ struct Inner {
     max_connections: usize,
     breaker_threshold: u32,
     breaker_cooldown: f64,
-    client: Mutex<Option<ConnectionManager>>,
+    clock: std::sync::Arc<dyn CacheClock>,
+    driver: Mutex<Option<std::sync::Arc<dyn Driver>>>,
     budget: Mutex<Budget>,
     breaker: Mutex<Breaker>,
     counters: Mutex<Counters>,
+}
+
+/// The handful of Redis commands this cache needs, behind a trait.
+///
+/// Production uses [`LiveDriver`] over a managed connection. Tests inject a
+/// fake, so the cache's own behaviour -- budget, breaker, key namespacing, the
+/// EVAL fallback -- is exercised without a server, which is exactly what the
+/// Python suite did with a fake async client.
+#[async_trait]
+pub trait Driver: Send + Sync {
+    async fn ping(&self) -> Result<(), String>;
+    async fn get(&self, key: &str) -> Result<Option<String>, String>;
+    /// `SET key value [NX] PX millis`. `None` means NX found the key present.
+    async fn set(
+        &self,
+        key: &str,
+        value: &str,
+        millis: i64,
+        nx: bool,
+    ) -> Result<Option<String>, String>;
+    async fn del(&self, keys: &[String]) -> Result<i64, String>;
+    /// `EVAL script 1 key... arg...`, returning the integer reply.
+    async fn eval(&self, script: &str, keys: &[String], args: &[String]) -> Result<i64, String>;
+    async fn incr(&self, key: &str) -> Result<i64, String>;
+    async fn pexpire(&self, key: &str, millis: i64) -> Result<i64, String>;
+}
+
+/// The real driver: a managed Redis connection.
+struct LiveDriver {
+    conn: ConnectionManager,
+}
+
+#[async_trait]
+impl Driver for LiveDriver {
+    async fn ping(&self) -> Result<(), String> {
+        let mut conn = self.conn.clone();
+        redis::cmd("PING")
+            .query_async::<String>(&mut conn)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn get(&self, key: &str) -> Result<Option<String>, String> {
+        let mut conn = self.conn.clone();
+        redis::cmd("GET")
+            .arg(key)
+            .query_async::<Option<String>>(&mut conn)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn set(
+        &self,
+        key: &str,
+        value: &str,
+        millis: i64,
+        nx: bool,
+    ) -> Result<Option<String>, String> {
+        let mut conn = self.conn.clone();
+        let mut cmd = redis::cmd("SET");
+        cmd.arg(key).arg(value);
+        if nx {
+            cmd.arg("NX");
+        }
+        cmd.arg("PX").arg(millis);
+        cmd.query_async::<Option<String>>(&mut conn)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn del(&self, keys: &[String]) -> Result<i64, String> {
+        let mut conn = self.conn.clone();
+        redis::cmd("DEL")
+            .arg(keys)
+            .query_async::<i64>(&mut conn)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn eval(&self, script: &str, keys: &[String], args: &[String]) -> Result<i64, String> {
+        let mut conn = self.conn.clone();
+        let mut cmd = redis::cmd("EVAL");
+        cmd.arg(script).arg(keys.len());
+        for key in keys {
+            cmd.arg(key);
+        }
+        for arg in args {
+            cmd.arg(arg);
+        }
+        cmd.query_async::<i64>(&mut conn)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn incr(&self, key: &str) -> Result<i64, String> {
+        let mut conn = self.conn.clone();
+        redis::cmd("INCR")
+            .arg(key)
+            .query_async::<i64>(&mut conn)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn pexpire(&self, key: &str, millis: i64) -> Result<i64, String> {
+        let mut conn = self.conn.clone();
+        redis::cmd("PEXPIRE")
+            .arg(key)
+            .arg(millis)
+            .query_async::<i64>(&mut conn)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Short-TTL cache and lock helper over a managed Redis, degrading always.
@@ -229,7 +400,44 @@ impl RedisCache {
                 max_connections: opts.max_connections.max(1),
                 breaker_threshold: opts.breaker_threshold.max(1),
                 breaker_cooldown: opts.breaker_cooldown.max(0.0),
-                client: Mutex::new(None),
+                clock: std::sync::Arc::new(SystemCacheClock),
+                driver: Mutex::new(None),
+                budget: Mutex::new(Budget::new(opts.op_budget_per_sec)),
+                breaker: Mutex::new(Breaker::default()),
+                counters: Mutex::new(Counters::default()),
+            })),
+            closed: std::sync::Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Build a cache over an injected driver.
+    ///
+    /// Test-only seam: production always reaches Redis through
+    /// [`RedisCache::new`]. A fake driver makes the cache's own behaviour --
+    /// budget, breaker, namespacing, EVAL fallback -- testable without a
+    /// server, the way the Python suite injected a fake async client.
+    pub fn with_driver(driver: std::sync::Arc<dyn Driver>, opts: CacheOptions) -> Self {
+        Self::with_driver_and_clock(driver, opts, std::sync::Arc::new(SystemCacheClock))
+    }
+
+    /// The full test seam: an injected driver and an injected clock.
+    pub fn with_driver_and_clock(
+        driver: std::sync::Arc<dyn Driver>,
+        opts: CacheOptions,
+        clock: std::sync::Arc<dyn CacheClock>,
+    ) -> Self {
+        let prefix = opts.prefix;
+        Self {
+            inner: Some(std::sync::Arc::new(Inner {
+                url: String::new(),
+                prefix,
+                socket_timeout: opts.socket_timeout.max(0.0),
+                connect_timeout: opts.socket_connect_timeout.max(0.0),
+                max_connections: opts.max_connections.max(1),
+                breaker_threshold: opts.breaker_threshold.max(1),
+                breaker_cooldown: opts.breaker_cooldown.max(0.0),
+                clock,
+                driver: Mutex::new(Some(driver)),
                 budget: Mutex::new(Budget::new(opts.op_budget_per_sec)),
                 breaker: Mutex::new(Breaker::default()),
                 counters: Mutex::new(Counters::default()),
@@ -259,7 +467,7 @@ impl RedisCache {
         };
         let mut breaker = inner.breaker.lock().await;
         if let Some(until) = breaker.open_until {
-            if Instant::now() < until {
+            if inner.clock.now() < until {
                 return true;
             }
             // Cooldown elapsed: allow one probe through so a recovered server
@@ -282,14 +490,14 @@ impl RedisCache {
         }
     }
 
-    /// Lazily build the shared client; never opens a socket by itself.
-    async fn connection(&self) -> Option<ConnectionManager> {
+    /// Lazily build the shared driver; never opens a socket by itself.
+    async fn driver(&self) -> Option<std::sync::Arc<dyn Driver>> {
         let inner = self.inner.as_ref()?;
         if self.closed.load(Ordering::Relaxed) {
             return None;
         }
-        if let Some(client) = inner.client.lock().await.clone() {
-            return Some(client);
+        if let Some(driver) = inner.driver.lock().await.clone() {
+            return Some(driver);
         }
         // The manager is built below; opening the client only validates the URL.
         let client = redis::Client::open(inner.url.clone());
@@ -309,9 +517,10 @@ impl RedisCache {
         )
         .await
         {
-            Ok(manager) => {
-                *inner.client.lock().await = Some(manager.clone());
-                Some(manager)
+            Ok(conn) => {
+                let driver: std::sync::Arc<dyn Driver> = std::sync::Arc::new(LiveDriver { conn });
+                *inner.driver.lock().await = Some(driver.clone());
+                Some(driver)
             }
             Err(e) => {
                 self.record_failure(&e.to_string()).await;
@@ -325,16 +534,16 @@ impl RedisCache {
         if !self.available().await {
             return false;
         }
-        self.op(|mut conn| async move { redis::cmd("PING").query_async::<String>(&mut conn).await })
+        self.op(|driver| async move { driver.ping().await })
             .await
             .is_some()
     }
 
-    /// Disconnect the shared client. Safe to call twice, or never started.
+    /// Disconnect the shared driver. Safe to call twice, or never started.
     pub async fn aclose(&self) {
         self.closed.store(true, Ordering::Relaxed);
         if let Some(inner) = &self.inner {
-            *inner.client.lock().await = None;
+            *inner.driver.lock().await = None;
             let mut breaker = inner.breaker.lock().await;
             breaker.open_until = None;
         }
@@ -348,8 +557,8 @@ impl RedisCache {
     /// sees a miss and reads Turso instead.
     async fn op<T, F, Fut>(&self, make: F) -> Option<T>
     where
-        F: FnOnce(ConnectionManager) -> Fut,
-        Fut: std::future::Future<Output = redis::RedisResult<T>>,
+        F: FnOnce(std::sync::Arc<dyn Driver>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, String>>,
     {
         if !self.available().await {
             self.bump_skipped().await;
@@ -359,25 +568,25 @@ impl RedisCache {
             self.bump_skipped().await;
             return None;
         };
-        if !inner.budget.lock().await.take() {
+        if !inner.budget.lock().await.take_at(inner.clock.now()) {
             // Over the plan's ops/sec: skip without touching the network.
             self.bump_skipped().await;
             return None;
         }
-        let Some(conn) = self.connection().await else {
+        let Some(driver) = self.driver().await else {
             // No driver, malformed URL, or a client already closed: every
             // caller treats this exactly like a miss.
             self.bump_skipped().await;
             return None;
         };
         inner.counters.lock().await.attempted += 1;
-        match tokio::time::timeout(self.timeout(), make(conn)).await {
+        match tokio::time::timeout(self.timeout(), make(driver)).await {
             Ok(Ok(value)) => {
                 self.record_success().await;
                 Some(value)
             }
             Ok(Err(e)) => {
-                self.record_failure(&e.to_string()).await;
+                self.record_failure(&e).await;
                 None
             }
             Err(_) => {
@@ -414,7 +623,7 @@ impl RedisCache {
         breaker.fail_streak += 1;
         if breaker.fail_streak >= inner.breaker_threshold {
             breaker.open_until =
-                Some(Instant::now() + Duration::from_secs_f64(inner.breaker_cooldown));
+                Some(inner.clock.now() + Duration::from_secs_f64(inner.breaker_cooldown));
             if !breaker.warned {
                 // Exactly one warning per outage episode: a dead Redis must not
                 // fill the log with thousands of identical lines.
@@ -460,12 +669,7 @@ impl RedisCache {
     pub async fn get(&self, key: &str) -> Option<String> {
         let name = self.key(key);
         let value = self
-            .op(move |mut conn| async move {
-                redis::cmd("GET")
-                    .arg(name)
-                    .query_async::<Option<String>>(&mut conn)
-                    .await
-            })
+            .op(move |driver| async move { driver.get(&name).await })
             .await
             .flatten();
         match &value {
@@ -479,18 +683,10 @@ impl RedisCache {
         let name = self.key(key);
         let value = value.to_string();
         let millis = ttl_millis(ttl);
-        self.op(move |mut conn| async move {
-            redis::cmd("SET")
-                .arg(name)
-                .arg(value)
-                .arg("PX")
-                .arg(millis)
-                .query_async::<Option<String>>(&mut conn)
-                .await
-        })
-        .await
-        .flatten()
-        .is_some()
+        self.op(move |driver| async move { driver.set(&name, &value, millis, false).await })
+            .await
+            .flatten()
+            .is_some()
     }
 
     pub async fn delete(&self, keys: &[&str]) -> i64 {
@@ -498,14 +694,9 @@ impl RedisCache {
             return 0;
         }
         let names: Vec<String> = keys.iter().map(|k| self.key(k)).collect();
-        self.op(move |mut conn| async move {
-            redis::cmd("DEL")
-                .arg(names)
-                .query_async::<i64>(&mut conn)
-                .await
-        })
-        .await
-        .unwrap_or(0)
+        self.op(move |driver| async move { driver.del(&names).await })
+            .await
+            .unwrap_or(0)
     }
 
     pub async fn get_json(&self, key: &str) -> Option<Json> {
@@ -537,30 +728,18 @@ impl RedisCache {
     pub async fn incr_with_ttl(&self, key: &str, ttl: f64) -> Option<i64> {
         let name = self.key(key);
         let millis = ttl_millis(ttl);
-        self.op(move |mut conn| async move {
-            match redis::cmd("EVAL")
-                .arg(INCR_TTL_SCRIPT)
-                .arg(1)
-                .arg(&name)
-                .arg(millis)
-                .query_async::<i64>(&mut conn)
-                .await
-            {
+        self.op(move |driver| async move {
+            let keys = [name.clone()];
+            let args = [millis.to_string()];
+            match driver.eval(INCR_TTL_SCRIPT, &keys, &args).await {
                 Ok(value) => Ok(value),
                 Err(e) => {
                     // A server without EVAL (or with scripting disabled) would
                     // lose every counter, so fall back to two plain commands.
                     // Documented cost: one extra round trip on that path only.
-                    tracing::debug!(
-                        "redis eval unavailable ({}); using incr+pexpire",
-                        scrub(&e.to_string())
-                    );
-                    let value: i64 = redis::cmd("INCR").arg(&name).query_async(&mut conn).await?;
-                    let _: i64 = redis::cmd("PEXPIRE")
-                        .arg(&name)
-                        .arg(millis)
-                        .query_async(&mut conn)
-                        .await?;
+                    tracing::debug!("redis eval unavailable ({}); using incr+pexpire", scrub(&e));
+                    let value = driver.incr(&name).await?;
+                    driver.pexpire(&name, millis).await?;
                     Ok(value)
                 }
             }
@@ -593,16 +772,7 @@ impl RedisCache {
         let millis = ttl_millis(ttl);
         let token_for_call = token.clone();
         let result = self
-            .op(move |mut conn| async move {
-                redis::cmd("SET")
-                    .arg(name)
-                    .arg(token_for_call)
-                    .arg("NX")
-                    .arg("PX")
-                    .arg(millis)
-                    .query_async::<Option<String>>(&mut conn)
-                    .await
-            })
+            .op(move |driver| async move { driver.set(&name, &token_for_call, millis, true).await })
             .await;
         match result {
             // No answer: the caller must decide, not assume the lock is held.
@@ -616,18 +786,10 @@ impl RedisCache {
     pub async fn release(&self, key: &str, token: &str) -> bool {
         let name = self.key(key);
         let token = token.to_string();
-        self.op(move |mut conn| async move {
-            redis::cmd("EVAL")
-                .arg(RELEASE_SCRIPT)
-                .arg(1)
-                .arg(name)
-                .arg(token)
-                .query_async::<i64>(&mut conn)
-                .await
-        })
-        .await
-        .map(|value| value > 0)
-        .unwrap_or(false)
+        self.op(move |driver| async move { driver.eval(RELEASE_SCRIPT, &[name], &[token]).await })
+            .await
+            .map(|value| value > 0)
+            .unwrap_or(false)
     }
 
     // -- diagnostics -----------------------------------------------------
@@ -732,9 +894,9 @@ mod tests {
     #[test]
     fn budget_refuses_instead_of_queueing() {
         let mut budget = Budget::new(1.0);
-        assert!(budget.take());
+        assert!(budget.take_at(Instant::now()));
         // No time has passed, so the bucket is empty and the call is refused.
-        assert!(!budget.take());
+        assert!(!budget.take_at(Instant::now()));
     }
 
     #[test]

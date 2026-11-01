@@ -1,6 +1,6 @@
 //! Gateway wiring: process state, lifecycle, and the helpers every handler shares.
 //!
-//! `bot.py` kept all of this on one 3,200-line `commands.Bot` subclass. Here the
+//! The Python bot kept all of this on one 3,200-line `commands.Bot` subclass. Here the
 //! same surface is split by role:
 //!
 //! - this module owns [`BotState`], the login retry loop, the event handlers and
@@ -46,6 +46,8 @@ use crate::convert;
 mod buttons;
 mod commands;
 mod commands_admin;
+#[cfg(test)]
+mod tests;
 mod tick;
 
 /// Seconds a single database call may run before the caller gives up.
@@ -112,6 +114,154 @@ const LOGIN_RETRY_MAX_WAIT_SECS: u64 = 300;
 
 /// Jitter added to every login retry, so restarts do not stampede together.
 const LOGIN_RETRY_JITTER_SECS: u64 = 5;
+
+/// The gateway intents the bot cannot work without.
+///
+/// `GUILD_MEMBERS` is not optional: the join path reads a clicker's roles and
+/// native timeout state, and the entrants-role grant/revoke needs the member
+/// cache. Without it every role check silently reads "no roles".
+pub(crate) fn build_intents() -> GatewayIntents {
+    GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::GUILD_MEMBERS
+}
+
+/// Whether a message counts towards its author's minimum-messages requirement.
+///
+/// Bots and DMs never do: a bot's chatter is not a member's, and a DM has no
+/// guild to count in. Pulled out of `on_message` because serenity only builds a
+/// `Message` from gateway JSON, so the rule is otherwise untestable.
+fn counts_message(is_bot: bool, guild: Option<&str>) -> bool {
+    !is_bot && guild.is_some()
+}
+
+/// Whether a snapshot may be refreshed into its live message at all.
+///
+/// Checked before the status re-read: an ended/cancelled row, or one that never
+/// got a message id, has no live embed to update, and editing now would
+/// overwrite the winner announcement with a stale countdown.
+fn refresh_allowed(gw: &Giveaway) -> bool {
+    gw.active() && gw.message_id.is_some()
+}
+
+/// Whether the status read immediately before the edit still permits it.
+///
+/// The snapshot can pre-date an `end`/`cancel`, so the decision is made on the
+/// fresh status, not on the one the caller handed in.
+fn refresh_status_allows(status: Option<&str>) -> bool {
+    status == Some("active")
+}
+
+/// Whether a just-granted entrants role must be taken straight back.
+///
+/// The grant is an HTTP round trip; a giveaway can end inside that window. When
+/// the re-read status is anything but `active` the role the member just earned
+/// no longer describes a live giveaway, so it is revoked.
+fn should_revoke_after_grant(live: Option<&str>) -> bool {
+    live != Some("active")
+}
+
+/// The entrant count a refresh renders, reusing the caller's number when it has
+/// one.
+///
+/// The join path has just committed the entry and the count came back with it, so
+/// re-reading it would be a second round trip for a number already in hand. A
+/// failed read renders nothing at all: Python skipped the edit rather than
+/// flashing "0 entrants", so a transient database error freezes the old countdown
+/// instead of erasing the giveaway.
+pub(super) async fn refresh_count(
+    bot: &Bot,
+    gw: &Giveaway,
+    entry_count: Option<i64>,
+) -> Option<i64> {
+    match entry_count {
+        Some(count) => Some(count),
+        None => match bot.service().entry_count_cached(&gw.id).await {
+            Ok(count) => Some(count),
+            Err(err) => {
+                error!("embed refresh failed for {}: {err}", gw.id);
+                None
+            }
+        },
+    }
+}
+
+/// The plain-text body of a winner announcement.
+///
+/// Extracted so the wording is testable without a gateway: it is the only part
+/// of the announcement that is not an embed. `None` when there is nothing to
+/// say (no winners, no notify role, no entrants role).
+fn announce_content(winners: &[String], notify: &str, role_id: Option<&str>) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if !winners.is_empty() {
+        let mentions = winners
+            .iter()
+            .map(|w| format!("<@{w}>"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        parts.push(format!("🎉 {mentions}"));
+    }
+    if !notify.is_empty() {
+        parts.push(format!("{notify} — results are in!"));
+    }
+    if let Some(role_id) = role_id {
+        parts.push(format!("<@&{role_id}> — thanks to everyone who entered!"));
+    } else if winners.is_empty() {
+        parts.push("No valid entries — no winners this time.".to_string());
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+/// One side effect of a winner announcement, in the order it is attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AnnounceStep {
+    /// Repaint the live giveaway message with the winner embed.
+    Edit,
+    /// Reply to the live message, so the ping threads under the giveaway.
+    Reply,
+    /// Post a brand-new message (a reroll, or nothing live to repaint).
+    Post,
+}
+
+/// Which steps a winner announcement takes.
+///
+/// A reroll always posts: the original result belongs to the winners it already
+/// named, and editing it would erase them. Otherwise a giveaway that still has
+/// its message is edited in place and the ping replied underneath. The closing
+/// `Post` of the non-reroll list is the fallback the caller uses when the edit
+/// fails — a deleted message must not swallow the draw.
+pub(super) fn announce_steps(has_message_id: bool, reroll: bool) -> &'static [AnnounceStep] {
+    const EDIT_THEN_REPLY: &[AnnounceStep] =
+        &[AnnounceStep::Edit, AnnounceStep::Reply, AnnounceStep::Post];
+    const POST_ONLY: &[AnnounceStep] = &[AnnounceStep::Post];
+    if has_message_id && !reroll {
+        EDIT_THEN_REPLY
+    } else {
+        POST_ONLY
+    }
+}
+
+/// `(everyone, users, roles)` for the announcement and cancellation posts.
+///
+/// The bot never pings `@everyone` itself; winners are mentioned by id and the
+/// notify/entrants roles are pinged explicitly.
+pub(super) fn announce_mentions() -> (bool, bool, bool) {
+    (false, true, true)
+}
+
+/// The title of the announcement embed.
+///
+/// A reroll posts a fresh message, so it needs its own title: the original
+/// result belongs to the winners it already named and must not be relabelled.
+pub(super) fn announce_title(reroll: bool) -> &'static str {
+    if reroll {
+        "Giveaway Rerolled"
+    } else {
+        "Giveaway Ended"
+    }
+}
 
 /// A page of the ephemeral participant/timeout-ban list.
 ///
@@ -298,8 +448,16 @@ impl Bot {
     /// could not be reused. Here a fresh serenity `Client` is built per attempt
     /// while the shared [`BotState`] (database, cache, latches) persists.
     async fn login_loop(&self) -> Result<()> {
-        let intents =
-            GatewayIntents::GUILDS | GatewayIntents::GUILD_MESSAGES | GatewayIntents::GUILD_MEMBERS;
+        let intents = build_intents();
+        // One listener for the whole retry loop. A stop that arrives during a
+        // backoff has to end the loop, not be waited out and retried: Python's
+        // `amain` slept first and only then re-checked its shutdown task, which
+        // could park a deploy behind a 300s sleep.
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let listener = tokio::spawn(async move {
+            shutdown_signal().await;
+            let _ = stop_tx.send(true);
+        });
         let mut attempt: usize = 0;
         loop {
             attempt += 1;
@@ -312,7 +470,13 @@ impl Bot {
                     warn!("could not build the Discord client: {err}");
                     self.set_health(&format!("retrying-{attempt}"), "rate-limited")
                         .await;
-                    tokio::time::sleep(retry_wait(attempt, None)).await;
+                    if wait_or_stop(retry_wait(attempt, None), &mut stop_rx).await {
+                        // A stop during the cooldown resolves as a clean stop and
+                        // leaves /ready reporting the cooldown it was in, which
+                        // is exactly what Python's amain did.
+                        listener.abort();
+                        return Ok(());
+                    }
                     continue;
                 }
             };
@@ -335,6 +499,7 @@ impl Bot {
                         Ok(Err(err)) => {
                             if is_fatal_login(&err) {
                                 self.set_health("online", "auth-failed").await;
+                                listener.abort();
                                 return Err(err.into());
                             }
                             warn!("Discord login failed: {}", login_summary(&err));
@@ -343,13 +508,17 @@ impl Bot {
                     }
                     self.set_health(&format!("retrying-{attempt}"), "rate-limited")
                         .await;
-                    tokio::time::sleep(retry_wait(attempt, None)).await;
+                    if wait_or_stop(retry_wait(attempt, None), &mut stop_rx).await {
+                        listener.abort();
+                        return Ok(());
+                    }
                 }
-                _ = shutdown_signal() => {
+                _ = stop_rx.changed() => {
                     info!("shutdown requested; closing the gateway");
                     shard_manager.shutdown_all().await;
                     handle.abort();
                     self.set_health("online", "stopped").await;
+                    listener.abort();
                     return Ok(());
                 }
             }
@@ -597,7 +766,7 @@ impl Bot {
         entry_count: Option<i64>,
         live_status: Option<&str>,
     ) -> Option<String> {
-        if !gw.active() || gw.message_id.is_none() {
+        if !refresh_allowed(gw) {
             return None;
         }
         let status = match live_status {
@@ -610,7 +779,7 @@ impl Bot {
                 }
             },
         };
-        if status.as_deref() != Some("active") {
+        if !refresh_status_allows(status.as_deref()) {
             return status;
         }
         let (Some(channel_id), Some(message_id)) = (
@@ -628,19 +797,7 @@ impl Bot {
         if !is_text {
             return None;
         }
-        let count = match entry_count {
-            Some(count) => count,
-            None => match self.service().entry_count_cached(&gw.id).await {
-                Ok(count) => count,
-                // A failed count must not be rendered as "0 entrants": Python
-                // skipped the edit entirely, so a transient database error froze
-                // the old countdown rather than flashing an empty giveaway.
-                Err(err) => {
-                    error!("embed refresh failed for {}: {err}", gw.id);
-                    return None;
-                }
-            },
-        };
+        let count = refresh_count(self, gw, entry_count).await?;
         let embed = embeds::giveaway_embed(gw, count, self.state.settings.embed_color);
         let rows = convert::to_action_rows(&components::giveaway_buttons(
             &gw.id,
@@ -888,7 +1045,7 @@ impl Bot {
                 }
             },
         };
-        if live.as_deref() != Some("active") {
+        if should_revoke_after_grant(live.as_deref()) {
             let _ = ctx
                 .http
                 .remove_member_role(
@@ -1063,74 +1220,61 @@ impl Bot {
             claim_deadline_ms,
             (!claim_deadlines.is_empty()).then_some(&claim_deadlines),
         );
-        if reroll {
-            embed.title = "Giveaway Rerolled".to_string();
-        }
+        // `winner_embed` renders the ended title; a reroll overrides it so the
+        // fresh post cannot be mistaken for the original draw.
+        embed.title = announce_title(reroll).to_string();
 
-        let mut parts: Vec<String> = Vec::new();
-        if !winners.is_empty() {
-            let mentions = winners
-                .iter()
-                .map(|w| format!("<@{w}>"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            parts.push(format!("🎉 {mentions}"));
-        }
         let notify = self.notify_mention_for(cache, &gw.guild_id).await;
-        if !notify.is_empty() {
-            parts.push(format!("{notify} — results are in!"));
-        }
-        if let Some(role_id) = self.entrants_role(cache, gw) {
-            parts.push(format!("<@&{role_id}> — thanks to everyone who entered!"));
-        } else if winners.is_empty() {
-            parts.push("No valid entries — no winners this time.".to_string());
-        }
-        let content = if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join("\n"))
-        };
+        let role_id = self
+            .entrants_role(cache, gw)
+            .map(|role_id| role_id.to_string());
+        let content = announce_content(winners, &notify, role_id.as_deref());
 
         let components: Vec<CreateActionRow> = if claim_deadlines.is_empty() {
             Vec::new()
         } else {
             convert::to_action_rows(&components::claim_buttons(&gw.id))
         };
+        let (everyone, users, roles) = announce_mentions();
         let allowed = CreateAllowedMentions::new()
-            .everyone(false)
-            .all_users(true)
-            .all_roles(true);
+            .everyone(everyone)
+            .all_users(users)
+            .all_roles(roles);
         let create_embed = convert::to_create_embed(&embed);
+        let steps = announce_steps(gw.message_id.is_some(), reroll);
 
-        if let (Some(message_id), false) = (
-            gw.message_id
+        if steps.contains(&AnnounceStep::Edit) {
+            if let Some(message_id) = gw
+                .message_id
                 .as_deref()
                 .and_then(snowflake)
-                .map(MessageId::new),
-            reroll,
-        ) {
-            let edited = channel_id
-                .edit_message(
-                    handles,
-                    message_id,
-                    EditMessage::new()
-                        .embed(create_embed.clone())
-                        .components(components.clone()),
-                )
-                .await;
-            if edited.is_ok() {
-                if let Some(text) = content {
-                    let _ = channel_id
-                        .send_message(
-                            handles,
-                            CreateMessage::new()
-                                .content(text)
-                                .reference_message((channel_id, message_id))
-                                .allowed_mentions(allowed),
-                        )
-                        .await;
+                .map(MessageId::new)
+            {
+                let edited = channel_id
+                    .edit_message(
+                        handles,
+                        message_id,
+                        EditMessage::new()
+                            .embed(create_embed.clone())
+                            .components(components.clone()),
+                    )
+                    .await;
+                if edited.is_ok() {
+                    if steps.contains(&AnnounceStep::Reply) {
+                        if let Some(text) = content {
+                            let _ = channel_id
+                                .send_message(
+                                    handles,
+                                    CreateMessage::new()
+                                        .content(text)
+                                        .reference_message((channel_id, message_id))
+                                        .allowed_mentions(allowed),
+                                )
+                                .await;
+                        }
+                    }
+                    return;
                 }
-                return;
             }
         }
 
@@ -1203,6 +1347,17 @@ impl Bot {
 
     // -- event handlers --------------------------------------------------
 
+    /// Claim the one-time guild-command cleanup for this process.
+    ///
+    /// `ready` can fire again after a reconnect; the guild copies only have to
+    /// be cleared once, and re-clearing them is a wasted HTTP call per guild.
+    fn claim_guild_cleanup(&self) -> bool {
+        !self
+            .state
+            .guild_cmd_cleanup_done
+            .swap(true, Ordering::SeqCst)
+    }
+
     async fn on_ready(&self, ctx: &Context, ready: &Ready) {
         let guilds = ctx.cache.guilds();
         info!("logged in as {} ({} guilds)", ready.user.name, guilds.len());
@@ -1214,11 +1369,7 @@ impl Bot {
                 Err(err) => error!("could not register global commands: {err}"),
             }
         }
-        if !self
-            .state
-            .guild_cmd_cleanup_done
-            .swap(true, Ordering::SeqCst)
-        {
+        if self.claim_guild_cleanup() {
             // aa22c23 mirrored the global tree into every guild for instant
             // visibility, which left two registrations per command. The global
             // tree propagates on its own, so clear the guild copies once.
@@ -1269,22 +1420,32 @@ impl Bot {
 
     /// Count a message towards its author's min-messages requirement.
     async fn on_message(&self, message: &Message) {
-        let (Some(guild_id), false) = (message.guild_id, message.author.bot) else {
+        let guild = message.guild_id.map(|id| id.to_string());
+        if !counts_message(message.author.bot, guild.as_deref()) {
             return;
-        };
-        let key = (guild_id.to_string(), message.author.id.to_string());
-        let overflow = {
-            let Ok(mut guard) = self.state.message_buffer.lock() else {
-                return;
-            };
-            *guard.entry(key).or_insert(0) += 1;
-            guard.len() >= MESSAGE_BUFFER_MAX
-        };
+        }
+        let guild = guild.expect("counts_message checked the guild");
+        let overflow = self.buffer_message(&guild, &message.author.id.to_string());
         if overflow {
             if let Err(err) = self.flush_message_buffer().await {
                 error!("message-count flush failed: {err}");
             }
         }
+    }
+
+    /// Record one message in the buffer; `true` when the buffer hit its cap.
+    ///
+    /// Counting is buffered because a busy guild would otherwise cost one write
+    /// per message. The cap is what bounds that memory, so hitting it triggers
+    /// an early flush instead of growing the map without limit.
+    fn buffer_message(&self, guild: &str, user: &str) -> bool {
+        let Ok(mut guard) = self.state.message_buffer.lock() else {
+            return false;
+        };
+        *guard
+            .entry((guild.to_string(), user.to_string()))
+            .or_insert(0) += 1;
+        guard.len() >= MESSAGE_BUFFER_MAX
     }
 
     async fn on_interaction(&self, ctx: &Context, interaction: Interaction) {
@@ -1348,12 +1509,22 @@ pub async fn run_bot(
     flush_task.abort();
     heartbeat_task.abort();
 
+    shutdown(&bot).await;
+    result
+}
+
+/// Stop cleanly: flush the buffered message counts, then close the pools.
+///
+/// Order matters. The buffer holds counts no tick has committed yet, so it is
+/// drained while the database is still open — closing first would drop them.
+/// `discord.py` did this in `GiveawayBot.close()`; here it is one function so a
+/// test can drive it without a gateway.
+async fn shutdown(bot: &Bot) {
     if let Err(err) = bot.flush_message_buffer().await {
         warn!("final message-count flush failed: {err}");
     }
     bot.service().db().close().await;
     bot.state.redis.aclose().await;
-    result
 }
 
 // -- free helpers --------------------------------------------------------
@@ -1432,17 +1603,70 @@ fn is_fatal_login(err: &serenity::Error) -> bool {
     )
 }
 
+/// Flatten a login error body into one safe log line.
+///
+/// Cloudflare 1015 pages are kilobytes of HTML, so only the head is kept. The
+/// `Ray ID:` token is pulled forward when it would otherwise fall past the clip:
+/// it is the one thing support can act on, so it must survive.
+fn flatten_login_text(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let ray = match flat.find("Ray ID:") {
+        Some(at) => {
+            let token: String = flat[at + "Ray ID:".len()..]
+                .trim_start()
+                .chars()
+                .take_while(|ch| !ch.is_whitespace())
+                .collect();
+            if token.is_empty() {
+                String::new()
+            } else {
+                format!("Ray ID: {token}")
+            }
+        }
+        None => String::new(),
+    };
+    let head: String = flat.chars().take(260).collect();
+    if ray.is_empty() || head.contains("Ray ID:") {
+        return head;
+    }
+    let room = 260usize.saturating_sub(ray.chars().count() + 3);
+    let head: String = flat.chars().take(room).collect();
+    format!("{head} :: {ray}")
+}
+
 /// Flatten a login error into one log line, keeping the Discord status.
 fn login_summary(err: &serenity::Error) -> String {
     let text = match err {
         serenity::Error::Gateway(gateway) => format!("{gateway:?}"),
         other => format!("{other:?}"),
     };
-    let mut flat = text.replace('\n', " ");
-    if flat.chars().count() > 160 {
-        flat = flat.chars().take(160).collect();
+    flatten_login_text(&text)
+}
+
+/// Sleep for `wait`, unless the process is asked to stop first.
+///
+/// Returns `true` when a stop arrived, so the caller can leave the retry loop
+/// without another attempt.
+async fn wait_or_stop(wait: Duration, stop: &mut watch::Receiver<bool>) -> bool {
+    let already = *stop.borrow();
+    if already {
+        return true;
     }
-    flat
+    tokio::select! {
+        _ = tokio::time::sleep(wait) => false,
+        changed = stop.changed() => changed.is_ok(),
+    }
+}
+
+/// The un-jittered wait before the next login attempt.
+///
+/// Split out from [`retry_wait`] so the schedule itself is assertable: the
+/// jitter is deliberately random, but 30/60/120/300 must not drift.
+fn retry_base(attempt: usize, retry_after: Option<u64>) -> u64 {
+    match retry_after {
+        Some(seconds) if seconds > 0 && seconds <= LOGIN_RETRY_MAX_WAIT_SECS => seconds,
+        _ => LOGIN_RETRY_DELAYS[(attempt.saturating_sub(1)).min(LOGIN_RETRY_DELAYS.len() - 1)],
+    }
 }
 
 /// How long to wait before the next login attempt.
@@ -1450,10 +1674,7 @@ fn login_summary(err: &serenity::Error) -> String {
 /// `discord.py` used `random.uniform(0, 5)` for jitter; an integer 0..=5 is
 /// indistinguishable at this scale and keeps the schedule reproducible in logs.
 fn retry_wait(attempt: usize, retry_after: Option<u64>) -> Duration {
-    let base = match retry_after {
-        Some(seconds) if seconds > 0 && seconds <= LOGIN_RETRY_MAX_WAIT_SECS => seconds,
-        _ => LOGIN_RETRY_DELAYS[(attempt.saturating_sub(1)).min(LOGIN_RETRY_DELAYS.len() - 1)],
-    };
+    let base = retry_base(attempt, retry_after);
     let jitter = rand::random::<u64>() % (LOGIN_RETRY_JITTER_SECS + 1);
     Duration::from_secs((base + jitter).min(LOGIN_RETRY_MAX_WAIT_SECS + LOGIN_RETRY_JITTER_SECS))
 }

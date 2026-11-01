@@ -4,7 +4,7 @@
 //! button posted before a restart still works and nothing is registered per
 //! giveaway. A click is acknowledged before any database work
 //! (`defer_ephemeral`) and then answered with an ephemeral followup, which is
-//! exactly `bot.py`'s `_safe_defer` + `_safe_followup` pair.
+//! exactly the Python bot's `_safe_defer` + `_safe_followup` pair.
 //!
 //! The pager is the only state: `discord.py` kept it on a `View` instance and
 //! serenity has no such object, so [`PagerState`] lives in
@@ -27,7 +27,7 @@ use super::{Bot, PagerKind, PagerState, PARTICIPANT_WINDOW};
 use crate::convert;
 
 /// The four eligibility subqueries `join_snapshot` returns alongside the row.
-type Snapshot = Option<(bool, i64, i64, bool)>;
+pub(super) type Snapshot = Option<(bool, i64, i64, bool)>;
 
 /// What a page click says once its pager is gone.
 ///
@@ -35,6 +35,12 @@ type Snapshot = Option<(bool, i64, i64, bool)>;
 /// callback ran). An interaction must be answered here, and silence reads as a
 /// broken bot, so the click is told to open the panel again.
 const PAGER_EXPIRED: &str = "This list expired — click Participants again.";
+
+/// What a Leave click says when the database refuses the write.
+///
+/// Pinned so the wording can be asserted without a gateway; a failure here used
+/// to escape the callback as a bare "interaction failed".
+pub(super) const LEAVE_FAILED: &str = "⚠️ Could not update your entry. Try again.";
 
 pub(crate) async fn handle_component(bot: &Bot, ctx: &Context, ci: ComponentInteraction) {
     let Some(click) = components::parse_custom_id(&ci.data.custom_id) else {
@@ -53,6 +59,15 @@ pub(crate) async fn handle_component(bot: &Bot, ctx: &Context, ci: ComponentInte
 }
 
 // -- join ----------------------------------------------------------------
+
+/// Whether a member is currently in Discord's native timeout.
+///
+/// `None` means "not timed out": an interaction payload that omits the field, or
+/// a member who has never been timed out, must never be penalised. `now` is
+/// passed in so the rule is testable without waiting on the wall clock.
+pub(super) fn is_timed_out(until: Option<Timestamp>, now: Timestamp) -> bool {
+    until.map(|until| until > now).unwrap_or(false)
+}
 
 async fn handle_join(bot: &Bot, ctx: &Context, ci: &ComponentInteraction, giveaway_id: &str) {
     let (Some(guild_id), Some(member)) = (ci.guild_id, ci.member.clone()) else {
@@ -78,10 +93,7 @@ async fn handle_join(bot: &Bot, ctx: &Context, ci: &ComponentInteraction, giveaw
     // "you may not enter" rule instead of becoming a second join path. For a
     // component click the member comes from the interaction payload, so this is
     // the state Discord reported when they clicked.
-    let timed_out = member
-        .communication_disabled_until
-        .map(|until| until > Timestamp::now())
-        .unwrap_or(false);
+    let timed_out = is_timed_out(member.communication_disabled_until, Timestamp::now());
     // A plain in-process set of (giveaway, user) ids whose join COMMITTED here.
     // It only ever short-circuits a refusal: a missing marker runs the normal
     // path and the database still decides.
@@ -183,31 +195,58 @@ async fn handle_join(bot: &Bot, ctx: &Context, ci: &ComponentInteraction, giveaw
     // Discord API work below fails.
     let ack = format!("🎟️ You're in! Entry #{count}.");
     bot.safe_followup_component(ctx, ci, &ack).await;
-    if status == "active" {
-        // Each post-ack step is isolated so a role-grant failure cannot cancel
-        // the embed refresh (or vice versa), and neither may undo the entry.
-        // The refresh is debounced: every click grants the role, but only the
-        // first in the window re-renders the embed.
-        let grant = bot.grant_entrants_role(ctx, &gw, &member, Some(status.as_str()));
-        if bot.should_refresh(giveaway_id) {
-            let refresh = bot.refresh_embed(ctx, &gw, Some(count), Some(status.as_str()));
-            let _ = tokio::join!(grant, refresh);
-        } else {
-            grant.await;
+    match post_join(Some(status.as_str())) {
+        PostJoin::GrantAndRefresh => {
+            // Each post-ack step is isolated so a role-grant failure cannot
+            // cancel the embed refresh (or vice versa), and neither may undo the
+            // entry. The refresh is debounced: every click grants the role, but
+            // only the first in the window re-renders the embed.
+            let grant = bot.grant_entrants_role(ctx, &gw, &member, Some(status.as_str()));
+            if bot.should_refresh(giveaway_id) {
+                let refresh = bot.refresh_embed(ctx, &gw, Some(count), Some(status.as_str()));
+                let _ = tokio::join!(grant, refresh);
+            } else {
+                grant.await;
+            }
         }
+        PostJoin::TakeRole => {
+            // The draw won the race: this member joined in the same instant the
+            // giveaway ended and the strip pass may already have walked past
+            // them. The entry stays but missed this draw, so say so — "You're
+            // in!" above must not be the last word.
+            bot.take_entrants_role(ctx, &gw, &uid).await;
+            bot.safe_followup_component(
+                ctx,
+                ci,
+                "This giveaway just ended — your entry arrived too late for the draw.",
+            )
+            .await;
+        }
+    }
+}
+
+/// What happens after the "You're in!" ack, decided by the status the join
+/// returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PostJoin {
+    /// Still live: grant the entrants role and repaint the countdown.
+    GrantAndRefresh,
+    /// The draw won the race: take the role back and say the entry missed it.
+    TakeRole,
+}
+
+/// Which post-ack half runs for a committed join.
+///
+/// The status comes out of the same transaction as the entry, so it cannot be
+/// stale: `active` means the giveaway is still accepting, anything else means the
+/// draw already ran. Granting the role then would leave the member holding the
+/// ping-everyone role of a finished giveaway, and refreshing would repaint the
+/// winner announcement with a live countdown.
+pub(super) fn post_join(status: Option<&str>) -> PostJoin {
+    if status == Some("active") {
+        PostJoin::GrantAndRefresh
     } else {
-        // The draw won the race: this member joined in the same instant the
-        // giveaway ended and the strip pass may already have walked past them.
-        // Granting the role now would leave them holding the ping-everyone role
-        // of a giveaway that is over. The entry stays but missed this draw, so
-        // say so — "You're in!" above must not be the last word.
-        bot.take_entrants_role(ctx, &gw, &uid).await;
-        bot.safe_followup_component(
-            ctx,
-            ci,
-            "This giveaway just ended — your entry arrived too late for the draw.",
-        )
-        .await;
+        PostJoin::TakeRole
     }
 }
 
@@ -217,7 +256,7 @@ async fn handle_join(bot: &Bot, ctx: &Context, ci: &ComponentInteraction, giveaw
 /// the only thing that lets the service's timeout-ban gate skip its own live row
 /// read. Dropping it was measured in Python and saved nothing (one read moved
 /// from one place to the other), so it stays.
-async fn join_header(
+pub(super) async fn join_header(
     bot: &Bot,
     giveaway_id: &str,
     guild_id: &str,
@@ -249,6 +288,14 @@ async fn join_header(
 }
 
 // -- participants --------------------------------------------------------
+
+/// What the panel says when the window came back empty.
+///
+/// Split out so the wording is assertable without a Discord context: the empty
+/// case is also the one that proves opening a panel costs no extra lookup.
+pub(super) fn empty_panel_text(prize: &str) -> String {
+    format!("🏆 **{prize}** — no entrants yet.")
+}
 
 async fn handle_participants(
     bot: &Bot,
@@ -312,7 +359,7 @@ async fn handle_participants(
     };
     let (total, rows, mine) = found.unwrap_or((0, Vec::new(), 0));
     if rows.is_empty() {
-        let text = format!("🏆 **{}** — no entrants yet.", gw.prize);
+        let text = empty_panel_text(&gw.prize);
         bot.safe_followup_component(ctx, ci, &text).await;
         return;
     }
@@ -379,8 +426,7 @@ async fn handle_leave(bot: &Bot, ctx: &Context, ci: &ComponentInteraction, givea
         Ok(result) => result,
         Err(err) => {
             error!("leave failed for {giveaway_id}: {err}");
-            bot.safe_followup_component(ctx, ci, "⚠️ Could not update your entry. Try again.")
-                .await;
+            bot.safe_followup_component(ctx, ci, LEAVE_FAILED).await;
             return;
         }
     };
@@ -574,10 +620,10 @@ async fn reply_ephemeral(ctx: &Context, ci: &ComponentInteraction, text: &str) {
 
 /// Drain the cache keys a just-committed write invalidated, off the reply path.
 ///
-/// `bot.py` spawned this for the same reason: on a blackholed Redis one awaited
+/// The Python bot spawned this for the same reason: on a blackholed Redis one awaited
 /// DEL costs the full cache timeout, and the member's answer must never wait on
 /// a cache hop. The keys heal on their own TTL either way.
-fn spawn_flush(bot: &Bot) {
+pub(super) fn spawn_flush(bot: &Bot) {
     let bot = bot.clone();
     tokio::spawn(async move { bot.flush_invalidations().await });
 }

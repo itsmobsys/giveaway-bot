@@ -1,6 +1,6 @@
 //! Slash commands and autocomplete.
 //!
-//! `bot.py` registered all of these inside `wire_commands`; here the same table
+//! The Python bot registered all of these inside `wire_commands`; here the same table
 //! is split in two: this module owns the giveaway lifecycle commands, while
 //! [`super::commands_admin`] owns the blacklist/ban/probe set. Both feed the one
 //! global command tree registered on the first `ready`.
@@ -14,7 +14,7 @@ use anyhow::Result;
 use gwbot_core::components;
 use gwbot_core::embeds::{self, Embed};
 use gwbot_core::mentions::{split_mentions, MAX_MENTION_MESSAGES};
-use gwbot_core::models::ServiceError;
+use gwbot_core::models::{Giveaway, ServiceError};
 use serenity::all::{
     AutocompleteChoice, ChannelId, CommandDataOptionValue, CommandInteraction, CommandOptionType,
     Context, CreateAllowedMentions, CreateAutocompleteResponse, CreateCommand, CreateCommandOption,
@@ -27,6 +27,148 @@ use crate::convert;
 
 /// What Discord shows for an option that had no `@app_commands.describe`.
 const NO_DESCRIPTION: &str = "No description provided.";
+
+/// The reply for a command used in a DM.
+///
+/// A DM has no guild, so there is no giveaway to act on and nothing to look up:
+/// say so before the defer, because the 3s budget belongs to the real commands.
+pub(super) const USE_IN_SERVER: &str = "Use this in a server.";
+
+/// Appended to the create reply when the message id could not be stored.
+pub(super) const MESSAGE_NOTE_FAILED: &str = " (message tracking could not be saved)";
+/// Appended when the entrants role was created but its id could not be stored.
+pub(super) const ROLE_NOTE_FAILED: &str = " (entrants role could not be saved)";
+/// Appended when Discord refused to create the entrants role at all.
+pub(super) const ROLE_NOTE_MISSING: &str = " (no entrants role — I need **Manage Roles**)";
+
+/// The success line for `/giveaway_create`.
+///
+/// The giveaway is already posted by the time this is built, so the reply must
+/// never claim failure when only a bookkeeping write failed: each failed write
+/// appends a note instead of replacing the link.
+pub(super) fn started_reply(link: &str, message_note: &str, role_note: &str) -> String {
+    format!("✅ Giveaway started: {link}{message_note}{role_note}")
+}
+
+/// `(everyone, users, roles)` for the post that opens a giveaway.
+///
+/// The notify/entrants roles are pinged by id; members and `@everyone` are not,
+/// so creating a giveaway cannot turn into a server-wide ping.
+pub(super) fn create_mentions() -> (bool, bool, bool) {
+    (false, false, true)
+}
+
+/// The embed that replaces a cancelled giveaway's live panel.
+pub(super) fn cancelled_embed(gw: &Giveaway, colour: u32) -> Embed {
+    Embed {
+        title: "Giveaway Cancelled".to_string(),
+        description: format!("🚫 **{}** — this giveaway was cancelled.", gw.prize),
+        colour,
+        image_url: None,
+        footer: Some(format!("ID: {}", gw.id)),
+    }
+}
+
+/// The edit that closes a cancelled giveaway's message: the cancelled embed and
+/// no buttons, so the stale Join/Leave panel cannot be clicked any more.
+pub(super) fn cancel_edit(embed: &Embed) -> EditMessage {
+    EditMessage::new()
+        .embed(convert::to_create_embed(embed))
+        .components(Vec::new())
+}
+
+/// `_can_manage`: **Manage Server** or **Administrator**, from the payload bits.
+///
+/// Split out so the rule is testable without an interaction: serenity reads the
+/// same two bits off the member's permissions, and a DM payload has neither.
+pub(super) fn can_manage_bits(manage_guild: bool, administrator: bool) -> bool {
+    manage_guild || administrator
+}
+
+/// `on_app_command_error`'s reply: the command name and a retry hint.
+///
+/// The traceback carries the error; the member must not, or a database message
+/// or a token fragment could reach a channel.
+pub(super) fn command_failure_reply(name: &str) -> String {
+    format!("⚠️ /{name} failed. Please try again.")
+}
+
+/// `🏆 **{prize}**{host} — no entrants yet.`
+pub(super) fn no_entrants_report(prize: &str, host: &str) -> String {
+    format!("🏆 **{prize}**{host} — no entrants yet.")
+}
+
+/// The `/giveaway_list <id>` reply: the whole count, the odds, then one page.
+///
+/// `total` is the live count and `shown` the page's user ids, so a long list
+/// says how many were left out instead of pretending the page is everything.
+pub(super) fn entrant_report(gw: &Giveaway, host: &str, total: i64, shown: &[String]) -> String {
+    let chance = if total != 0 {
+        (gw.winner_count as f64 / total as f64 * 100.0).min(100.0)
+    } else {
+        0.0
+    };
+    let odds = format!(
+        "\n📊 Each entrant has a **{chance:.1}%** chance ({} winner(s) / {total} entries).",
+        gw.winner_count
+    );
+    let extra = if total > shown.len() as i64 {
+        format!("\n…and {} more.", total - shown.len() as i64)
+    } else {
+        String::new()
+    };
+    let status = if gw.active() {
+        "running 🟢".to_string()
+    } else {
+        gw.status.clone()
+    };
+    let mentions: Vec<String> = shown.iter().map(|id| format!("<@{id}>")).collect();
+    format!(
+        "🏆 **{}**{host} — **{total}** entrant(s) ({status}){odds}:\n{}{extra}",
+        gw.prize,
+        mentions.join(", ")
+    )
+}
+
+/// The body of a `/giveaway_ping`: the prize, plus the optional note.
+pub(super) fn ping_body(prize: &str, text: &str) -> String {
+    if text.is_empty() {
+        format!("📢 **{prize}**")
+    } else {
+        format!("📢 **{prize}** — {text}")
+    }
+}
+
+/// `(everyone, users, roles)` for a ping or an extend notice.
+///
+/// A role ping mentions the role and nobody else; the per-member fallback
+/// mentions users and no roles. `@everyone` is off in both: a giveaway prize
+/// that literally reads `@everyone` must not turn a ping into a server-wide one.
+pub(super) fn mention_policy(has_role: bool) -> (bool, bool, bool) {
+    (false, !has_role, has_role)
+}
+
+/// The followup after a ping: how many were reached, and the cap when one hit.
+pub(super) fn ping_summary(sent: usize, total: usize, capped: bool) -> String {
+    if capped {
+        format!(
+            "📢 Pinged {sent} of {total} entrant(s) — capped at {MAX_MENTION_MESSAGES} messages \
+             without an entrants role. Re-run once the role exists to reach the rest."
+        )
+    } else {
+        format!("📢 Pinged {total} entrant(s).")
+    }
+}
+
+/// The followup that confirms an extend.
+pub(super) fn extend_reply(prize: &str, ends_in: i64) -> String {
+    format!("⏳ **{prize}** extended — now ends <t:{ends_in}:R>.")
+}
+
+/// The notice the entrants get when a giveaway is extended.
+pub(super) fn extend_notice(prize: &str, ends_in: i64) -> String {
+    format!("⏳ **{prize}** got more time — now ends <t:{ends_in}:R>!")
+}
 
 /// The global command table registered on the first `ready`.
 pub(crate) fn command_specs() -> Vec<CreateCommand> {
@@ -148,7 +290,7 @@ pub(crate) fn command_specs() -> Vec<CreateCommand> {
     specs
 }
 
-/// An integer option with no range: `bot.py` never set an `app_commands.Range`.
+/// An integer option with no range: the Python bot never set an `app_commands.Range`.
 fn int_opt(name: &str, description: &str) -> CreateCommandOption {
     CreateCommandOption::new(CommandOptionType::Integer, name, description)
 }
@@ -188,10 +330,10 @@ pub(crate) async fn handle_command(bot: &Bot, ctx: &Context, ci: CommandInteract
         _ => Ok(()),
     };
     if let Err(err) = outcome {
-        // `bot.py`'s `on_app_command_error`: the traceback names the command and
+        // the Python bot's `on_app_command_error`: the traceback names the command and
         // server, and the member gets a retry hint instead of silence.
         error!("command /{name} failed: {err}");
-        bot.safe_followup_command(ctx, &ci, &format!("⚠️ /{name} failed. Please try again."))
+        bot.safe_followup_command(ctx, &ci, &command_failure_reply(&name))
             .await;
     }
 }
@@ -292,7 +434,7 @@ fn can_manage(ci: &CommandInteraction) -> bool {
     ci.member
         .as_deref()
         .and_then(|member| member.permissions)
-        .map(|permissions| permissions.manage_guild() || permissions.administrator())
+        .map(|permissions| can_manage_bits(permissions.manage_guild(), permissions.administrator()))
         .unwrap_or(false)
 }
 
@@ -471,12 +613,13 @@ async fn giveaway_create(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> R
     let mut message = CreateMessage::new()
         .embed(convert::to_create_embed(&embed))
         .components(rows)
-        .allowed_mentions(
+        .allowed_mentions({
+            let (everyone, users, roles) = create_mentions();
             CreateAllowedMentions::new()
-                .everyone(false)
-                .all_users(false)
-                .all_roles(true),
-        );
+                .everyone(everyone)
+                .all_users(users)
+                .all_roles(roles)
+        });
     if let Some(text) = create_content {
         message = message.content(text);
     }
@@ -507,7 +650,7 @@ async fn giveaway_create(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> R
         .await
     {
         error!("could not save message id for giveaway {}: {err}", gw.id);
-        message_note = " (message tracking could not be saved)";
+        message_note = MESSAGE_NOTE_FAILED;
     }
 
     let mut role_note = "";
@@ -530,12 +673,12 @@ async fn giveaway_create(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> R
                 )
                 .await;
             if let Err(err) = saved {
-                role_note = " (entrants role could not be saved)";
+                role_note = ROLE_NOTE_FAILED;
                 error!("could not save entrants role for giveaway {}: {err}", gw.id);
             }
         }
         Err(err) => {
-            role_note = " (no entrants role — I need **Manage Roles**)";
+            role_note = ROLE_NOTE_MISSING;
             warn!("could not create entrants role in {guild_id}: {err}");
         }
     }
@@ -543,10 +686,7 @@ async fn giveaway_create(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> R
     bot.safe_followup_command(
         ctx,
         ci,
-        &format!(
-            "✅ Giveaway started: {}{message_note}{role_note}",
-            msg.link()
-        ),
+        &started_reply(&msg.link(), message_note, role_note),
     )
     .await;
     Ok(())
@@ -804,21 +944,9 @@ async fn giveaway_cancel(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> R
                 .and_then(snowflake)
                 .map(MessageId::new),
         ) {
-            let cancelled_embed = Embed {
-                title: "Giveaway Cancelled".to_string(),
-                description: format!("🚫 **{}** — this giveaway was cancelled.", ended.prize),
-                colour: bot.state.settings.embed_color,
-                image_url: None,
-                footer: Some(format!("ID: {}", ended.id)),
-            };
+            let panel = cancelled_embed(&ended, bot.state.settings.embed_color);
             let edited = channel_id
-                .edit_message(
-                    ctx,
-                    message_id,
-                    EditMessage::new()
-                        .embed(convert::to_create_embed(&cancelled_embed))
-                        .components(Vec::new()),
-                )
+                .edit_message(ctx, message_id, cancel_edit(&panel))
                 .await;
             if let Err(err) = edited {
                 warn!(
@@ -842,12 +970,13 @@ async fn giveaway_cancel(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> R
             let _ = channel_id
                 .send_message(
                     ctx,
-                    CreateMessage::new().content(text).allowed_mentions(
+                    CreateMessage::new().content(text).allowed_mentions({
+                        let (everyone, users, roles) = create_mentions();
                         CreateAllowedMentions::new()
-                            .everyone(false)
-                            .all_users(false)
-                            .all_roles(true),
-                    ),
+                            .everyone(everyone)
+                            .all_users(users)
+                            .all_roles(roles)
+                    }),
                 )
                 .await;
         }
@@ -902,15 +1031,8 @@ async fn giveaway_extend(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> R
     bot.gw_drop(&gw.id);
     bot.refresh_embed(ctx, &fresh, None, None).await;
     let ends_in = fresh.ends_at / 1000;
-    bot.safe_followup_command(
-        ctx,
-        ci,
-        &format!(
-            "⏳ **{}** extended — now ends <t:{ends_in}:R>.",
-            fresh.prize
-        ),
-    )
-    .await;
+    bot.safe_followup_command(ctx, ci, &extend_reply(&fresh.prize, ends_in))
+        .await;
 
     // Tell the people waiting: ping every entrant in the giveaway channel.
     let entrants = match bot.db_call(bot.service().entries(&fresh.id, None)).await {
@@ -935,12 +1057,10 @@ async fn giveaway_extend(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> R
     if !is_text {
         return Ok(());
     }
-    let notice = format!(
-        "⏳ **{}** got more time — now ends <t:{ends_in}:R>!",
-        fresh.prize
-    );
+    let notice = extend_notice(&fresh.prize, ends_in);
     match bot.role_for(ctx, &fresh) {
         Some((_, role_id)) => {
+            let (everyone, users, roles) = mention_policy(true);
             let sent = channel_id
                 .send_message(
                     ctx,
@@ -948,9 +1068,9 @@ async fn giveaway_extend(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> R
                         .content(format!("{notice}\n<@&{role_id}>"))
                         .allowed_mentions(
                             CreateAllowedMentions::new()
-                                .everyone(false)
-                                .all_users(false)
-                                .all_roles(true),
+                                .everyone(everyone)
+                                .all_users(users)
+                                .all_roles(roles),
                         ),
                 )
                 .await;
@@ -959,6 +1079,7 @@ async fn giveaway_extend(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> R
             }
         }
         None => {
+            let (everyone, users, roles) = mention_policy(false);
             let ids: Vec<String> = entrants.iter().filter_map(json_id).collect();
             let pairs = split_mentions(&ids, &notice);
             let capped = &pairs[..pairs.len().min(MAX_MENTION_MESSAGES)];
@@ -968,9 +1089,9 @@ async fn giveaway_extend(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> R
                         ctx,
                         CreateMessage::new().content(chunk).allowed_mentions(
                             CreateAllowedMentions::new()
-                                .everyone(false)
-                                .all_users(true)
-                                .all_roles(false),
+                                .everyone(everyone)
+                                .all_users(users)
+                                .all_roles(roles),
                         ),
                     )
                     .await;
@@ -1002,7 +1123,7 @@ async fn giveaway_extend(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> R
 
 async fn giveaway_list(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Result<()> {
     let Some(guild_id) = ci.guild_id else {
-        bot.reply_ephemeral(ctx, ci, "Use this in a server.").await;
+        bot.reply_ephemeral(ctx, ci, USE_IN_SERVER).await;
         return Ok(());
     };
     if !bot.defer_command(ctx, ci).await {
@@ -1032,49 +1153,14 @@ async fn giveaway_list(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Res
             Some(host_id) => format!(" by <@{host_id}>"),
             None => String::new(),
         };
-        let chance = if total != 0 {
-            (gw.winner_count as f64 / total as f64 * 100.0).min(100.0)
-        } else {
-            0.0
-        };
-        let odds = format!(
-            "\n📊 Each entrant has a **{chance:.1}%** chance ({} winner(s) / {total} entries).",
-            gw.winner_count
-        );
         if entrants.is_empty() {
-            bot.safe_followup_command(
-                ctx,
-                ci,
-                &format!("🏆 **{}**{host} — no entrants yet.", gw.prize),
-            )
-            .await;
+            bot.safe_followup_command(ctx, ci, &no_entrants_report(&gw.prize, &host))
+                .await;
             return Ok(());
         }
-        let shown: Vec<String> = entrants
-            .iter()
-            .filter_map(json_id)
-            .map(|user_id| format!("<@{user_id}>"))
-            .collect();
-        let extra = if total > entrants.len() as i64 {
-            format!("\n…and {} more.", total - entrants.len() as i64)
-        } else {
-            String::new()
-        };
-        let status = if gw.active() {
-            "running 🟢".to_string()
-        } else {
-            gw.status.clone()
-        };
-        bot.safe_followup_command(
-            ctx,
-            ci,
-            &format!(
-                "🏆 **{}**{host} — **{total}** entrant(s) ({status}){odds}:\n{}{extra}",
-                gw.prize,
-                shown.join(", ")
-            ),
-        )
-        .await;
+        let shown: Vec<String> = entrants.iter().filter_map(json_id).collect();
+        bot.safe_followup_command(ctx, ci, &entrant_report(&gw, &host, total, &shown))
+            .await;
         return Ok(());
     }
 
@@ -1276,11 +1362,7 @@ async fn giveaway_ping(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Res
     } else {
         text
     };
-    let body = if text.is_empty() {
-        format!("📢 **{}**", gw.prize)
-    } else {
-        format!("📢 **{}** — {text}", gw.prize)
-    };
+    let body = ping_body(&gw.prize, &text);
 
     let role = bot.role_for(ctx, &gw);
     let channel_id = ci.channel_id;
@@ -1298,6 +1380,7 @@ async fn giveaway_ping(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Res
     let mut sent: usize = 0;
     match role {
         Some((_, role_id)) => {
+            let (everyone, users, roles) = mention_policy(true);
             let sent_message = channel_id
                 .send_message(
                     ctx,
@@ -1305,9 +1388,9 @@ async fn giveaway_ping(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Res
                         .content(format!("{body}\n<@&{role_id}>"))
                         .allowed_mentions(
                             CreateAllowedMentions::new()
-                                .everyone(false)
-                                .all_users(false)
-                                .all_roles(true),
+                                .everyone(everyone)
+                                .all_users(users)
+                                .all_roles(roles),
                         ),
                 )
                 .await;
@@ -1319,6 +1402,7 @@ async fn giveaway_ping(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Res
             }
         }
         None => {
+            let (everyone, users, roles) = mention_policy(false);
             let ids: Vec<String> = entrants.iter().filter_map(json_id).collect();
             pairs = split_mentions(&ids, &body);
             for (chunk, count) in pairs.iter().take(MAX_MENTION_MESSAGES) {
@@ -1327,9 +1411,9 @@ async fn giveaway_ping(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Res
                         ctx,
                         CreateMessage::new().content(chunk).allowed_mentions(
                             CreateAllowedMentions::new()
-                                .everyone(false)
-                                .all_users(true)
-                                .all_roles(false),
+                                .everyone(everyone)
+                                .all_users(users)
+                                .all_roles(roles),
                         ),
                     )
                     .await;
@@ -1344,25 +1428,9 @@ async fn giveaway_ping(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Res
         }
     }
 
-    if role.is_none() && pairs.len() > MAX_MENTION_MESSAGES {
-        bot.safe_followup_command(
-            ctx,
-            ci,
-            &format!(
-                "📢 Pinged {sent} of {} entrant(s) — capped at {MAX_MENTION_MESSAGES} messages \
-                 without an entrants role. Re-run once the role exists to reach the rest.",
-                entrants.len()
-            ),
-        )
+    let capped = role.is_none() && pairs.len() > MAX_MENTION_MESSAGES;
+    bot.safe_followup_command(ctx, ci, &ping_summary(sent, entrants.len(), capped))
         .await;
-    } else {
-        bot.safe_followup_command(
-            ctx,
-            ci,
-            &format!("📢 Pinged {} entrant(s).", entrants.len()),
-        )
-        .await;
-    }
     Ok(())
 }
 

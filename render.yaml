@@ -5,7 +5,7 @@
 # monitor on https://<name>.onrender.com/health every 5 minutes.
 #
 # The image is built by the repository Dockerfile (Rust, multi-stage), so a
-# deploy needs no Python and no build cache from a previous release.
+# deploy needs no interpreter and no build cache from a previous release.
 
 services:
   - type: web

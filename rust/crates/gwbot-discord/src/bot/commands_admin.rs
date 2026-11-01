@@ -1,7 +1,7 @@
 //! Admin slash commands: blacklist, timeout bans, host bans, and the latency
 //! probe. Split out of `commands` purely for review size.
 //!
-//! Every handler keeps `bot.py`'s shape exactly: the cheap guards (guild +
+//! Every handler keeps the Python bot's shape exactly: the cheap guards (guild +
 //! **Manage Server**) answer before the 3-second interaction budget is at risk,
 //! the command is deferred, the database work happens, and only then is the
 //! member answered. `/gw_request_time` is the one exception: its "ack" leg IS
@@ -22,6 +22,7 @@ use serenity::all::{
 };
 use tracing::{error, info, warn};
 
+use super::commands::USE_IN_SERVER;
 use super::{json_id, snowflake, Bot, PagerKind, PagerState};
 use crate::convert;
 
@@ -91,7 +92,7 @@ pub(crate) async fn handle_admin(
         _ => return false,
     };
     if let Err(err) = outcome {
-        // `bot.py`'s `on_app_command_error`: the traceback names the command,
+        // the Python bot's `on_app_command_error`: the traceback names the command,
         // and the member gets a retry hint instead of silence.
         error!("command /{name} failed: {err}");
         bot.safe_followup_command(ctx, ci, &format!("⚠️ /{name} failed. Please try again."))
@@ -114,13 +115,11 @@ fn can_manage(ci: &CommandInteraction) -> bool {
 /// The shared `interaction.guild is None or not _can_manage(...)` guard.
 async fn manage_guard(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Option<GuildId> {
     let Some(guild_id) = ci.guild_id else {
-        bot.reply_ephemeral(ctx, ci, "You need **Manage Server**.")
-            .await;
+        bot.reply_ephemeral(ctx, ci, MANAGE_REQUIRED).await;
         return None;
     };
     if !can_manage(ci) {
-        bot.reply_ephemeral(ctx, ci, "You need **Manage Server**.")
-            .await;
+        bot.reply_ephemeral(ctx, ci, MANAGE_REQUIRED).await;
         return None;
     }
     Some(guild_id)
@@ -262,8 +261,7 @@ async fn blacklist_list(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Re
         Ok(pair) => pair,
         Err(err) => {
             error!("blacklist list failed: {err}");
-            bot.safe_followup_command(ctx, ci, "⚠️ Could not load the blacklist. Try again.")
-                .await;
+            bot.safe_followup_command(ctx, ci, BLACKLIST_FAILED).await;
             return Ok(());
         }
     };
@@ -273,9 +271,40 @@ async fn blacklist_list(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Re
         return Ok(());
     }
     // A mention is 21 characters and Discord rejects a message over 2000, so
-    // the body stops at 80 — the same chunk size /giveaway_ping uses — while
-    // the header keeps the real count instead of the shown one.
-    let shown = &ids[..ids.len().min(80)];
+    // the body stops at 80 while the header keeps the real count.
+    bot.safe_followup_command(ctx, ci, &blacklist_body(&ids, total))
+        .await;
+    Ok(())
+}
+
+// -- pure renderers ------------------------------------------------------
+//
+// The admin replies are plain strings, so they are built here instead of inside
+// the handlers: serenity 0.12 cannot hand a test a `Context`, and the wording is
+// the part worth pinning.
+
+/// What every admin command says to a member without Manage Server.
+pub(super) const MANAGE_REQUIRED: &str = "You need **Manage Server**.";
+
+/// `/giveaway_timeout_bans` when nobody is sitting out a penalty.
+pub(super) const NO_TIMEOUT_BANS: &str = "No users are currently banned from giveaways.";
+
+/// The failure line for the timeout-ban listing.
+pub(super) const TIMEOUT_BANS_FAILED: &str = "⚠️ Could not load the timeout bans. Try again.";
+
+/// The failure line for the blacklist listing.
+pub(super) const BLACKLIST_FAILED: &str = "⚠️ Could not load the blacklist. Try again.";
+
+/// How many mentions one blacklist message may carry.
+///
+/// A mention is 21 characters and Discord rejects anything over 2000, so 80 is
+/// the same chunk size `/giveaway_ping` uses. The header still reports `total`,
+/// which is the real count rather than the shown one.
+const BLACKLIST_PAGE: usize = 80;
+
+/// The `/giveaway_blacklist_list` body.
+pub(super) fn blacklist_body(ids: &[String], total: i64) -> String {
+    let shown = &ids[..ids.len().min(BLACKLIST_PAGE)];
     let lines = shown
         .iter()
         .map(|uid| format!("<@{uid}>"))
@@ -286,13 +315,103 @@ async fn blacklist_list(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Re
     } else {
         String::new()
     };
-    bot.safe_followup_command(
-        ctx,
-        ci,
-        &format!("🚫 **Blocked ({total}):**\n{lines}{extra}"),
+    format!("🚫 **Blocked ({total}):**\n{lines}{extra}")
+}
+
+/// The `/giveaway_ban` reply: who, until when, and why.
+pub(super) fn ban_reply(
+    uid: &str,
+    permanent: bool,
+    expires_at: Option<i64>,
+    hours: i64,
+    running: usize,
+    reason: &str,
+) -> String {
+    let when = if permanent {
+        "permanently".to_string()
+    } else if let Some(exp) = expires_at {
+        format!("until <t:{}:R>", exp / 1000)
+    } else {
+        format!("for {hours}h")
+    };
+    let clean_reason = reason.trim();
+    let reason_bit = if clean_reason.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Reason: {}",
+            clean_reason.chars().take(256).collect::<String>()
+        )
+    };
+    format!(
+        "🚫 <@{uid}> is banned {when} — entries removed from {running} running giveaway(s).{reason_bit}"
     )
-    .await;
-    Ok(())
+}
+
+/// The `/giveaway_unban` reply, which distinguishes "cleared" from "was not
+/// banned" so a moderator does not think a typo unblocked somebody.
+pub(super) fn unban_reply(uid: &str, removed: bool) -> String {
+    if removed {
+        format!("✅ <@{uid}> can join giveaways again.")
+    } else {
+        format!("<@{uid}> was not banned.")
+    }
+}
+
+/// The `/giveaway_ban_list` body: one line per ban, capped at 20.
+pub(super) fn ban_list_body(rows: &[Value], total: i64) -> String {
+    let shown = &rows[..rows.len().min(20)];
+    let mut lines: Vec<String> = Vec::with_capacity(shown.len());
+    for row in shown {
+        let uid = json_id(row).unwrap_or_default();
+        let reason = row
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let when = match row.get("expires_at").and_then(Value::as_i64) {
+            None => "permanent".to_string(),
+            Some(exp) => format!("expires <t:{}:R>", exp / 1000),
+        };
+        let tail = if reason.is_empty() {
+            String::new()
+        } else {
+            format!(" — {}", reason.chars().take(100).collect::<String>())
+        };
+        lines.push(format!("<@{uid}> ({when}){tail}"));
+    }
+    let body = lines.join("\n");
+    let extra = if total > shown.len() as i64 {
+        format!("\n…plus {} more.", total - shown.len() as i64)
+    } else {
+        String::new()
+    };
+    format!("🚫 **Banned ({total}):**\n{body}{extra}")
+}
+
+/// Resolve which banned ids are still guild members, for the timeout-ban panel.
+///
+/// Only the member cache is consulted: a fetch per row would be one HTTP request
+/// per banned member for what is a snapshot anyway. With nothing cached (members
+/// intent off) every id would look like it had left, so plain mentions are used
+/// instead of an invented label.
+pub(super) fn mark_in_guild(
+    rows: &[Value],
+    cached: bool,
+    is_member: impl Fn(&str) -> bool,
+) -> Vec<bool> {
+    rows.iter()
+        .map(|row| {
+            if !cached {
+                return true;
+            }
+            match json_id(row) {
+                Some(uid) => is_member(&uid),
+                None => false,
+            }
+        })
+        .collect()
 }
 
 // -- bans ----------------------------------------------------------------
@@ -351,32 +470,21 @@ async fn ban(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Result<()> {
         "banned {uid} in guild {gid} for {hours}h reason={:?}",
         clean_reason.chars().take(64).collect::<String>()
     );
-    let reason_bit = if clean_reason.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " Reason: {}",
-            clean_reason.chars().take(256).collect::<String>()
-        )
-    };
     let permanent = info
         .get("permanent")
         .and_then(Value::as_bool)
         .unwrap_or(hours == 0);
     let expires_at = info.get("expires_at").and_then(Value::as_i64);
-    let when = if permanent {
-        "permanently".to_string()
-    } else if let Some(exp) = expires_at {
-        format!("until <t:{}:R>", exp / 1000)
-    } else {
-        format!("for {hours}h")
-    };
     bot.safe_followup_command(
         ctx,
         ci,
-        &format!(
-            "🚫 <@{uid}> is banned {when} — entries removed from {} running giveaway(s).{reason_bit}",
-            active.len()
+        &ban_reply(
+            &uid,
+            permanent,
+            expires_at,
+            hours,
+            active.len(),
+            &clean_reason,
         ),
     )
     .await;
@@ -406,11 +514,7 @@ async fn unban(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Result<()> 
             return Ok(());
         }
     };
-    let text = if removed {
-        format!("✅ <@{uid}> can join giveaways again.")
-    } else {
-        format!("<@{uid}> was not banned.")
-    };
+    let text = unban_reply(&uid, removed);
     bot.safe_followup_command(ctx, ci, &text).await;
     Ok(())
 }
@@ -452,34 +556,7 @@ async fn ban_list(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Result<(
             .await;
         return Ok(());
     }
-    let shown = &rows[..rows.len().min(20)];
-    let mut lines: Vec<String> = Vec::with_capacity(shown.len());
-    for row in shown {
-        let uid = json_id(row).unwrap_or_default();
-        let reason = row
-            .get("reason")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        let when = match row.get("expires_at").and_then(Value::as_i64) {
-            None => "permanent".to_string(),
-            Some(exp) => format!("expires <t:{}:R>", exp / 1000),
-        };
-        let tail = if reason.is_empty() {
-            String::new()
-        } else {
-            format!(" — {}", reason.chars().take(100).collect::<String>())
-        };
-        lines.push(format!("<@{uid}> ({when}){tail}"));
-    }
-    let body = lines.join("\n");
-    let extra = if total > shown.len() as i64 {
-        format!("\n…plus {} more.", total - shown.len() as i64)
-    } else {
-        String::new()
-    };
-    bot.safe_followup_command(ctx, ci, &format!("🚫 **Banned ({total}):**\n{body}{extra}"))
+    bot.safe_followup_command(ctx, ci, &ban_list_body(&rows, total))
         .await;
     Ok(())
 }
@@ -511,14 +588,13 @@ async fn timeout_bans(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
         Ok(pair) => pair,
         Err(err) => {
             error!("timeout ban list failed: {err}");
-            bot.safe_followup_command(ctx, ci, "⚠️ Could not load the timeout bans. Try again.")
+            bot.safe_followup_command(ctx, ci, TIMEOUT_BANS_FAILED)
                 .await;
             return Ok(());
         }
     };
     if rows.is_empty() {
-        bot.safe_followup_command(ctx, ci, "No users are currently banned from giveaways.")
-            .await;
+        bot.safe_followup_command(ctx, ci, NO_TIMEOUT_BANS).await;
         return Ok(());
     }
     // Only from the member cache: a fetch per row would be one HTTP request per
@@ -535,23 +611,16 @@ async fn timeout_bans(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
             .as_ref()
             .map(|guild| !guild.members.is_empty())
             .unwrap_or(false);
-        rows.iter()
-            .map(|row| {
-                if !cached {
-                    return true;
-                }
-                let Some(uid) = json_id(row) else {
-                    return false;
-                };
-                let Some(id) = snowflake(&uid) else {
-                    return false;
-                };
-                guild
-                    .as_ref()
-                    .map(|guild| guild.members.contains_key(&UserId::new(id)))
-                    .unwrap_or(false)
-            })
-            .collect()
+        mark_in_guild(&rows, cached, |uid| {
+            snowflake(uid)
+                .map(|id| {
+                    guild
+                        .as_ref()
+                        .map(|guild| guild.members.contains_key(&UserId::new(id)))
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        })
     };
     for (row, in_guild) in rows.iter_mut().zip(in_guild_flags) {
         if let Value::Object(map) = row {
@@ -594,7 +663,7 @@ async fn timeout_bans(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
 }
 
 /// One page of rows, clamped to what the listing actually loaded.
-fn page_rows(rows: &[Value], page: usize) -> &[Value] {
+pub(super) fn page_rows(rows: &[Value], page: usize) -> &[Value] {
     let start = page * PAGE_SIZE;
     if start >= rows.len() {
         return &[];
@@ -628,7 +697,7 @@ fn store_pager(bot: &Bot, message_id: MessageId, state: PagerState) {
 /// readers, so it is neither timed nor reported.
 async fn request_time(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Result<()> {
     let Some(guild_id) = ci.guild_id else {
-        bot.reply_ephemeral(ctx, ci, "Use this in a server.").await;
+        bot.reply_ephemeral(ctx, ci, USE_IN_SERVER).await;
         return Ok(());
     };
     let started = Instant::now();
@@ -646,49 +715,139 @@ async fn request_time(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
     }
     let ack_ms = Some(ack_started.elapsed().as_secs_f64() * 1000.0);
 
-    let gid = guild_id.to_string();
-    // serenity 0.12 does not publish the shard heartbeat latency to handlers
-    // (`ShardMessenger` has no accessor), so this leg is always unmeasured.
-    let gateway_ms: Option<f64> = None;
+    // Every cache leg is measured without a Discord handle, so the same code
+    // runs from a test as from a click. Only the two REST legs below need the
+    // interaction, and they are passed into the report as plain numbers.
+    let measured = measure_probe(
+        bot,
+        &guild_id.to_string(),
+        &ci.channel_id.to_string(),
+        &ci.user.id.to_string(),
+    )
+    .await;
+
+    // Leg 6: a real Discord REST send, timed. It is then edited into the report
+    // so the invoker sees one ephemeral reply, not two.
+    let reply_started = Instant::now();
+    let sent = ci
+        .create_followup(
+            ctx,
+            CreateInteractionResponseFollowup::new()
+                .content("Measuring Discord reply leg…")
+                .ephemeral(true),
+        )
+        .await;
+    let (probe_msg, rest_ms) = match sent {
+        Ok(message) => (
+            Some(message),
+            Some(reply_started.elapsed().as_secs_f64() * 1000.0),
+        ),
+        Err(err) => {
+            warn!("request-time reply probe failed: {err}");
+            (None, None)
+        }
+    };
+    let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let report = render_report(&measured, ack_ms, rest_ms, loop_lag_ms, total_ms);
+
+    match probe_msg {
+        // One message, not a spam of replies: the timed probe is edited in
+        // place into the final report.
+        Some(message) => {
+            let edited = ci
+                .edit_followup(
+                    ctx,
+                    message.id,
+                    CreateInteractionResponseFollowup::new().content(&report),
+                )
+                .await;
+            if let Err(err) = edited {
+                warn!("request-time report edit failed: {err}");
+            }
+        }
+        None => bot.safe_followup_command(ctx, ci, &report).await,
+    }
+    Ok(())
+}
+
+/// Everything one probe measured, before any of it becomes text.
+///
+/// The measurement is split from the report so both halves can be exercised
+/// without a Discord interaction: serenity 0.12 builds neither a `Context` nor
+/// a `CommandInteraction` outside its own dispatch.
+pub(crate) struct ProbeMeasurement {
+    pub redis_ms: Option<f64>,
+    pub redis_note: String,
+    pub cache_ops: Option<i64>,
+    pub redis_hits: Option<i64>,
+    pub redis_misses: Option<i64>,
+    pub redis_skipped: Option<i64>,
+    pub redis_failed: Option<i64>,
+    pub count_ms: Option<f64>,
+    pub count_note: String,
+    pub role_ms: Option<f64>,
+    pub role_note: String,
+    pub list_ms: Option<f64>,
+    pub list_note: String,
+    pub cold_total_ms: Option<f64>,
+    pub warm_total_ms: Option<f64>,
+    pub warm_pair: bool,
+    pub cache_gets: Option<i64>,
+    pub cache_stores: Option<i64>,
+    pub redis_probe_ms: Option<f64>,
+    pub redis_probe_note: String,
+}
+
+impl ProbeMeasurement {
+    fn new() -> Self {
+        Self {
+            redis_ms: None,
+            // The PING leg's note: a cache that is off never measured one, so
+            // the fall-through explanation is the default.
+            redis_note:
+                "not configured (no REDIS_URL) — every read here falls through to the database"
+                    .to_string(),
+            cache_ops: None,
+            redis_hits: None,
+            redis_misses: None,
+            redis_skipped: None,
+            redis_failed: None,
+            count_ms: None,
+            count_note: String::new(),
+            role_ms: None,
+            role_note: String::new(),
+            list_ms: None,
+            list_note: String::new(),
+            cold_total_ms: None,
+            warm_total_ms: None,
+            warm_pair: false,
+            cache_gets: None,
+            cache_stores: None,
+            redis_probe_ms: None,
+            // Same shape as the PING note: default to "not configured" so the
+            // write path only has to overwrite it when it was measured.
+            redis_probe_note: "not configured".to_string(),
+        }
+    }
+}
+
+/// Every leg the probe can measure without Discord.
+pub(crate) async fn measure_probe(
+    bot: &Bot,
+    gid: &str,
+    channel_id: &str,
+    created_by: &str,
+) -> ProbeMeasurement {
+    let mut out = ProbeMeasurement::new();
 
     let redis: &RedisCache = &bot.state.redis;
     let redis_on = redis.configured();
-
-    let mut redis_ms: Option<f64> = None;
-    // The PING leg's note: a cache that is off never measured one, so the
-    // fall-through explanation is the default rather than a dead assignment.
-    let mut redis_note =
-        "not configured (no REDIS_URL) — every read here falls through to the database".to_string();
-    let mut cache_ops: Option<i64> = None;
-    let mut redis_hits: Option<i64> = None;
-    let mut redis_misses: Option<i64> = None;
-    let mut redis_skipped: Option<i64> = None;
-    let mut redis_failed: Option<i64> = None;
-    let mut count_ms: Option<f64> = None;
-    let mut count_note = String::new();
-    let mut role_ms: Option<f64> = None;
-    let mut role_note = String::new();
-    let mut list_ms: Option<f64> = None;
-    let mut list_note = String::new();
-    // The same pair of cached reads as a total, first (cold) then second (warm)
-    // run, so the repeat-click cost can be compared honestly.
-    let mut cold_total_ms: Option<f64> = None;
-    let mut warm_total_ms: Option<f64> = None;
-    // Only true when the second run of the cached pair was answered from the
-    // cache in full; until then the report must not claim a cache hit.
-    let mut warm_pair = false;
-    let mut cache_gets: Option<i64> = None;
-    let mut cache_stores: Option<i64> = None;
-    let mut redis_probe_ms: Option<f64> = None;
-    // Same shape as the PING note: default to "not configured" so the branch
-    // below only has to overwrite it when the write path was actually measured.
-    let mut redis_probe_note = "not configured".to_string();
 
     // The one database call still made here: the same pre-ack list the Join
     // button reads. Deliberately not timed and not reported, and a failure is
     // not fatal: with nothing live the probe falls back to a throwaway preview
     // row for the same purpose.
-    let live = match bot.db_call(bot.service().list_active(&gid)).await {
+    let live = match bot.db_call(bot.service().list_active(gid)).await {
         Ok(live) => live,
         Err(err) => {
             error!("request-time active-giveaway lookup failed: {err}");
@@ -702,16 +861,14 @@ async fn request_time(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
     // written and read through the same code the create path uses.
     let mut preview_id = String::new();
     if live.is_empty() {
-        let channel_id = ci.channel_id.to_string();
-        let created_by = ci.user.id.to_string();
         let created = bot
             .db_call(bot.service().create(
-                &gid,
-                &channel_id,
+                gid,
+                channel_id,
                 "Cache preview (deleted immediately)",
                 1,
                 300,
-                &created_by,
+                created_by,
                 None,
                 None,
                 None,
@@ -739,12 +896,12 @@ async fn request_time(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
         // HIT/MISS is the state a click would have found, not one this probe
         // just warmed.
         let leg_started = Instant::now();
-        match bot.db_call(bot.service().list_active_cached(&gid)).await {
+        match bot.db_call(bot.service().list_active_cached(gid)).await {
             Ok(list_cached) => {
-                list_ms = Some(leg_started.elapsed().as_secs_f64() * 1000.0);
+                out.list_ms = Some(leg_started.elapsed().as_secs_f64() * 1000.0);
                 let before_hits = counter(&before, "hits").unwrap_or(0);
                 let now_hits = counter(&redis.stats().await, "hits").unwrap_or(0);
-                list_note = if now_hits > before_hits {
+                out.list_note = if now_hits > before_hits {
                     format!(
                         "HIT - {} active giveaway(s), from the cache",
                         list_cached.len()
@@ -758,22 +915,23 @@ async fn request_time(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
             }
             Err(err) => {
                 error!("request-time cached list probe failed: {err}");
-                list_note = "cached list probe failed".to_string();
+                out.list_note = "cached list probe failed".to_string();
             }
         }
 
         // `ping_ms` reports its own failure as None and never raises, so the
         // note is unconditional on this path — exactly like the Python source.
-        redis_ms = redis.ping_ms().await;
-        redis_note = "PING through the shared client (auth + pool reuse included)".to_string();
+        out.redis_ms = redis.ping_ms().await;
+        out.redis_note = "PING through the shared client (auth + pool reuse included)".to_string();
 
         // The cached readers live on the service; it only has them when a cache
         // is wired in. Reading through the service is what a real click does.
         if bot.state.service.redis().is_none() {
-            count_note = "no cache wired into the service".to_string();
-            role_note = count_note.clone();
+            out.count_note = "no cache wired into the service".to_string();
+            out.role_note = out.count_note.clone();
         } else if gw_id.is_empty() && preview_id.is_empty() {
-            count_note = "no live giveaway, and the preview row could not be created".to_string();
+            out.count_note =
+                "no live giveaway, and the preview row could not be created".to_string();
         } else {
             // Twice on purpose: run 1 is what a cold cache costs (it falls
             // through to the database), run 2 is the warm cost a click pays.
@@ -799,7 +957,7 @@ async fn request_time(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
                     served,
                 });
                 let (ms, _role, served) = timed_cached(redis, || async {
-                    bot.service().get_notify_role_cached(&gid).await
+                    bot.service().get_notify_role_cached(gid).await
                 })
                 .await;
                 role_runs.push(Leg {
@@ -812,40 +970,40 @@ async fn request_time(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
             // both runs stay visible in the note beside it.
             let warm_count_ms = count_runs[1].ms;
             let warm_role_ms = role_runs[1].ms;
-            count_ms = warm_count_ms;
-            role_ms = warm_role_ms;
+            out.count_ms = warm_count_ms;
+            out.role_ms = warm_role_ms;
             // "Served from the cache" is a claim, not a label: it may only be
             // printed when BOTH runs of the pair were answered without a
             // fall-through. If either read the database, the warm number is the
             // cost of a read that missed.
-            warm_pair = count_runs[1].served == Some(true) && role_runs[1].served == Some(true);
+            out.warm_pair = count_runs[1].served == Some(true) && role_runs[1].served == Some(true);
             let cold_vals: Vec<f64> = [count_runs[0].ms, role_runs[0].ms]
                 .into_iter()
                 .flatten()
                 .collect();
             if cold_vals.len() == 2 {
-                cold_total_ms = Some(cold_vals.iter().sum());
+                out.cold_total_ms = Some(cold_vals.iter().sum());
             }
             let warm_vals: Vec<f64> = [warm_count_ms, warm_role_ms]
                 .into_iter()
                 .flatten()
                 .collect();
             if warm_vals.len() == 2 {
-                warm_total_ms = Some(warm_vals.iter().sum());
+                out.warm_total_ms = Some(warm_vals.iter().sum());
             }
             // A failed count read has no value, and Python printed the same
             // "None" there rather than inventing a zero.
             let entrants = n_cached
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "None".to_string());
-            count_note = format!("{} - {entrants} entrant(s)", runs_note(&count_runs));
-            role_note = runs_note(&role_runs);
+            out.count_note = format!("{} - {entrants} entrant(s)", runs_note(&count_runs));
+            out.role_note = runs_note(&role_runs);
             if gw_id.is_empty() {
                 // Say plainly that the per-giveaway key was measured on a
                 // throwaway row, so nobody reads it as a live giveaway.
                 let note = "(no live giveaway — measured on a preview row this probe deleted)";
-                count_note = format!("{count_note} {note}");
-                role_note = format!("{role_note} {note}");
+                out.count_note = format!("{} {note}", out.count_note);
+                out.role_note = format!("{} {note}", out.role_note);
             }
         }
 
@@ -854,13 +1012,13 @@ async fn request_time(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
             (Some(before), Some(after)) => Some(after - before),
             _ => None,
         };
-        redis_hits = delta("hits");
-        redis_misses = delta("misses");
-        redis_skipped = delta("skipped");
-        redis_failed = delta("failed");
-        cache_ops = delta("attempted");
-        cache_stores = delta("ok");
-        cache_gets = match (redis_hits, redis_misses) {
+        out.redis_hits = delta("hits");
+        out.redis_misses = delta("misses");
+        out.redis_skipped = delta("skipped");
+        out.redis_failed = delta("failed");
+        out.cache_ops = delta("attempted");
+        out.cache_stores = delta("ok");
+        out.cache_gets = match (out.redis_hits, out.redis_misses) {
             (Some(hits), Some(misses)) => Some(hits + misses),
             _ => None,
         };
@@ -884,37 +1042,25 @@ async fn request_time(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
     if redis_on {
         let probe_started = Instant::now();
         let wrote = redis.set(PROBE_KEY, "1", 10.0).await && redis.delete(&[PROBE_KEY]).await >= 0;
-        redis_probe_ms = Some(probe_started.elapsed().as_secs_f64() * 1000.0);
-        redis_probe_note = if wrote {
+        out.redis_probe_ms = Some(probe_started.elapsed().as_secs_f64() * 1000.0);
+        out.redis_probe_note = if wrote {
             "SET then DEL one probe key (2 round trips)".to_string()
         } else {
             "SET/DEL refused (Redis degraded or over budget)".to_string()
         };
     }
 
-    // Leg 6: a real Discord REST send, timed. It is then edited into the report
-    // so the invoker sees one ephemeral reply, not two.
-    let reply_started = Instant::now();
-    let sent = ci
-        .create_followup(
-            ctx,
-            CreateInteractionResponseFollowup::new()
-                .content("Measuring Discord reply leg…")
-                .ephemeral(true),
-        )
-        .await;
-    let (probe_msg, rest_ms) = match sent {
-        Ok(message) => (
-            Some(message),
-            Some(reply_started.elapsed().as_secs_f64() * 1000.0),
-        ),
-        Err(err) => {
-            warn!("request-time reply probe failed: {err}");
-            (None, None)
-        }
-    };
-    let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+    out
+}
 
+/// The report the invoker reads, from measured numbers and nothing else.
+pub(crate) fn render_report(
+    measured: &ProbeMeasurement,
+    ack_ms: Option<f64>,
+    rest_ms: Option<f64>,
+    loop_lag_ms: Option<f64>,
+    total_ms: f64,
+) -> String {
     // One decimal on purpose: 0.0ms is only reachable when the cache answered
     // without a network round trip, so the precision is the evidence that the
     // reader was served from Redis and not from the database. A leg that never
@@ -924,36 +1070,38 @@ async fn request_time(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
         None => "not measured".to_string(),
     };
     let ops_text = || -> String {
-        let Some(gets) = cache_gets else {
+        let Some(gets) = measured.cache_gets else {
             return "n/a".to_string();
         };
         let mut bits = vec![format!("{gets} get(s)")];
-        if let Some(stores) = cache_stores {
+        if let Some(stores) = measured.cache_stores {
             bits.push(format!("{stores} set(s)"));
         }
-        if let Some(ops) = cache_ops {
+        if let Some(ops) = measured.cache_ops {
             bits.push(format!("{ops} op(s)"));
         }
-        if let (Some(hits), Some(misses)) = (redis_hits, redis_misses) {
+        if let (Some(hits), Some(misses)) = (measured.redis_hits, measured.redis_misses) {
             bits.push(format!("{hits} hit / {misses} miss"));
         }
-        if let Some(skipped) = redis_skipped.filter(|value| *value != 0) {
+        if let Some(skipped) = measured.redis_skipped.filter(|value| *value != 0) {
             bits.push(format!("{skipped} skipped over budget"));
         }
-        if let Some(failed) = redis_failed.filter(|value| *value != 0) {
+        if let Some(failed) = measured.redis_failed.filter(|value| *value != 0) {
             bits.push(format!("{failed} failed"));
         }
         bits.join(", ")
     };
 
+    // serenity 0.12 does not publish the shard heartbeat latency to handlers
+    // (`ShardMessenger` has no accessor), so this leg is always unmeasured.
     let short = [
         ("Discord ack", ack_ms),
         ("Discord reply", rest_ms),
-        ("Redis ping", redis_ms),
-        ("Redis cache count", count_ms),
-        ("Redis cache list", list_ms),
-        ("Redis cache notify-role", role_ms),
-        ("Redis write", redis_probe_ms),
+        ("Redis ping", measured.redis_ms),
+        ("Redis cache count", measured.count_ms),
+        ("Redis cache list", measured.list_ms),
+        ("Redis cache notify-role", measured.role_ms),
+        ("Redis write", measured.redis_probe_ms),
     ];
     // Python's `max` keeps the first leg on a tie, so the fold only replaces a
     // strictly slower one.
@@ -970,17 +1118,14 @@ async fn request_time(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
         .map(|(name, _)| name)
         .unwrap_or("n/a");
 
-    let gateway_txt = match gateway_ms {
-        Some(ms) => format!("{ms:.0}ms"),
-        None => "n/a (offline)".to_string(),
-    };
+    let gateway_txt = "n/a (offline)";
     let lag_txt = match loop_lag_ms {
         Some(ms) => format!("{ms:.2}ms"),
         None => "n/a".to_string(),
     };
-    let warm_txt = match warm_total_ms {
+    let warm_txt = match measured.warm_total_ms {
         None => "n/a".to_string(),
-        Some(warm) => match cold_total_ms {
+        Some(warm) => match measured.cold_total_ms {
             Some(cold) if cold > warm => format!("{cold:.0}ms cold -> {warm:.0}ms warm"),
             _ => format!("{warm:.0}ms"),
         },
@@ -990,8 +1135,8 @@ async fn request_time(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
         "Request-time breakdown — live legs, timed just now:".to_string(),
         format!(
             "• Cached reads this request (repeat click): **{}**{}",
-            leg_text(warm_total_ms),
-            if warm_pair {
+            leg_text(measured.warm_total_ms),
+            if measured.warm_pair {
                 " — same keys served from the cache, no database read at all"
             } else {
                 " — NOT a cache hit: the second read still fell through to the database, so this is not what a warm click pays"
@@ -999,7 +1144,7 @@ async fn request_time(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
         ),
         format!(
             "• First read on an empty cache: **{}** (Redis miss) — that path falls through to the database, which is not timed in this report",
-            leg_text(cold_total_ms)
+            leg_text(measured.cold_total_ms)
         ),
         "• — Discord, the one leg the cache cannot cover —".to_string(),
         format!("• Discord ack (defer): **{}**", leg_text(ack_ms)),
@@ -1007,28 +1152,28 @@ async fn request_time(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
         "• — Redis: every leg below is one real cache call, timed —".to_string(),
         format!(
             "• Redis cache list: **{}** — {}",
-            leg_text(list_ms),
-            or_na(&list_note)
+            leg_text(measured.list_ms),
+            or_na(&measured.list_note)
         ),
         format!(
             "• Redis cache count: **{}** — {}",
-            leg_text(count_ms),
-            or_na(&count_note)
+            leg_text(measured.count_ms),
+            or_na(&measured.count_note)
         ),
         format!(
             "• Redis cache notify-role: **{}** — {}",
-            leg_text(role_ms),
-            or_na(&role_note)
+            leg_text(measured.role_ms),
+            or_na(&measured.role_note)
         ),
         format!(
             "• Redis ping: **{}** — {}",
-            leg_text(redis_ms),
-            or_na(&redis_note)
+            leg_text(measured.redis_ms),
+            or_na(&measured.redis_note)
         ),
         format!(
             "• Redis write: **{}** — {}",
-            leg_text(redis_probe_ms),
-            or_na(&redis_probe_note)
+            leg_text(measured.redis_probe_ms),
+            or_na(&measured.redis_probe_note)
         ),
         format!("• Redis ops this command: {}", ops_text()),
         "• — reference only, neither is a cache read —".to_string(),
@@ -1042,26 +1187,7 @@ async fn request_time(bot: &Bot, ctx: &Context, ci: &CommandInteraction) -> Resu
         String::new(),
         "_(No database leg is measured or printed by this command. A cache miss and a Redis outage both fall through to the database — that cost is real and is deliberately not shown here; read it from the database side, not from this report.)_".to_string(),
     ];
-    let report = lines.join("\n");
-
-    match probe_msg {
-        // One message, not a spam of replies: the timed probe is edited in
-        // place into the final report.
-        Some(message) => {
-            let edited = ci
-                .edit_followup(
-                    ctx,
-                    message.id,
-                    CreateInteractionResponseFollowup::new().content(&report),
-                )
-                .await;
-            if let Err(err) = edited {
-                warn!("request-time report edit failed: {err}");
-            }
-        }
-        None => bot.safe_followup_command(ctx, ci, &report).await,
-    }
-    Ok(())
+    lines.join("\n")
 }
 
 /// One run of a cached reader: (milliseconds, value, served-from-cache).

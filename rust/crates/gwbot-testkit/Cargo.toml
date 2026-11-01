@@ -1,0 +1,22 @@
+[package]
+name = "gwbot-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "In-process harness and shared fixtures for the giveaway test suite"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+gwbot-core = { path = "../gwbot-core" }
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+# Only the storage-layer port needs the raw driver: a user-defined function is
+# the one seam that can make a real read fail mid-transfer.
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
