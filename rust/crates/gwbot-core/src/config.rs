@@ -66,16 +66,31 @@ impl Default for Settings {
 /// Integer setting: blank or unparseable keeps the default, like the Python
 /// helper, so a typo can never crash startup.
 pub fn env_int(name: &str, default: i64) -> i64 {
-    match std::env::var(name) {
-        Ok(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return default;
+    env_int_first(&[name], default)
+}
+
+/// Integer setting read from the first name that carries a usable value.
+///
+/// Only the renamed keys need this: an `.env` written before the port can hold
+/// the older spelling and no new one, and silently falling back to the default
+/// would change the cadence of a running deploy. Blank or unparseable values
+/// fall through to the next name, then to the default, so a stray space cannot
+/// hide the value behind it.
+pub fn env_int_first(names: &[&str], default: i64) -> i64 {
+    names
+        .iter()
+        .find_map(|name| match std::env::var(name) {
+            Ok(raw) => {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    trimmed.parse::<i64>().ok()
+                }
             }
-            trimmed.parse::<i64>().unwrap_or(default)
-        }
-        Err(_) => default,
-    }
+            Err(_) => None,
+        })
+        .unwrap_or(default)
 }
 
 /// Yes/no setting in every spelling people actually write.
@@ -180,9 +195,10 @@ fn repo_env_candidates() -> Vec<PathBuf> {
 
 /// Read the process environment into `Settings`.
 ///
-/// Mirrors `get_settings()`: the colour is parsed separately and
-/// `TICK_SECONDS` is clamped to a 5-second floor so a busy loop cannot be
-/// configured by accident.
+/// Mirrors `get_settings()`: the colour is parsed separately and `TICK_SECONDS`
+/// is clamped to a 5-second floor so a busy loop cannot be configured by
+/// accident. `TICK_INTERVAL_SECONDS` is the name the tick carried before the
+/// port; it is still read so an existing `.env` needs no edit.
 pub fn get_settings() -> Settings {
     let mut settings = Settings {
         bot_token: std::env::var("DISCORD_BOT_TOKEN")
@@ -206,7 +222,7 @@ pub fn get_settings() -> Settings {
             .unwrap_or_default()
             .trim()
             .to_string(),
-        tick_seconds: env_int("TICK_SECONDS", 30),
+        tick_seconds: env_int_first(&["TICK_SECONDS", "TICK_INTERVAL_SECONDS"], 30),
         dashboard_url: match std::env::var("DASHBOARD_URL") {
             Ok(value) => value.trim().to_string(),
             Err(_) => DEFAULT_DASHBOARD_URL.to_string(),
@@ -281,5 +297,37 @@ mod tests {
         assert_eq!(with_var("INT_A", "", || env_int("INT_A", 7)), 7);
         assert_eq!(with_var("INT_B", "abc", || env_int("INT_B", 7)), 7);
         assert_eq!(with_var("INT_C", " 12 ", || env_int("INT_C", 7)), 12);
+    }
+
+    /// A renamed key still configures the value it used to: an `.env` written
+    /// before the port has the old spelling and no new one.
+    #[test]
+    fn the_old_tick_name_still_sets_the_tick() {
+        let tick = with_var("TICK_SECONDS", "", || {
+            with_var("TICK_INTERVAL_SECONDS", "45", || {
+                get_settings().tick_seconds
+            })
+        });
+        assert_eq!(tick, 45);
+    }
+
+    /// When both spellings are present the documented one wins, so a stale
+    /// legacy line cannot quietly override a value someone just set.
+    #[test]
+    fn the_documented_tick_name_wins_over_the_old_one() {
+        let names = ["ALIAS_PRIMARY", "ALIAS_LEGACY"];
+        let value = with_var("ALIAS_PRIMARY", "12", || {
+            with_var("ALIAS_LEGACY", "45", || env_int_first(&names, 30))
+        });
+        assert_eq!(value, 12);
+        // Only the old name set, or only a blank one, still resolves.
+        assert_eq!(
+            with_var("ALIAS_LEGACY", "45", || env_int_first(&names, 30)),
+            45
+        );
+        assert_eq!(
+            with_var("ALIAS_PRIMARY", " ", || env_int_first(&names, 30)),
+            30
+        );
     }
 }

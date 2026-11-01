@@ -330,7 +330,7 @@ Copy `.env.example` to `.env`. Settings are read once at startup.
 | `TURSO_DATABASE_URL` | yes | — | `libsql://…`; the only database |
 | `TURSO_AUTH_TOKEN` | yes | — | Turso auth token |
 | `DISCORD_GIVEAWAY_CHANNEL_ID` | no | — | Force every giveaway into one channel (`GIVEAWAY_CHANNEL_ID` also accepted) |
-| `TICK_SECONDS` | no | `30` | Due-check and refresh cadence, minimum 5 |
+| `TICK_SECONDS` | no | `30` | Due-check and refresh cadence, minimum 5 (`TICK_INTERVAL_SECONDS` also accepted) |
 | `EMBED_COLOR` | no | `0x7C5CFF` | `0xRRGGBB`, `#RRGGBB`, bare hex or decimal; masked to 24 bits |
 | `DASHBOARD_URL` | no | public site | Blue Dashboard link button; empty string removes the button |
 | `PORT` | no | `10000` | Health server port (Render sets this) |
