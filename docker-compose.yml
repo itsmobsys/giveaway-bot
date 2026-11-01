@@ -1,5 +1,5 @@
 # Bot only. Needs TURSO_DATABASE_URL / TURSO_AUTH_TOKEN / DISCORD_BOT_TOKEN
-# in .env (see .env.example).
+# in .env (see .env.example). Build with `docker compose up --build`.
 services:
   bot:
     build:
@@ -7,8 +7,10 @@ services:
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file: .env
+    # The probe is a subcommand of the bot binary, so the runtime image needs no
+    # curl or wget. /health is liveness only; /ready reflects the gateway.
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request,os;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','10000')+'/health')"]
+      test: ["CMD", "giveaway-bot", "healthcheck"]
       interval: 60s
       timeout: 10s
       retries: 3

@@ -23,6 +23,7 @@
 
 # Lockfiles are generated; keep diffs readable but still normalised.
 package-lock.json text eol=lf
+Cargo.lock text eol=lf
 
 # Keep these out of language statistics and diffs: they are generated or large.
 dashboard/data/** linguist-generated
